@@ -28,8 +28,8 @@
 #ifndef _WIN32
 #include <sys/mman.h>        /* madvise(MADV_HUGEPAGE) per i buffer expert (riduce TLB-miss) */
 #endif
-#include "nn.h"            /* falloc per le scale; matmul_q lo usa il chiamante */
-#include "tier.h"          /* tier_lfru_score per l'eviction frequency+recency */
+#include "nn/nn.h"            /* falloc per le scale; matmul_q lo usa il chiamante */
+#include "io/tier.h"          /* tier_lfru_score per l'eviction frequency+recency */
 
 typedef struct {
     int eid;                /* expert id, -1 = slot vuoto */

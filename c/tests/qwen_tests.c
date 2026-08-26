@@ -2,7 +2,7 @@
  * Ogni funzione qt_* ritorna 0=ok, 1=fail; dettagli su stderr.
  * Include il motore intero: accesso diretto a static e strutture. */
 #define QWEN_TEST
-#include "../qwen.c"
+#include "../engines/qwen.c"
 #include "tiny_st.h"
 #include "tiny_gguf.h"
 

@@ -29,7 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "json.h"
+#include "util/json.h"
 
 #define SGB_MAX_DEPTH 32
 

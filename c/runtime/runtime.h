@@ -104,10 +104,10 @@ static void cfg_common(jval *r, Cfg *c) {
     if (c->n_heads % c->n_kv_heads) { fprintf(stderr,"config: n_heads %% n_kv_heads != 0\n"); exit(1); }
 }
 
-#include "rt_model_load.h"
-#include "rt_kv_cache.h"
-#include "rt_gen_loop.h"
-#include "rt_env_cfg.h"
+#include "runtime/rt_model_load.h"
+#include "runtime/rt_kv_cache.h"
+#include "runtime/rt_gen_loop.h"
+#include "runtime/rt_env_cfg.h"
 
 /* ---------- main condiviso ---------- */
 static int engine_main(int argc, char **argv) {

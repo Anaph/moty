@@ -6,7 +6,7 @@
  * Stampa GFLOP/s e GB/s (pesi) + i tier compilati. Compilare anche con
  * -DMOTY_TEST_MARCH/-march per misurare i kernel reali. */
 #define QWEN_TEST
-#include "../qwen.c"
+#include "../engines/qwen.c"
 
 static uint64_t bn_rng = 88172645463325252ULL;
 static float bn_frnd(void) {

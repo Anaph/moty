@@ -23,13 +23,13 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include "st.h"
-#include "gguf.h"
-#include "nn.h"
-#include "nn_rope.h"
-#include "moe.h"
-#include "nn_norm.h"
-#include "tok.h"
+#include "io/st.h"
+#include "io/gguf.h"
+#include "nn/nn.h"
+#include "nn/nn_rope.h"
+#include "runtime/moe.h"
+#include "nn/nn_norm.h"
+#include "tok/tok.h"
 
 /* env-knob globali (letti in main prima di engine_main) */
 static int g_ebits = 4;          /* EBITS: bit expert. 4=int4 packed (2x meno RAM+banda),
@@ -103,8 +103,8 @@ typedef struct {
 #define ENGINE_PRECOOKED_A
 #define ENGINE_GATED_ATTN
 #define ATTN_NORM in_ln
-#include "nn_attn.h"
-#include "nn_deltanet.h"
+#include "nn/nn_attn.h"
+#include "nn/nn_deltanet.h"
 
 /* (gli hook load_cfg/load_small/... sono dichiarati forward da runtime.h subito sotto,
  * e definiti dopo l'include: stesso pattern di qwen.c. MatRef vive in runtime.h.) */
@@ -118,7 +118,7 @@ static void qwenmoe_load_expert(void *ctx, int layer, int eid, ExpertSlot *s, in
             if ((m)->L[_i].ec) \
                 expert_get((m)->L[_i].ec, (m), _i, _e, qwenmoe_load_expert, _c->moe_inter, _c->hidden); \
 } while (0)
-#include "runtime.h"
+#include "runtime/runtime.h"
 
 /* ---------- config ---------- */
 static void load_cfg(Cfg *c, const char *snap) {
@@ -272,7 +272,7 @@ static void qwenmoe_load_expert(void *ctx, int layer, int eid, ExpertSlot *s, in
 
 #define MOE_LOAD_EXPERT qwenmoe_load_expert
 #define MOE_SHARED_EXPERT
-#include "nn_moe_sigmoid.h"
+#include "nn/nn_moe_sigmoid.h"
 
 /* ---------- MoE: router(top-K) + shared(gated) + Σ expert ---------- */
 /* g_expert_cap e' dichiarato sopra (prima di runtime.h/load_small) */

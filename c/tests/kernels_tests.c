@@ -13,10 +13,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
-#include "../nn_alloc.h"
-#include "../simd.h"          /* hw.h: dot_i4g8p, dot_i4i8p, dot_i4i8, px_*, WF_* */
-#include "../nn_quant.h"      /* pack_int4, pack_int4_grouped, quantize_rows */
-#include "../nn_matmul.h"
+#include "../nn/nn_alloc.h"
+#include "../util/simd.h"          /* hw.h: dot_i4g8p, dot_i4i8p, dot_i4i8, px_*, WF_* */
+#include "../nn/nn_quant.h"      /* pack_int4, pack_int4_grouped, quantize_rows */
+#include "../nn/nn_matmul.h"
 
 static uint64_t kt_lcg = 0xC0FFEE1234567ULL;
 static uint32_t kt_rnd(void) {
@@ -113,7 +113,7 @@ int kt_grouped_batch(void) {
     return 0;
 }
 
-#include "../nn_sample.h"
+#include "../nn/nn_sample.h"
 
 /* ---- argmax_v_par == argmax_v ---- */
 static int kt_argmax_one(int V) {

@@ -17,8 +17,8 @@
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
-#include "json.h"
-#include "tok_unicode.h"
+#include "util/json.h"
+#include "tok/tok_unicode.h"
 
 /* ---------- hash map (chiavi binarie con lunghezza) ---------- */
 typedef struct { const char *k; int klen; int v; int used; } ment;

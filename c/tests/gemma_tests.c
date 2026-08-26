@@ -1,7 +1,7 @@
 /* Logica dei test del motore gemma (C puro; glue gtest in gemma_gtest.cc).
  * Ritorni: 0=ok, 1=fail. Include il motore intero. */
 #define GEMMA_TEST
-#include "../gemma.c"
+#include "../engines/gemma.c"
 #include "tiny_st.h"
 
 #define CHECK(cond) do { if (!(cond)) { \

@@ -65,7 +65,7 @@ mirror. A hard RAM cap composes naturally with the engine's own knobs:
 
 ## SIMD
 
-The shared kernels in `c/simd.h` are selected at compile time by `-march`
+The shared kernels (contract in `c/hw/hw.h`) are selected at compile time by `-march`
 (one `#ifdef` ladder, no runtime CPUID dispatch):
 
 | Build | f32 kernel | int8 kernel |
@@ -97,7 +97,7 @@ SNAP=/path/to/Qwen3-4B PROMPT="Hello!" ./c/qwen
 # interactive chat (persistent KV cache)
 SNAP=/path/to/Qwen3-4B ./c/qwen
 
-# GLM-5.2 (see c/glm.c header for its full env reference)
+# GLM-5.2 (see the glm.c header for its full env reference)
 SNAP=/path/to/glm-snapshot PROMPT="ciao" ./c/glm
 ```
 
@@ -192,7 +192,7 @@ weights); `LORA` adapters work (they are small and stay resident).
 ## Fine-tuning (LoRA)
 
 The qwen engine ships a dependency-free LoRA fine-tuner (hand-written
-backward pass + AdamW, `c/qwen_train.h`). Set `TRAIN=` to a plain-text
+backward pass + AdamW, `c/engines/qwen_train.h`). Set `TRAIN=` to a plain-text
 corpus and the binary trains rank-r adapters on the top `LORA_LAYERS`
 layers (q/k/v/o + gate/up/down, optionally the lm_head) instead of
 generating, then saves them as a single safetensors file:
@@ -264,20 +264,27 @@ by the reference tokenizer before debugging model-level mismatches.
 ## Layout
 
 ```
-c/glm.c      GLM-5.2 engine (single file)
-c/olmoe.c    OLMoE reference engine
-c/qwen.c     Qwen3 / Qwen3.5 engine
-c/gemma.c    Gemma 4 engine (text-only)
-c/nn.h       shared kernels: matmul f32/int8, quantization, sampler
-c/st.h       safetensors loader (multi-shard, BF16/F16/F32)
-c/tok.h      BPE tokenizer: byte-level and SentencePiece modes
-c/gguf.h     GGUF reader (single-file models, Q4_0..Q6_K)
-c/json.h     minimal JSON parser
-c/compat.h   cross-platform shims
+c/engines/   one .c per model family + moty.c (multi-model dispatcher)
+c/nn/        shared compute kernels (attention, conv, MoE, FFN, sampler...)
+c/hw/        hardware abstraction: AVX512/AVX2/NEON/SVE2/VSX/scalar backends
+c/runtime/   engine scaffolding (load/KV/generation hooks) + MoE expert cache
+c/io/        safetensors, GGUF, io_uring, tiering
+c/tok/       tokenizers (BPE byte-level, SentencePiece)
+c/util/      json, compat shims, grammar, profiling
 c/tests/     test suite: C logic + GoogleTest glue (make test)
 Dockerfile   multi-stage image: build -> (test) -> slim runtime
 docker-compose.yml  services qwen/gemma/glm with /models mounted
+docs/        architecture + how-to guides
 ```
+
+Documentation:
+
+- [docs/architecture.md](docs/architecture.md) — module map, layering
+  rules, kernel contracts, scratch arena, token flow
+- [docs/adding-a-model.md](docs/adding-a-model.md) — support a new model
+  architecture end-to-end (hooks, registration, validation, tests)
+- [docs/supporting-layers.md](docs/supporting-layers.md) — extract or add
+  a shared layer in `nn/` (design rules, template, mandatory tests)
 
 ### Gemma engine notes
 
@@ -286,7 +293,7 @@ with global layers (p-RoPE, optionally larger global head_dim), per-head
 q/k/v RMSNorm, sandwich norms, GeGLU, optional KV-sharing / K=V / per-layer
 embeddings — all config-driven. A few checkpoint conventions could not be
 verified offline and sit behind loud probes (see VERIFY comments in
-`c/gemma.c`); on first run against a real snapshot, resolve any reported
+`c/engines/gemma.c`); on first run against a real snapshot, resolve any reported
 tensor-name/shape mismatch, validate the tokenizer with `tok_oracle`, then
 gate with REF mode. `GEMMA_NORM_PLAIN=1` switches the RMSNorm convention
 from `(1+w)` to `w` if REF parity points at the norm.

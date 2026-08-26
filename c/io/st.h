@@ -15,8 +15,8 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
-#include "json.h"
-#include "compat.h"
+#include "util/json.h"
+#include "util/compat.h"
 
 /* tetto sulla dimensione dell'header safetensors: gli header reali sono piccoli
  * (KB..pochi MB). Un file crafted che dichiara un hlen enorme causerebbe una

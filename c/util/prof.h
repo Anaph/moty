@@ -14,7 +14,7 @@
 
 #ifdef MOTY_PROF
 #define PROF_ON 1
-#include "nn_alloc.h"      /* now_s */
+#include "nn/nn_alloc.h"      /* now_s */
 /* contatori per-fase di un TU; il motore li tocca dentro PROF_ACC(name,dt) */
 #define PROF_DECL() static double pf_attn=0,pf_conv=0,pf_moe=0,pf_ffn=0,pf_log=0,pf_other=0,pf_wall0=0,pf_last=0; static int pf_n=0
 #define PROF_TICK(v) double v = now_s()

@@ -9,8 +9,8 @@
  */
 #ifndef NN_GEMM_H
 #define NN_GEMM_H
-#include "nn_quant.h"
-#include "nn_matmul.h"
-#include "nn_attn_kernels.h"
-#include "nn_mat.h"
+#include "nn/nn_quant.h"
+#include "nn/nn_matmul.h"
+#include "nn/nn_attn_kernels.h"
+#include "nn/nn_mat.h"
 #endif /* NN_GEMM_H */

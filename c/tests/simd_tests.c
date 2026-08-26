@@ -6,7 +6,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
-#include "../simd.h"
+#include "../util/simd.h"
 
 /* LCG deterministico (stesso stile di qwen_tests.c) */
 static uint64_t st_lcg = 0x1234567895555ULL;

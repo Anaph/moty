@@ -8,7 +8,7 @@
 #include <string.h>
 #include <unistd.h>
 #define main moty_glm_main_unused
-#include "../glm.c"
+#include "../engines/glm.c"
 #undef main
 
 static uint32_t gt_rng=0x12345678u;

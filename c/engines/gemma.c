@@ -33,10 +33,10 @@
 #include <stdarg.h>
 #include <math.h>
 #include <time.h>
-#include "nn.h"
-#include "st.h"
-#include "gguf.h"
-#include "tok.h"
+#include "nn/nn.h"
+#include "io/st.h"
+#include "io/gguf.h"
+#include "tok/tok.h"
 
 #define ENGINE_TAG "gemma"
 #define ENGINE_EOT "<end_of_turn>\n"
@@ -89,7 +89,7 @@ typedef struct {
     float *ple_proj_norm;       /* [n_layers*ple_dim]? VERIFY: norm su ple_dim */
 } Model;
 
-#include "runtime.h"
+#include "runtime/runtime.h"
 
 /* ---------- config ---------- */
 static void load_cfg(Cfg *c, const char *snap) {

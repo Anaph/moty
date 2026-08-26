@@ -61,15 +61,15 @@
 #if defined(_WIN32) && (defined(__x86_64__) || defined(__i386__))
 #include <cpuid.h>                                /* hwinfo_emit: CPU brand string senza /proc */
 #endif
-#include "st.h"
+#include "io/st.h"
 #ifdef __linux__
-#include "uring.h"
+#include "io/uring.h"
 #endif
-#include "tok.h"
-#include "tier.h"
-#include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
-#include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
-#include "decode_batch.h"
+#include "tok/tok.h"
+#include "io/tier.h"
+#include "util/grammar.h"                              /* metodo F: draft grammaticali (#48) */
+#include "util/schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
+#include "runtime/decode_batch.h"
 #ifdef _OPENMP
 #include <omp.h>                                  /* scratch per-thread nell'attention */
 #else
@@ -91,7 +91,7 @@ static const float *g_pre_sh;   /* output dello shared expert gia' calcolato su 
 /* kernel SIMD condivisi (simd.h): dot_i8i8/i4i8/f32/f32i8, hsum*, qrow_i8,
  * dn_row. Prima duplicati qui (~230 righe); ora un'unica copia. glm guadagna
  * anche i path SVE/SVE2 (armv9-a) che la copia locale non aveva. */
-#include "hw.h"
+#include "hw/hw.h"
 #ifdef __APPLE__
 #include <mach/mach.h>                            /* host_statistics64: MemAvailable di macOS */
 #endif

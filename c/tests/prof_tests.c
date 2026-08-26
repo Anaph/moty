@@ -12,7 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "../prof.h"
+#include "../util/prof.h"
 
 #ifndef MOTY_PROF
 int prof_tests_main(void) {
@@ -20,9 +20,9 @@ int prof_tests_main(void) {
     return PROF_ON == 0 ? 0 : 1;
 }
 #else
-static double pf_wall0_fake;   /* PROF_WINDOW usa now_s() reale: le finestre
- * si aprono col muro di clock, qui bastano accumuli ripetuti veloci e la
- * verifica che i delta non esplodano (other finito) */
+/* PROF_WINDOW usa now_s() reale: le finestre si aprono col muro di clock;
+ * qui bastano accumuli ripetuti veloci e la verifica che i delta non
+ * esplodano (other finito) */
 
 int prof_tests_main(void) {
     PROF_DECL();
@@ -36,7 +36,6 @@ int prof_tests_main(void) {
     if (!(pf_attn >= 0 && pf_attn < 1.0)) { fprintf(stderr, "PROF_ACC: pf_attn=%g\n", pf_attn); return 1; }
     /* reset manuale del periodo, come farebbe una finestra appena stampata */
     pf_attn = pf_conv = pf_moe = pf_ffn = pf_log = 0; pf_n = 0;
-    (void)pf_wall0_fake;
     return 0;
 }
 #endif

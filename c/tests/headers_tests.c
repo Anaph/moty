@@ -7,15 +7,15 @@
 #include <math.h>
 #include <stdint.h>
 
-#include "../json.h"
-#include "../st.h"
-#include "../gguf.h"
+#include "../util/json.h"
+#include "../io/st.h"
+#include "../io/gguf.h"
 #include "tiny_gguf.h"
-#include "../tok.h"
-#include "../tier.h"
-#include "../grammar.h"
-#include "../schema_gbnf.h"
-#include "../decode_batch.h"
+#include "../tok/tok.h"
+#include "../io/tier.h"
+#include "../util/grammar.h"
+#include "../util/schema_gbnf.h"
+#include "../runtime/decode_batch.h"
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -666,7 +666,7 @@ int ht_compat_direct(void) { return 2; }
 #else
 #include <fcntl.h>
 #include <io.h>
-#include "../compat.h"
+#include "../util/compat.h"
 
 #define CD_FSZ (1u<<20)
 #define CD_TMPF "test_direct.tmp"

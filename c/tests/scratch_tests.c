@@ -13,7 +13,7 @@
 #include <string.h>
 #include <stdint.h>
 
-#include "../nn_alloc.h"
+#include "../nn/nn_alloc.h"
 
 static uint64_t sa_lcg = 0xC0FFEE42ULL;
 static uint32_t sa_rnd(void) {

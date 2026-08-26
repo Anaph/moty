@@ -15,14 +15,14 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include "st.h"
-#include "gguf.h"
-#include "nn.h"
-#include "nn_rope.h"
-#include "moe.h"
-#include "tok.h"
-#include "compat.h"
-#include "prof.h"
+#include "io/st.h"
+#include "io/gguf.h"
+#include "nn/nn.h"
+#include "nn/nn_rope.h"
+#include "runtime/moe.h"
+#include "tok/tok.h"
+#include "util/compat.h"
+#include "util/prof.h"
 
 enum { LT_CONV = 0, LT_FULL = 1 };
 
@@ -61,7 +61,7 @@ static void ldm_layer_load_expert(void *ctx, int layer, int eid, ExpertSlot *s, 
             if ((m)->L[_i].ec) \
                 expert_get((m)->L[_i].ec, (m), _i, _e, ldm_layer_load_expert, _c->moe_inter, _c->hidden); \
 } while (0)
-#include "runtime.h"
+#include "runtime/runtime.h"
 
 /* ---------- config ---------- */
 static void load_cfg(Cfg *c, const char *snap) {
@@ -159,12 +159,12 @@ static void ldm_layer_load_expert(void *ctx, int layer, int eid, ExpertSlot *s, 
 
 /* ---------- shared layer compute ---------- */
 #define ATTN_NORM attn_norm
-#include "nn_attn.h"       /* attention() */
-#include "nn_conv.h"        /* conv_token(), conv_layer() */
-#include "nn_ffn.h"         /* dense_ffn() */
+#include "nn/nn_attn.h"       /* attention() */
+#include "nn/nn_conv.h"        /* conv_token(), conv_layer() */
+#include "nn/nn_ffn.h"         /* dense_ffn() */
 #define MOE_LOAD_EXPERT ldm_layer_load_expert
 #define MOE_GATE_SIGMOID
-#include "nn_moe_sigmoid.h" /* moe_decode1(), moe_batch() */
+#include "nn/nn_moe_sigmoid.h" /* moe_decode1(), moe_batch() */
 
 /* ---------- forward pass ---------- */
 static float *step(Model *m, const int *ids, int S, int pos_base) {

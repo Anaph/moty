@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include "moe.h"
+#include "../runtime/moe.h"
 
 static uint64_t mt_rng = 0xABCDEF12345ULL;
 static uint32_t mt_rnd(void){ mt_rng = mt_rng*6364136223846793005ULL + 1442695040888963407ULL; return (uint32_t)(mt_rng>>33); }

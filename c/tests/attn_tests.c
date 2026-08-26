@@ -18,21 +18,21 @@
 #include <math.h>
 #include <omp.h>
 
-#include "../nn_alloc.h"
-#include "../simd.h"
-#include "../nn_quant.h"
-#include "../nn_matmul.h"
-#include "../nn_mat.h"       /* Mat, mat_apply, mat_reset_storage, kv_store_row */
-#include "../nn_attn_kernels.h"  /* att_scores_*, att_accum_* */
-#include "../nn_norm.h"
-#include "../nn_rope.h"
+#include "../nn/nn_alloc.h"
+#include "../util/simd.h"
+#include "../nn/nn_quant.h"
+#include "../nn/nn_matmul.h"
+#include "../nn/nn_mat.h"       /* Mat, mat_apply, mat_reset_storage, kv_store_row */
+#include "../nn/nn_attn_kernels.h"  /* att_scores_*, att_accum_* */
+#include "../nn/nn_norm.h"
+#include "../nn/nn_rope.h"
 
 typedef struct { int hidden, n_heads, n_kv_heads, head_dim, max_t; float eps, theta; int rot; } Cfg;
 typedef struct { Mat q, k, v, o; float *qn, *kn; } Layer;
 typedef struct { Cfg c; float **K, **V; int8_t **K8, **V8; float **Ks, **Vs;
                  float *att_sc; int kv_len, max_t; Scratch scr; } Model;
 
-#include "../nn_attn.h"
+#include "../nn/nn_attn.h"
 
 static uint64_t at_lcg = 0x1234ABCD5678EF90ULL;
 static uint32_t at_rnd(void) {

@@ -14,11 +14,11 @@
 #include <math.h>
 
 /* ---- contratto minimo di nn_conv.h / nn_mat.h ---- */
-#include "../nn_alloc.h"
-#include "../simd.h"
-#include "../nn_quant.h"
-#include "../nn_matmul.h"
-#include "../nn_mat.h"       /* Mat, mat_apply, mat_reset_storage */
+#include "../nn/nn_alloc.h"
+#include "../util/simd.h"
+#include "../nn/nn_quant.h"
+#include "../nn/nn_matmul.h"
+#include "../nn/nn_mat.h"       /* Mat, mat_apply, mat_reset_storage */
 
 typedef struct { int hidden, n_heads, n_kv_heads, head_dim, n_layers, inter, vocab,
                  max_pos, n_eos, eos[4], tie_emb; float eps, theta; int rot,
@@ -26,7 +26,7 @@ typedef struct { int hidden, n_heads, n_kv_heads, head_dim, n_layers, inter, voc
 typedef struct { Mat in_proj, out_proj; float *conv_w; float *conv_state; } Layer;
 typedef struct { Cfg c; Scratch scr; } Model;   /* P5: arena nel Model del test */
 
-#include "../nn_conv.h"
+#include "../nn/nn_conv.h"
 
 static uint64_t cv_lcg = 0xA5A5F00DULL;
 static uint32_t cv_rnd(void) {

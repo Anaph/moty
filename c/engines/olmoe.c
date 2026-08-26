@@ -25,10 +25,10 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include "st.h"
-#include "nn.h"
-#include "moe.h"
-#include "tok.h"
+#include "io/st.h"
+#include "nn/nn.h"
+#include "runtime/moe.h"
+#include "tok/tok.h"
 
 #define ENGINE_TAG "olmoe"
 

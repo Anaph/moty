@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <string.h>
-#include "mla.h"
+#include "../nn/mla.h"
 
 static uint64_t mla_rng = 0x9E3779B97F4A7C15ULL;
 static uint32_t mla_rnd(void){ mla_rng = mla_rng*6364136223846793005ULL + 1442695040888963407ULL; return (uint32_t)(mla_rng>>33); }

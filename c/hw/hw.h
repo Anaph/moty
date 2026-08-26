@@ -82,54 +82,54 @@ enum { WF_F32=0, WF_I8=1, WF_I4=2, WF_I2=3, WF_I4G=4, WF_Q4K=5, WF_Q6K=6 };
 
 /* --- GPU backends (compile-time opt-in via HW_<NAME>) --- */
 #if defined(HW_OPENCL)
-  #include "hw/hw_opencl.h"
+  #include "hw_opencl.h"
 
 #elif defined(HW_VULKAN)
-  #include "hw/hw_vulkan.h"
+  #include "hw_vulkan.h"
 
 #elif defined(HW_METAL)
-  #include "hw/hw_metal.h"
+  #include "hw_metal.h"
 
 #elif defined(HW_CUDA)
-  #include "hw/hw_cuda.h"
+  #include "hw_cuda.h"
 
 #elif defined(HW_WASM)
-  #include "hw/hw_wasm.h"
+  #include "hw_wasm.h"
 
 /* --- x86-64 --- */
 #elif defined(__AVX512VNNI__) && defined(__AVX512BW__)
-  #include "hw/hw_avx512.h"
+  #include "hw_avx512.h"
   #define HW_IDOT_KERNEL "avx512-vnni"
 
 #elif defined(__AVXVNNI__) && defined(__AVX2__)
-  #include "hw/hw_avx2.h"
+  #include "hw_avx2.h"
   #define HW_IDOT_KERNEL "avx-vnni"
 
 #elif defined(__AVX2__)
-  #include "hw/hw_avx2.h"
+  #include "hw_avx2.h"
   #define HW_IDOT_KERNEL "avx2"
 
 /* --- ARM --- */
 #elif defined(__ARM_FEATURE_SVE2) && defined(__ARM_FEATURE_SVE)
-  #include "hw/hw_sve2.h"
+  #include "hw_sve2.h"
   #define HW_IDOT_KERNEL "sve2-svdot"
 
 #elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-  #include "hw/hw_neon.h"
+  #include "hw_neon.h"
   #define HW_IDOT_KERNEL "neon-dotprod"
 
 #elif defined(__ARM_NEON)
-  #include "hw/hw_neon.h"
+  #include "hw_neon.h"
   #define HW_IDOT_KERNEL "neon"
 
 /* --- POWER --- */
 #elif defined(__VSX__)
-  #include "hw/hw_vsx.h"
+  #include "hw_vsx.h"
   #define HW_IDOT_KERNEL "vsx"
 
 /* --- fallback --- */
 #else
-  #include "hw/hw_scalar.h"
+  #include "hw_scalar.h"
   #define HW_IDOT_KERNEL "scalar"
 #endif
 
@@ -156,8 +156,8 @@ enum { WF_F32=0, WF_I8=1, WF_I4=2, WF_I2=3, WF_I4G=4, WF_Q4K=5, WF_Q6K=6 };
  *  Section 2: Shared kernels (not SIMD-specific).              *
  *  These use whatever dot_f32 / dot_i8i8 the backend provides. *
  * ============================================================ */
-#include "hw/hw_quant.h"       /* qrow_i8 (portable) */
-#include "hw/hw_deltanet.h"    /* dn_row_decay_acc, dn_row_update_dot */
+#include "hw_quant.h"       /* qrow_i8 (portable) */
+#include "hw_deltanet.h"    /* dn_row_decay_acc, dn_row_update_dot */
 
 /* ============================================================ *
  *  Section 3: Runtime dispatch (optional).                     *
@@ -165,6 +165,6 @@ enum { WF_F32=0, WF_I8=1, WF_I4=2, WF_I2=3, WF_I4G=4, WF_Q4K=5, WF_Q6K=6 };
  *  which provides function-pointer based dispatch for GPU/CPU  *
  *  selection at runtime. Otherwise this is a no-op.            *
  * ============================================================ */
-#include "hw/hw_backend.h"
+#include "hw_backend.h"
 
 #endif /* HW_H */

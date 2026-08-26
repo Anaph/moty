@@ -2,7 +2,7 @@
 
 *Research note — feasibility of adapting model behaviour **during** inference
 in Moty's CPU engines (qwen, gemma). Companion to the `TTA=` prototype in
-`c/qwen.c`.*
+`c/engines/qwen.c`.*
 
 ## 1. Scope and constraints
 
@@ -55,7 +55,7 @@ chain is one or two hops.
 ### 2.3 Fast weights — this engine already does it
 
 The key observation of this note: **Qwen3.5's Gated DeltaNet layers — already
-implemented in `c/qwen.c` (`deltanet_token`) — are fast-weight layers trained
+implemented in `c/engines/qwen.c` (`deltanet_token`) — are fast-weight layers trained
 online at inference time.** The recurrence
 
 &nbsp;&nbsp;&nbsp;&nbsp;S ← α·S + β·k·(v − Sᵀk)ᵀ
@@ -192,7 +192,7 @@ online LoRA (§2.2, backprop wall). **Natural next step** if the cache proves
 itself: the final-layer `down_proj` adapter (§2.5.3), then TTT-NTP-style
 placements (§2.3).
 
-### Prototype specification (implemented in `c/qwen.c`)
+### Prototype specification (implemented in `c/engines/qwen.c`)
 
 Environment: `TTA=cache|bias` (default off — hooks compile to no-ops for
 other engines and cost one branch when off), `TTA_N` (cache entries, default
@@ -228,7 +228,7 @@ real checkpoint.
 
 The rank-r lm_head adapter rejected above for the *default* path is now
 implemented as a third mode, `TTA=lora` — the LoRA runtime and trainer
-(`c/qwen_train.h`) made the machinery cheap to reuse. It keeps a rank-r
+(`c/engines/qwen_train.h`) made the machinery cheap to reuse. It keeps a rank-r
 adapter `logits += (α/r)·B·(A·h)` with A[r,D] a fixed random projection
 (deterministic init, α = 2r) and B[V,r] starting at zero, so a fresh
 adapter is an exact no-op. On each observed token it runs closed-form SGD

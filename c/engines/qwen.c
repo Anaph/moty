@@ -23,12 +23,12 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include "nn.h"
-#include "nn_rope.h"
-#include "st.h"
-#include "gguf.h"
-#include "stw.h"
-#include "tok.h"
+#include "nn/nn.h"
+#include "nn/nn_rope.h"
+#include "io/st.h"
+#include "io/gguf.h"
+#include "util/stw.h"
+#include "tok/tok.h"
 
 #define ENGINE_TAG "qwen"
 #define ENGINE_EOT "<|im_end|>\n"
@@ -86,7 +86,7 @@ typedef struct {
     Lora lm_lora;                          /* adattatore LoRA sull'lm_head (r=0 = spento) */
 } Model;
 
-#include "nn_deltanet.h"
+#include "nn/nn_deltanet.h"
 
 /* --- TTA sperimentale: adattamento lento a runtime (docs/online-learning.md).
  * TTA=cache -> neural cache (senza gradienti); TTA=bias -> bias sui logit con
@@ -99,7 +99,7 @@ static void lora_load(Model *m);
 #define ENGINE_POST_INIT(m)       lora_load(m)
 #define ENGINE_MICRO 1            /* step() sa girare con embed NULL (gather per riga) */
 
-#include "runtime.h"
+#include "runtime/runtime.h"
 
 enum { TTA_OFF = 0, TTA_CACHE = 1, TTA_BIAS = 2, TTA_LORA = 3 };
 static struct {

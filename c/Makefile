@@ -1,3 +1,4 @@
+
 # --- Target detection ---
 # Ask the compiler what it actually targets (rofl0r's note on #129): a gcc/clang
 # toolchain reports its target triple via `-dumpmachine`, e.g.
@@ -60,7 +61,7 @@ $(warning libomp not found: building single-threaded. For multithreading: brew i
 OMPC    =
 OMPL    =
 endif
-CFLAGS  = -O2 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -I. -O2 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 # Opt-in: ARCH=native appends -mcpu=native (arm64 clang uses -mcpu, not -march),
 # which unlocks the i8mm SMMLA int8/int4 dot kernels in glm.c. ARCH unset ->
 # no -mcpu, default build byte-identical. Apple clang knows apple-m4 / native.
@@ -80,7 +81,7 @@ else ifneq ($(IS_WIN),)
 # a v3 build simply compiles out the VNNI path - safe on any x86-64.
 CC      = gcc
 ARCH   ?= x86-64-v3
-CFLAGS  = -D_FILE_OFFSET_BITS=64 -O2 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -I. -D_FILE_OFFSET_BITS=64 -O2 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 # -lpsapi: compat.h calls GetProcessMemoryInfo (rss_gb). It's linked via
 # #pragma comment(lib,"psapi.lib") for MSVC, but MinGW gcc ignores that pragma
 # (warns), so link psapi explicitly or the build fails undefined-reference on
@@ -95,7 +96,7 @@ ifneq (,$(PPC64))
 # (validated token-exact vs the transformers oracle on a POWER8 S824).
 CC      = gcc
 ARCH   ?= native
-CFLAGS  = -O2 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -I. -O2 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm -fopenmp -pthread
 EXE     =
 else
@@ -109,7 +110,7 @@ ifneq (,$(ARMV7))
 CC      = gcc
 ARCH   ?= armv7-a
 FPU    ?= neon-vfpv4
-CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -mfpu=$(FPU) -munaligned-access -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -I. -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -mfpu=$(FPU) -munaligned-access -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm -fopenmp -pthread
 EXE     =
 else
@@ -120,7 +121,7 @@ CC      = gcc
 # ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
 # -pthread: Linux lo tira dentro via -fopenmp, i *BSD no e le pthread_* non risolvono (#219).
 ARCH   ?= native
-CFLAGS  = -O2 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -I. -O2 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm -fopenmp -pthread
 EXE     =
 endif
@@ -148,58 +149,61 @@ gemma: gemma$(EXE)
 moty: moty$(EXE)
 endif
 
-glm$(EXE): glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h
-	$(CC) $(CFLAGS) glm.c -o glm$(EXE) $(LDFLAGS)
+# ---- source layout (v2): engines/ nn/ hw/ runtime/ io/ tok/ util/ ----
+# All includes are repo-c-relative ("nn/nn.h", "hw/hw.h", ...), so every
+# compile adds -I. A shared deps list keeps the .o rules honest.
+NN_CORE   = nn/nn.h nn/nn_alloc.h nn/nn_norm.h nn/nn_sample.h nn/nn_gemm.h hw/hw.h
+RUNTIME_H = runtime/runtime.h runtime/rt_model_load.h runtime/rt_kv_cache.h runtime/rt_gen_loop.h runtime/rt_env_cfg.h
+IO_H      = io/st.h io/gguf.h io/tier.h
+TOK_H     = tok/tok.h tok/tok_unicode.h
+UTIL_H    = util/json.h util/compat.h util/prof.h
 
-olmoe$(EXE): olmoe.c nn.h nn_alloc.h nn_norm.h nn_sample.h nn_gemm.h moe.h st.h json.h tok.h tok_unicode.h compat.h
-	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
+glm$(EXE): engines/glm.c io/st.h io/uring.h util/json.h $(TOK_H) util/compat.h util/grammar.h
+	$(CC) $(CFLAGS) engines/glm.c -o glm$(EXE) $(LDFLAGS)
 
-qwen$(EXE): qwen.c nn.h nn_rope.h nn_deltanet.h nn_alloc.h nn_norm.h nn_sample.h nn_gemm.h runtime.h st.h gguf.h stw.h qwen_train.h json.h tok.h tok_unicode.h compat.h
-	$(CC) $(CFLAGS) qwen.c -o qwen$(EXE) $(LDFLAGS)
+olmoe$(EXE): engines/olmoe.c $(NN_CORE) runtime/moe.h $(IO_H) $(TOK_H) $(UTIL_H)
+	$(CC) $(CFLAGS) engines/olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
-qwenmoe$(EXE): qwenmoe.c nn.h nn_rope.h nn_deltanet.h nn_alloc.h nn_norm.h nn_sample.h nn_gemm.h moe.h tier.h runtime.h st.h gguf.h json.h tok.h tok_unicode.h compat.h
-	$(CC) $(CFLAGS) qwenmoe.c -o qwenmoe$(EXE) $(LDFLAGS)
+qwen$(EXE): engines/qwen.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/runtime.h $(IO_H) util/stw.h engines/qwen_train.h $(UTIL_H)
+	$(CC) $(CFLAGS) engines/qwen.c -o qwen$(EXE) $(LDFLAGS)
 
-lfm2$(EXE): lfm2.c nn.h nn_rope.h nn_attn.h nn_conv.h nn_ffn.h nn_moe_sigmoid.h nn_alloc.h nn_norm.h nn_sample.h nn_gemm.h moe.h tier.h runtime.h st.h gguf.h json.h tok.h tok_unicode.h compat.h
-	$(CC) $(CFLAGS) lfm2.c -o lfm2$(EXE) $(LDFLAGS)
+qwenmoe$(EXE): engines/qwenmoe.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/moe.h runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+	$(CC) $(CFLAGS) engines/qwenmoe.c -o qwenmoe$(EXE) $(LDFLAGS)
+
+lfm2$(EXE): engines/lfm2.c $(NN_CORE) nn/nn_rope.h nn/nn_attn.h nn/nn_conv.h nn/nn_ffn.h nn/nn_moe_sigmoid.h runtime/moe.h runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+	$(CC) $(CFLAGS) engines/lfm2.c -o lfm2$(EXE) $(LDFLAGS)
 
 # ---- Unified multi-model binary ----
-# Each model_X.c is compiled to model_X.o with its main() renamed. The .o files
-# are linked with moty.o (the dispatcher). To add a model:
-#   1. Add a compile rule: $(CC) $(CFLAGS) -Dmain=model_X_main -c model_X.c
+# Each engines/model_X.c is compiled to model_X.o with its main() renamed.
+# The .o files are linked with moty.o (the dispatcher). To add a model:
+#   1. Add a compile rule: $(CC) $(CFLAGS) -Dmain=model_X_main -c engines/model_X.c
 #   2. Add model_X.o to the moty link line
 #   3. Add {"arch", model_X_main} to the models[] table in moty.c
+# See docs/adding-a-model.md for the full recipe (config, hooks, layers, tests).
 
-LFM2_DEPS = nn.h nn_rope.h nn_attn.h nn_conv.h nn_ffn.h nn_moe_sigmoid.h nn_alloc.h nn_norm.h nn_sample.h nn_gemm.h moe.h tier.h runtime.h st.h gguf.h json.h tok.h tok_unicode.h compat.h
-QWENMOE_DEPS = nn.h nn_rope.h nn_deltanet.h nn_alloc.h nn_norm.h nn_sample.h nn_gemm.h moe.h tier.h runtime.h st.h gguf.h json.h tok.h tok_unicode.h compat.h
+lfm2.o: engines/lfm2.c $(NN_CORE) nn/nn_rope.h nn/nn_attn.h nn/nn_conv.h nn/nn_ffn.h nn/nn_moe_sigmoid.h runtime/moe.h runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+	$(CC) $(CFLAGS) -Dmain=lfm2_main -c engines/lfm2.c -o lfm2.o
 
-GEMMA_DEPS = nn.h nn_alloc.h nn_norm.h nn_sample.h nn_gemm.h runtime.h st.h gguf.h json.h tok.h tok_unicode.h compat.h
-OLMOE_DEPS = nn.h nn_alloc.h nn_norm.h nn_sample.h nn_gemm.h moe.h tier.h runtime.h st.h gguf.h json.h tok.h tok_unicode.h compat.h
-QWEN_DEPS = nn.h nn_rope.h nn_deltanet.h nn_alloc.h nn_norm.h nn_sample.h nn_gemm.h moe.h tier.h runtime.h st.h gguf.h json.h tok.h tok_unicode.h compat.h stw.h qwen_train.h
+qwenmoe.o: engines/qwenmoe.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/moe.h runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+	$(CC) $(CFLAGS) -Dmain=qwenmoe_main -c engines/qwenmoe.c -o qwenmoe.o
 
-lfm2.o: lfm2.c $(LFM2_DEPS)
-	$(CC) $(CFLAGS) -Dmain=lfm2_main -c lfm2.c -o lfm2.o
+gemma.o: engines/gemma.c $(NN_CORE) runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+	$(CC) $(CFLAGS) -Dmain=gemma_main -c engines/gemma.c -o gemma.o
 
-qwenmoe.o: qwenmoe.c $(QWENMOE_DEPS)
-	$(CC) $(CFLAGS) -Dmain=qwenmoe_main -c qwenmoe.c -o qwenmoe.o
+olmoe.o: engines/olmoe.c $(NN_CORE) runtime/moe.h $(IO_H) $(TOK_H) $(UTIL_H)
+	$(CC) $(CFLAGS) -Dmain=olmoe_main -c engines/olmoe.c -o olmoe.o
 
-gemma.o: gemma.c $(GEMMA_DEPS)
-	$(CC) $(CFLAGS) -Dmain=gemma_main -c gemma.c -o gemma.o
+qwen.o: engines/qwen.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/runtime.h $(IO_H) util/stw.h engines/qwen_train.h $(UTIL_H)
+	$(CC) $(CFLAGS) -Dmain=qwen_main -c engines/qwen.c -o qwen.o
 
-olmoe.o: olmoe.c $(OLMOE_DEPS)
-	$(CC) $(CFLAGS) -Dmain=olmoe_main -c olmoe.c -o olmoe.o
-
-qwen.o: qwen.c $(QWEN_DEPS)
-	$(CC) $(CFLAGS) -Dmain=qwen_main -c qwen.c -o qwen.o
-
-glm.o: glm.c
-	$(CC) $(CFLAGS) -Dmain=glm_main -c glm.c -o glm.o
+glm.o: engines/glm.c io/st.h io/uring.h util/json.h $(TOK_H) util/compat.h util/grammar.h
+	$(CC) $(CFLAGS) -Dmain=glm_main -c engines/glm.c -o glm.o
 
 moty$(EXE): moty.c lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o
 	$(CC) $(CFLAGS) moty.c lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o -o moty$(EXE) $(LDFLAGS)
 
-gemma$(EXE): gemma.c nn.h nn_alloc.h nn_norm.h nn_sample.h nn_gemm.h runtime.h st.h gguf.h json.h tok.h tok_unicode.h compat.h
-	$(CC) $(CFLAGS) gemma.c -o gemma$(EXE) $(LDFLAGS)
+gemma$(EXE): engines/gemma.c $(NN_CORE) runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+	$(CC) $(CFLAGS) engines/gemma.c -o gemma$(EXE) $(LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks

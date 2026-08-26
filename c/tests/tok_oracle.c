@@ -4,7 +4,7 @@
  * Stampa ENCODE m/n e DECODE round-trip; exit 0 solo con match completo.
  * E' lo strumento primario di bring-up per nuovi tokenizer (es. SP di Gemma). */
 #define _GNU_SOURCE
-#include "../tok.h"
+#include "../tok/tok.h"
 
 int main(int argc, char **argv){
     if(argc<2){ fprintf(stderr,"usage: %s tokenizer.json < cases\n",argv[0]); return 1; }

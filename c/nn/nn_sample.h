@@ -8,7 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include "nn_alloc.h"   /* falloc */
+#include "nn/nn_alloc.h"   /* falloc */
 
 /* ---------- sampling (temperatura + nucleus) ---------- */
 static float g_temp = 0.7f, g_nuc = 0.95f;

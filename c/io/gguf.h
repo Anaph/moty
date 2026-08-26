@@ -14,7 +14,7 @@
  * versione 1 vengono rifiutati rumorosamente. */
 #ifndef GGUF_H
 #define GGUF_H
-#include "st.h"
+#include "io/st.h"
 
 /* ---- tipi dei valori dei metadati (spec GGUF) ---- */
 enum { GG_U8=0, GG_I8=1, GG_U16=2, GG_I16=3, GG_U32=4, GG_I32=5, GG_F32=6,
