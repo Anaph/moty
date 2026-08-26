@@ -1,0 +1,25 @@
+# binari compilati (si rigenerano con make)
+c/glm
+c/glm.exe
+c/olmoe
+c/olmoe.exe
+c/qwen
+c/qwen.exe
+c/qwenmoe
+c/qwenmoe.exe
+c/gemma
+c/gemma.exe
+c/lfm2
+c/lfm2.exe
+c/moty
+c/moty.exe
+c/*.o
+
+# build separata dei test (cmake + gtest)
+c/tests/build/
+c/tests/build-native/
+
+# pesi modello / artefatti di run
+*.safetensors
+stats*.txt
+*.log

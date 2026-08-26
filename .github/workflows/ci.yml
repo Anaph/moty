@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+jobs:
+  engine:
+    name: Engine (Linux, CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache gtest (FetchContent)
+        uses: actions/cache@v4
+        with:
+          path: c/tests/build/_deps
+          key: gtest-v1.14.0
+      - name: Build engines
+        run: cd c && make all
+      - name: Test suite (gtest via CMake + ctest)
+        run: cd c && make test
+      - name: Test suite (native march)
+        run: cd c && make test-native
+
+  # Cross-compile + QEMU parity for the ARM SIMD tiers added in WP1.1/1.4.
+  # x86 runners can't run ARM code natively; qemu-user executes the simd parity
+  # suite (bit-exact vs scalar int64/double reference) under each tier so a
+  # regression on SVE2/SVE1/NEON-baseline/armv7 is caught before merge.
+  arm-simd:
+    name: ARM SIMD tiers (cross + qemu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cross toolchains + qemu-user
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf qemu-user
+      - name: aarch64 simd parity (NEON / dotprod / SVE1 / SVE2)
+        run: |
+          cd c/tests
+          runner=../../.github/simd_runner.c
+          for spec in "armv8-a:neon" "armv8.2-a+dotprod:dotprod" "armv8-a+sve:sve1" "armv9-a:sve2"; do
+            march=${spec%%:*}; tier=${spec#*:}
+            aarch64-linux-gnu-gcc -O2 -march=$march -static -I. simd_tests.c $runner -o /tmp/sm_$tier -lm
+            echo ":: $tier ($(qemu-aarch64 -cpu max /tmp/sm_$tier 2>&1 | grep -o 'idot=[^ ]* f32=[^ ]*' | head -1))"
+            qemu-aarch64 -cpu max /tmp/sm_$tier 2>&1 | tail -1 | grep -q "ALL PASS" || { echo "FAIL $tier"; exit 1; }
+          done
+      - name: aarch64 engine cross-compile (SVE2)
+        run: cd c && make clean && make all CC=aarch64-linux-gnu-gcc ARCH=armv9-a
+      - name: armv7 simd parity (Cortex-A7 / A15, non-dotprod NEON)
+        run: |
+          cd c/tests
+          runner=../../.github/simd_runner.c
+          arm-linux-gnueabihf-gcc -O2 -march=armv7-a -mfpu=neon-vfpv4 -static -I. simd_tests.c $runner -o /tmp/sm_armv7 -lm
+          for cpu in cortex-a7 cortex-a15; do
+            echo ":: armv7 $cpu"
+            qemu-arm -cpu $cpu /tmp/sm_armv7 2>&1 | tail -1 | grep -q "ALL PASS" || { echo "FAIL armv7 $cpu"; exit 1; }
+          done
+      - name: armv7 engine cross-compile (dense trio; glm excluded, AArch64-only)
+        run: cd c && make clean && make all CC=arm-linux-gnueabihf-gcc
+

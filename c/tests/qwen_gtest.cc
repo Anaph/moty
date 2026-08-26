@@ -1,0 +1,99 @@
+// Glue gtest per qwen_tests.c: SOLO dichiarazioni extern "C" e macro TEST.
+#include <gtest/gtest.h>
+
+extern "C" {
+int qt_rope(void);
+int qt_gqa(void);
+int qt_quant(void);
+int qt_quant_batch(void);
+int qt_int4_pack(void);
+int qt_int4_grouped(void);
+int qt_int4_matmul_ref(void);
+int qt_int2_matmul_ref(void);
+int qt_sampler(void);
+int qt_edges(void);
+int qt_gated_layout(void);
+int qt_deltanet_small(void);
+int qt_deltanet_large(void);
+int qt_tiny_dense(void);
+int qt_tiny_qbits(void);
+int qt_tiny_qbits4(void);
+int qt_tiny_hybrid(void);
+int qt_memknob_parity(void);
+int qt_memknob_env(void);
+int qt_memknob_q8_parity(void);
+int qt_gguf_tiny_parity(void);
+int qt_gguf_q4_0_load(void);
+int qt_kv_i8_roundtrip(void);
+int qt_kv_i8_tolerance(void);
+int qt_kv_i8_hybrid(void);
+int qt_prefill_chunk(void);
+int qt_prefill_chunk_tta(void);
+int qt_micro_parity(void);
+int qt_embed_q8(void);
+int qt_stw_st_parity(void);
+int qt_lora_zero_noop(void);
+int qt_lora_effect(void);
+int qt_lora_roundtrip(void);
+int qt_bw_rope_inv(void);
+int qt_bw_rmsnorm(void);
+int qt_grad_fd(void);
+int qt_train_descends(void);
+int qt_train_e2e(void);
+int qt_tta_off_bitexact(void);
+int qt_tta_cache_boost(void);
+int qt_tta_bias_direction(void);
+int qt_tta_ppl_proxy(void);
+int qt_tta_lora_off_noop(void);
+int qt_tta_lora_direction(void);
+int qt_tta_lora_reset(void);
+}
+
+#define C_TEST(suite, name, fn) \
+    TEST(suite, name) { int r = fn(); if (r == 2) GTEST_SKIP(); EXPECT_EQ(0, r); }
+
+C_TEST(QwenRope,     MatchesDoubleRef,  qt_rope)
+C_TEST(QwenGqa,      MatchesReplicated, qt_gqa)
+C_TEST(QwenQuant,    Int8Tolerance,     qt_quant)
+C_TEST(QwenQuant,    BatchBitExact,     qt_quant_batch)
+C_TEST(QwenInt4,     PackRoundtrip,     qt_int4_pack)
+C_TEST(QwenInt4,     GroupedScales,     qt_int4_grouped)
+C_TEST(QwenInt4,     MatmulVsRef,       qt_int4_matmul_ref)
+C_TEST(QwenInt2,     MatmulVsRef,       qt_int2_matmul_ref)
+C_TEST(QwenSampler,  Deterministic,     qt_sampler)
+C_TEST(QwenDeltanet, NumericEdges,      qt_edges)
+C_TEST(QwenGated,    QProjLayout,       qt_gated_layout)
+C_TEST(QwenDeltanet, DoubleRefSmall,    qt_deltanet_small)
+C_TEST(QwenDeltanet, DoubleRefLarge,    qt_deltanet_large)
+C_TEST(QwenTiny,     DenseDeterministic, qt_tiny_dense)
+C_TEST(QwenTiny,     Qbits8Finite,       qt_tiny_qbits)
+C_TEST(QwenTiny,     Qbits4Deterministic, qt_tiny_qbits4)
+C_TEST(QwenTiny,     HybridDeterministic, qt_tiny_hybrid)
+C_TEST(QwenMemKnob,  StreamTokenParity,   qt_memknob_parity)
+C_TEST(QwenMemKnob,  EnvPrecedence,       qt_memknob_env)
+C_TEST(QwenMemKnob,  StreamInt8Parity,    qt_memknob_q8_parity)
+C_TEST(QwenGguf,     TinyParity,          qt_gguf_tiny_parity)
+C_TEST(QwenGguf,     Q40LoadPaths,        qt_gguf_q4_0_load)
+C_TEST(QwenKv8,      RowRoundtrip,        qt_kv_i8_roundtrip)
+C_TEST(QwenKv8,      LogitsTolerance,     qt_kv_i8_tolerance)
+C_TEST(QwenKv8,      HybridLayout,        qt_kv_i8_hybrid)
+C_TEST(QwenPrefill,  ChunkBitExact,       qt_prefill_chunk)
+C_TEST(QwenPrefill,  ChunkTtaStash,       qt_prefill_chunk_tta)
+C_TEST(QwenMicro,    StreamBitExact,      qt_micro_parity)
+C_TEST(QwenQuant,    EmbedQ8ChunkExact,   qt_embed_q8)
+C_TEST(QwenLora,     StwStParity,         qt_stw_st_parity)
+C_TEST(QwenLora,     ZeroBNoop,           qt_lora_zero_noop)
+C_TEST(QwenLora,     EffectMatchesRef,    qt_lora_effect)
+C_TEST(QwenLora,     Roundtrip,           qt_lora_roundtrip)
+C_TEST(QwenTrain,    RopeInverse,         qt_bw_rope_inv)
+C_TEST(QwenTrain,    RmsNormBackward,     qt_bw_rmsnorm)
+C_TEST(QwenTrain,    GradFiniteDiff,      qt_grad_fd)
+C_TEST(QwenTrain,    LossDescends,        qt_train_descends)
+C_TEST(QwenTrain,    EndToEnd,            qt_train_e2e)
+C_TEST(QwenTta,      OffBitExact,         qt_tta_off_bitexact)
+C_TEST(QwenTta,      CacheBoost,          qt_tta_cache_boost)
+C_TEST(QwenTta,      BiasDirection,       qt_tta_bias_direction)
+C_TEST(QwenTta,      PplProxy,            qt_tta_ppl_proxy)
+C_TEST(QwenTta,      LoraZeroBNoop,       qt_tta_lora_off_noop)
+C_TEST(QwenTta,      LoraDirection,       qt_tta_lora_direction)
+C_TEST(QwenTta,      LoraReset,           qt_tta_lora_reset)

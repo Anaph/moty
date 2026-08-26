@@ -1,0 +1,149 @@
+# CPU inference performance: caches, memory, and cores
+
+*Research note for Moty's dense engines (qwen, gemma). Companion to the
+optimizations landed on this branch; numbers from `c/tests/build/bench` unless
+stated otherwise.*
+
+## 1. The memory-bandwidth wall
+
+Single-token decode of a dense transformer reads **every weight byte exactly
+once per token**: each matrix element participates in one multiply of a GEMV
+and is never reused. Arithmetic intensity is ~0.5 FLOP/byte at f32 (2 FLOP per
+4-byte weight) — orders of magnitude to the left of any CPU roofline knee. The
+consequence is a hard ceiling:
+
+&nbsp;&nbsp;&nbsp;&nbsp;**tok/s ≤ RAM bandwidth ÷ weight bytes per token**
+
+At Qwen3-4B scale (~4B params):
+
+| storage | bytes/token | 25 GB/s (2-ch DDR4) | 60 GB/s (2-ch DDR5) | 250 GB/s (Apple M-max) |
+|---|---|---|---|---|
+| f32 | ~16 GB | 1.5 tok/s | 3.7 | 15 |
+| int8 (`QBITS=8`) | ~4 GB | 6 | 15 | 60 |
+| int4 (`QBITS=4`) | ~2 GB | 12 | 30 | 120 |
+
+Everything else is noise at decode: KV-cache reads are ~288 KB/token at 4k
+context (0.01% of weight traffic), activations and the DeltaNet S-state are
+kilobytes. Cores beyond the point of bandwidth saturation add nothing —
+`THREADS` sweeps plateau exactly where aggregate read bandwidth peaks.
+
+**Prefill is the exception.** With S tokens in flight, each weight row can be
+applied to all S activations per read — arithmetic intensity scales with S and
+the workload becomes compute-bound. This asymmetry drives the batching work
+below.
+
+Cache-level view of the hot loops (4B dims): a weight row is 2.5–38 KB — it
+transits L1/L2 once and is gone; the only *resident* data are the activation
+vector (10–38 KB, stays hot in L1/L2 across all O rows) and, at prefill, the
+S×I activation block. The K/V cache layout `[kv_head][t][hd]` streams
+t-contiguously per head (full cache-line utilization). There is no blocking
+scheme that makes decode weight traffic cacheable — the working set is the
+model.
+
+## 2. What this branch implements (measured)
+
+Container: 4 shared cores, AVX512-VNNI, portable-build kernels for the table
+(scalar tier — relative effects transfer; native-tier absolute numbers in
+`bench` output).
+
+1. **OpenMP hot-thread tuning + re-exec** (`runtime.h: omp_hot_tune`, ported
+   from glm.c where it measured **66.9 s → 20.9 s** on a 32-core Zen5 matmul
+   run). Dense decode enters ~250–290 tiny parallel regions per token; with
+   the default passive wait policy the team goes to sleep between them.
+   `OMP_WAIT_POLICY=active` + `GOMP_SPINCOUNT` + `OMP_PROC_BIND=close` +
+   `OMP_DYNAMIC=FALSE` are seeded (never overriding user-set values) and the
+   process re-execs once so libgomp picks them up. Kill-switch:
+   `MOTY_NO_OMP_TUNE=1`. On the 4-core noisy container the effect is neutral
+   (spin competes with oversubscription); the win grows with core count.
+2. **`THREADS=N`** — first thread-count knob in the engines; applied before
+   load so weight quantization, scratch sizing and all regions obey it.
+   `OMP_NUM_THREADS` still works.
+3. **Per-model attention scratch** (`Model.att_sc`): the attention region
+   used to `malloc`/`free` a per-thread score buffer on **every layer, every
+   token** (2×36 allocations/token at 4B); now one buffer sized
+   `threads × max_t` lives on the Model, indexed by `omp_get_thread_num()`
+   (glm's pattern).
+4. **Batched activation quantization** (`matmul_q_s`): the int8 GEMV now
+   quantizes all S activation rows once and reads each weight row **once for
+   all S tokens** inside a single parallel region. Measured on the container:
+   34.5 → 50.9 → **58.9 GFLOP/s** at S = 1 → 8 → 64 with weight traffic
+   constant — the prefill weight-reuse win, bit-identical numerics. The
+   batched `mlp()` removes S× region re-forks per layer on top.
+5. **DeltaNet single region**: conv + recurrence share one parallel region
+   per token (was two). Minor; taken because it is free.
+6. **int8 embeddings under `QBITS=8`** — the embedding table used to stay
+   f32 resident, so with a tied lm_head the largest single GEMV of decode
+   (V×D: 622 MB at 0.6B, 1.5 GB at 4B) still streamed f32 bytes after every
+   other matrix was quantized. Now the table is quantized per-row at load
+   (chunk-wise, so the load transient is one chunk, not the table), the
+   input gather dequantizes one row, and the tied head runs the int8 kernel:
+   decode bytes/token at `QBITS=8` are now genuinely ~4× below f32.
+7. **Micro-RSS mode** (`MICRO=1`, qwen) — the opposite trade: minimum
+   resident memory instead of maximum speed. No weight is resident (embedding
+   rows gathered per token, every GEMV re-reads its matrix in constant 4 MB
+   chunks, page cache dropped after use); output stays bit-identical to the
+   resident f32 path. Decode cost becomes *disk* bandwidth ÷ model bytes —
+   the same wall as §1 with the disk in place of RAM. For hard cgroup /
+   embedded limits where tok/s is secondary.
+8. **int4 weights (`QBITS=4`)** — the "single largest available win" from
+   the deferred list, now landed: glm's bit-exact-validated int4 kernels
+   (packing, exact f32×int4 matmul, group-wise scales `QGROUP`, default 32)
+   lifted into the shared core. Layer weights halve again vs int8 (~2 GB at
+   4B → ~2× decode ceiling per §1); embeddings and the lm_head deliberately
+   stay int8 (the head is the most quantization-sensitive GEMV). The int4
+   IDOT kernel (`dot_i4i8`) is ported and tested but not yet wired — the
+   exact kernel already wins 4× on weight traffic.
+9. **int8 KV cache (`KV_BITS=8`)** — promoted from the deferred list since
+   at 4k context the f32 KV (1.2 GB at 4B) rivals quantized weights.
+   Per-(head, position) scales, quantize-on-write, one-sided error (queries
+   stay f32 via `dot_f32i8`). Works with gemma's sliding windows, shared-KV
+   aliasing and k_eq_v.
+10. **Chunked prefill (`PREFILL_CHUNK`)** — bounds the S-proportional
+   activation peak (mlp scratch alone is 2·S·inter floats) and the permanent
+   `matmul_q_s` scratch growth to a constant, bit-identically; opt-in
+   because with `MEM_GB` every chunk re-reads the streamed layers.
+11. **GGUF reading (`GGUF=`)** — single-file models; Q4_0 repacks
+   losslessly onto the int4 kernels, K-quants dequantize on load. Not a
+   speed feature per se, but it removes the f32 load transient and lets the
+   engine start from pre-quantized files.
+
+## 3. Deferred optimizations, cost/benefit at 4B
+
+Ordered by expected value (items 1 and 6 of the original list have since
+landed as §2.8/§2.9 above):
+
+1. **Speculative decoding** — the structural escape from the wall: draft
+   cheaply, verify K tokens in one batched forward (weight bytes amortize
+   over K like prefill). Qwen3.5's cheap linear layers or an n-gram draft
+   both fit; glm.c has a working MTP/n-gram speculation loop to model on.
+2. **Weight interleave for VNNI** — reorder int8 rows so the dot kernel loads
+   are perfectly sequential across the unrolled accumulators (llama.cpp /
+   [Neural Speed](https://arxiv.org/abs/2411.19542)-style fused layouts
+   reach >90% of bandwidth on INT4 GEMV). Moderate win over the current
+   row-major int8 (already sequential per row); real gain appears with int4.
+3. **NUMA placement** — first-touch or interleaved weight allocation +
+   binding the team per socket; only matters on multi-socket / chiplet-split
+   machines ([ArcLight](https://arxiv.org/abs/2603.07770) reports the
+   cross-NUMA bottleneck dominating many-core CPU inference).
+4. **Hugepages** — `MADV_HUGEPAGE` on the big weight buffers cuts TLB misses
+   during streaming; single-digit % on Linux, ~10 lines.
+5. **KV-cache paging** — int8 KV landed (§2.9); page-level eviction only
+   matters at 100k+ context, and the hybrid architectures (DeltaNet, sliding
+   windows) already bound this structurally.
+6. **Async prefetch of streamed layers** — the MEM_GB path already issues
+   `WILLNEED` for layer i+1; a dedicated I/O thread
+   ([async KV prefetching](https://arxiv.org/abs/2504.06319) analog) could
+   overlap more aggressively.
+
+## 4. LoRA training cost model
+
+Training (TRAIN mode, f32 base required) is bandwidth-heavy in one place: the
+chunked cross-entropy head. Per window of S tokens with chunk Sc, the lm_head
+matrix (V×D ≈ 1.5 GB f32 at 4B) streams once forward and once backward per
+chunk: ≈ 2·(S/Sc)·1.5 GB ≈ 50 GB per 512-token window at Sc=32 — a few
+seconds at desktop bandwidth, dominating the window unless the trained-layer
+count is large. The trained-layer backward is ~2× the forward FLOPs of those
+layers; activation stash ≈ 124 MB per trained layer at S=512 (dominated by
+the H×S×S attention probabilities). Adapter/optimizer state is megabytes.
+Practical guidance: keep `TRAIN_CTX` moderate (256–512), raise
+`TRAIN_CE_CHUNK` if RAM allows, and prefer few high-layers over many.
