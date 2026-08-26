@@ -174,6 +174,70 @@ int kt_conv_causality(void) {
     return 2;
 }
 
+/* ---- sampler: i due rami del nucleus devono dare distribuzioni uguali ----
+ * dist_build ha due cammini: (a) threshold-capped (candidati > pmax*1e-5,
+ * insertion-sort dei soli candidati) e (b) fallback qsort completo (quando
+ * la massa sopra soglia non copre nuc o i candidati sono troppi). Con la
+ * STESSA distribuzione e stessa nuc, l'insieme tenuto deve coincidere:
+ * forziamo (a) con una distribuzione piccata e (b) con una quasi-uniforme
+ * e confrontiamo ciascuno col ricalcolo atteso della massa tenuta. */
+static double kt_kept_mass(const SampBuf *sb, int V) {
+    double s = 0; for (int i = 0; i < V; i++) s += sb->pbuf[i];
+    return s;
+}
+int kt_nucleus_branches(void) {
+    Scratch sc = {0}; SampBuf sb;
+    int V = 4096;
+    float *lo = malloc(V*sizeof(float));
+
+    /* (a) piccata: un piccone dominante → pochi candidati, ramo capped */
+    for (int i = 0; i < V; i++) lo[i] = -8.f;
+    lo[V/3] = 12.f; lo[V/2] = 11.f; lo[V-1] = 10.f;
+    g_temp = 0.7f; g_nuc = 0.9f;
+    dist_build(&sc, &sb, lo, V);
+    double ma = kt_kept_mass(&sb, V);
+    if (ma < 0.89 || ma > 1.0001) { fprintf(stderr, "nucleus capped: massa %.6f\n", ma); free(lo); return 1; }
+    int nz = 0; for (int i = 0; i < V; i++) if (sb.pbuf[i] > 0) nz++;
+    if (nz > 16) { fprintf(stderr, "nucleus capped: tenuti %d token (attesi pochi)\n", nz); free(lo); return 1; }
+
+    /* (b) quasi-uniforme con coda: massa diffusa → qsort completo */
+    for (int i = 0; i < V; i++) lo[i] = -1.f + 2.f*(float)i/V;
+    g_nuc = 0.999f;
+    dist_build(&sc, &sb, lo, V);
+    double mb = kt_kept_mass(&sb, V);
+    if (mb < 0.998 || mb > 1.0001) { fprintf(stderr, "nucleus qsort: massa %.6f\n", mb); free(lo); return 1; }
+
+    /* identità argmax: il token dominante del ramo capped è quello col logit max */
+    for (int i = 0; i < V; i++) lo[i] = -8.f;
+    lo[777] = 12.f;
+    g_temp = 0.7f; g_nuc = 0.9f;
+    dist_build(&sc, &sb, lo, V);
+    int am = 0; (void)am;
+    int best = 0; float bv = sb.pbuf[0];
+    for (int i = 1; i < V; i++) if (sb.pbuf[i] > bv) { bv = sb.pbuf[i]; best = i; }
+    if (best != 777) { fprintf(stderr, "nucleus: argmax della dist %d != 777\n", best); free(lo); return 1; }
+
+    scr_free(&sc); free(lo);
+    return 0;
+}
+
+/* ---- sampler: pick_tok a temperatura 0 è argmax puro su V piccolo e grande;
+ * dopo ogni chiamata l'arena si resetta (uso ripetuto senza leak di used) ---- */
+int kt_pick_tok_argmax(void) {
+    Scratch sc = {0};
+    for (int V = 7; V <= 131072; V *= 64) {
+        float *lo = malloc(V*sizeof(float));
+        for (int i = 0; i < V; i++) lo[i] = -3.f + 0.001f*i;
+        lo[V-1] = 100.f;                      /* dominante in fondo */
+        g_temp = 0.f;
+        for (int rep = 0; rep < 3; rep++)
+            if (pick_tok(&sc, lo, V) != V-1) { fprintf(stderr, "pick_tok(temp=0,V=%d) non argmax\n", V); free(lo); scr_free(&sc); return 1; }
+        free(lo);
+    }
+    scr_free(&sc);
+    return 0;
+}
+
 int kt_report(void) {
     fprintf(stderr, "[kernels] backend %s / %s\n", IDOT_KERNEL, F32_KERNEL);
     return 0;

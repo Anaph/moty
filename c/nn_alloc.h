@@ -64,18 +64,27 @@ static void grow(void **p, int64_t *cap, int64_t need, size_t esz, const char *w
  *      che puo' reallocare; un take dopo la reserve non muove mai la base,
  *      quindi i puntatori consegnati prima restano validi
  *   3. scr_take()    consegna chunk allineati a 64 byte (cache line) */
-typedef struct Scratch { char *base; int64_t cap, used; } Scratch;
+typedef struct Scratch { char *raw; int off; char *base; int64_t cap, used; } Scratch;
 
 static void scr_reset(Scratch *s) { s->used = 0; }
-static void scr_free(Scratch *s) { free(s->base); s->base = NULL; s->cap = s->used = 0; }
+static void scr_free(Scratch *s) { free(s->raw); s->raw = NULL; s->base = NULL; s->off = 0; s->cap = s->used = 0; }
 
+/* La base deve essere allineata a 64 (i take lo ereditano): malloc garantisce
+ * solo 16, quindi si sovra-alloca di 63 e si tiene `raw` per la free. Se la
+ * realloc sposta il blocco con un allineamento diverso, il contenuto va
+ * riportato al nuovo offset (memmove: le zone si sovrappongono). */
 static void scr_reserve(Scratch *s, int64_t bytes) {
     if (bytes <= s->cap) return;
     int64_t nc = s->cap ? s->cap : (int64_t)1 << 20;   /* 1MB iniziale, x2 */
     while (nc < bytes) nc *= 2;
-    s->base = realloc(s->base, (size_t)nc);
-    if (!s->base) { fprintf(stderr, "OOM scratch (%lld byte)\n", (long long)nc); exit(1); }
-    s->cap = nc;
+    char *nr = realloc(s->raw, (size_t)nc + 63);
+    if (!nr) { fprintf(stderr, "OOM scratch (%lld byte)\n", (long long)nc); exit(1); }
+    int noff = (int)((64 - ((uintptr_t)nr & 63)) & 63);
+    if (s->base && noff != s->off && s->used > 0) {
+        int64_t live = s->used < s->cap ? s->used : s->cap;
+        memmove(nr + noff, nr + s->off, (size_t)live);
+    }
+    s->raw = nr; s->off = noff; s->base = nr + noff; s->cap = nc;
 }
 static void *scr_take(Scratch *s, int64_t bytes) {
     bytes = (bytes + 63) & ~(int64_t)63;

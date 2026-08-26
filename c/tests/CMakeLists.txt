@@ -55,13 +55,25 @@ endfunction()
 
 moty_test(test_headers headers_tests.c headers_gtest.cc)
 moty_test(test_simd    simd_tests.c    simd_gtest.cc)
+moty_test(test_scratch scratch_tests.c scratch_gtest.cc)
 moty_test(test_kernels kernels_tests.c kernels_gtest.cc)
 moty_test(test_conv    conv_tests.c    conv_gtest.cc)
+moty_test(test_attn    attn_tests.c    attn_gtest.cc)
+moty_test(test_prof    prof_tests.c    prof_gtest.cc ${CMAKE_CURRENT_BINARY_DIR}/prof_tests_on.c)
 moty_test(test_moe     moe_tests.c     moe_gtest.cc)
 moty_test(test_mla     mla_tests.c     mla_gtest.cc)
 moty_test(test_qwen    qwen_tests.c    qwen_gtest.cc)
 moty_test(test_gemma   gemma_tests.c   gemma_gtest.cc)
 moty_test(test_glm     glm_tests.c     glm_gtest.cc)
+
+# prof_tests_on.c: clone di prof_tests.c compilato CON la strumentazione
+# (P4) — verifica che le stesse macro accumulino quando MOTY_PROF è
+# attivo. Il define sta DENTRO il file generato: niente COMPILE_OPTIONS
+# che possano essere sovrascritti dal loop MOTY_TEST_MARCH in moty_test().
+file(GENERATE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/prof_tests_on.c CONTENT "#define MOTY_PROF 1
+#define prof_tests_main prof_tests_on_main
+#include \"${CMAKE_CURRENT_SOURCE_DIR}/prof_tests.c\"
+")
 
 # utility C pura (non un test ctest): parita' del tokenizer contro un corpus HF
 add_executable(tok_oracle tok_oracle.c)

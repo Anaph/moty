@@ -8,6 +8,8 @@ int kt_grouped_batch(void);
 int kt_argmax(void);
 int kt_dist(void);
 int kt_conv_causality(void);
+int kt_nucleus_branches(void);
+int kt_pick_tok_argmax(void);
 int kt_report(void);
 }
 
@@ -20,4 +22,6 @@ C_TEST(KernelsGrouped, BatchInvariance,        kt_grouped_batch)
 C_TEST(KernelsArgmax,  ParallelEqualsSerial,   kt_argmax)
 C_TEST(KernelsDist,    DistributionCoherent,   kt_dist)
 C_TEST(KernelsConv,    CausalityRequiresEngine, kt_conv_causality)
+C_TEST(KernelsNucleus, BothBranchesCoherent,   kt_nucleus_branches)
+C_TEST(KernelsPickTok, TempZeroIsArgmax,       kt_pick_tok_argmax)
 C_TEST(KernelsInfo,    ReportBackend,          kt_report)
