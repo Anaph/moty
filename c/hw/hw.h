@@ -43,93 +43,101 @@
 #define HW_H
 
 /* ============================================================ *
- *  Section 0a: Weight format enum.                             *
- *  Used by Mat in nn_gemm.h. Defined here so L1 can use it     *
- *  without pulling in any SIMD code.                           *
+ *  Section 1: PUBLIC API (M1: libmoty-hw boundary).            *
+ *  ONE compiled implementation lives in hw.c (via hw_impl.h,   *
+ *  which picks the -march tier); engines link libmoty-hw.a and *
+ *  include this header for prototypes + legacy name macros.    *
+ *  The tier strings below must be compiled with the SAME       *
+ *  -march as hw.c (both come from the same CFLAGS).            *
  * ============================================================ */
 enum { WF_F32=0, WF_I8=1, WF_I4=2, WF_I2=3, WF_I4G=4, WF_Q4K=5, WF_Q6K=6 };
 
-/* ============================================================ *
- *  Section 0b: System includes.                                *
- * ============================================================ */
 #include <stdint.h>
 #include <math.h>
 
-#if defined(__AVX2__) || defined(__AVX512F__)
-  #include <immintrin.h>
-#elif defined(__ARM_FEATURE_SVE)
-  #include <arm_sve.h>
-  #include <arm_neon.h>
-#elif defined(__ARM_NEON)
-  #include <arm_neon.h>
-#elif defined(__VSX__)
-  #include <altivec.h>
-  #undef vector
-  #undef pixel
-  #undef bool
-#endif
+int32_t moty_hw_dot_i8i8(const int8_t *w, const int8_t *x, int n);
+int32_t moty_hw_dot_i4i8(const uint8_t *w4, const int8_t *x, int I);
+int32_t moty_hw_dot_i4i8p(const uint8_t *w4, const int8_t *xp, int32_t sxsum, int I);
+float   moty_hw_dot_i4g8p(const uint8_t *w4, const float *scl,
+                          const int8_t *x, const int32_t *xgsum, int I);
+float   moty_hw_dot_f32(const float *a, const float *b, int n);
+float   moty_hw_dot_f32i8(const float *x, const int8_t *w, int n);
+float   moty_hw_qrow_i8(const float *x, int8_t *q, int n);
+void    moty_hw_px_permute(const int8_t *x, int8_t *xp, int I);
+int32_t moty_hw_px_sum(const int8_t *x, int I);
+void    moty_hw_dn_row_decay_acc(float *restrict S, float dec, float ki,
+                                 float *restrict kv, int dv);
+void    moty_hw_dn_row_update_dot(float *restrict S, float ki,
+                                  const float *restrict delta, float qi,
+                                  float *restrict oh, int dv);
 
-/* ============================================================ *
- *  Section 1: Backend selection.                               *
- *                                                              *
- *  Priority: GPU > CPU SIMD. Within CPU SIMD:                  *
- *    AVX512-VNNI > AVX-VNNI > AVX2                            *
- *    SVE2 > NEON-DOTPROD > NEON                               *
- *    VSX                                                       *
- *    WASM-SIMD128                                              *
- *    scalar (fallback)                                        *
- * ============================================================ */
+/* Legacy spellings: engines/nn headers keep calling dot_i8i8(...) —
+ * rewritten to the exported symbol. Delete when M3/M4 migrate callers
+ * (docs/symbol-map.md tracks the final names). */
+#ifndef MOTY_HW_NO_LEGACY
+#define dot_i8i8         moty_hw_dot_i8i8
+#define dot_i4i8         moty_hw_dot_i4i8
+#define dot_i4i8p        moty_hw_dot_i4i8p
+#define dot_i4g8p        moty_hw_dot_i4g8p
+#define dot_f32          moty_hw_dot_f32
+#define dot_f32i8        moty_hw_dot_f32i8
+#define qrow_i8          moty_hw_qrow_i8
+#define px_permute       moty_hw_px_permute
+#define px_sum           moty_hw_px_sum
+#define dn_row_decay_acc moty_hw_dn_row_decay_acc
+#define dn_row_update_dot moty_hw_dn_row_update_dot
+#endif
 
 /* --- GPU backends (compile-time opt-in via HW_<NAME>) --- */
 #if defined(HW_OPENCL)
-  #include "hw_opencl.h"
+  /* tier impl: hw_impl.h (libmoty-hw) */
 
 #elif defined(HW_VULKAN)
-  #include "hw_vulkan.h"
+  /* tier impl: hw_impl.h (libmoty-hw) */
 
 #elif defined(HW_METAL)
-  #include "hw_metal.h"
+  /* tier impl: hw_impl.h (libmoty-hw) */
 
 #elif defined(HW_CUDA)
-  #include "hw_cuda.h"
+  /* tier impl: hw_impl.h (libmoty-hw) */
 
 #elif defined(HW_WASM)
-  #include "hw_wasm.h"
+  /* tier impl: hw_impl.h (libmoty-hw) */
 
 /* --- x86-64 --- */
 #elif defined(__AVX512VNNI__) && defined(__AVX512BW__)
-  #include "hw_avx512.h"
+  /* tier impl: hw_impl.h (libmoty-hw) */
   #define HW_IDOT_KERNEL "avx512-vnni"
 
 #elif defined(__AVXVNNI__) && defined(__AVX2__)
-  #include "hw_avx2.h"
+  /* tier impl: hw_impl.h (libmoty-hw) */
   #define HW_IDOT_KERNEL "avx-vnni"
 
 #elif defined(__AVX2__)
-  #include "hw_avx2.h"
+  /* tier impl: hw_impl.h (libmoty-hw) */
   #define HW_IDOT_KERNEL "avx2"
 
 /* --- ARM --- */
 #elif defined(__ARM_FEATURE_SVE2) && defined(__ARM_FEATURE_SVE)
-  #include "hw_sve2.h"
+  /* tier impl: hw_impl.h (libmoty-hw) */
   #define HW_IDOT_KERNEL "sve2-svdot"
 
 #elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-  #include "hw_neon.h"
+  /* tier impl: hw_impl.h (libmoty-hw) */
   #define HW_IDOT_KERNEL "neon-dotprod"
 
 #elif defined(__ARM_NEON)
-  #include "hw_neon.h"
+  /* tier impl: hw_impl.h (libmoty-hw) */
   #define HW_IDOT_KERNEL "neon"
 
 /* --- POWER --- */
 #elif defined(__VSX__)
-  #include "hw_vsx.h"
+  /* tier impl: hw_impl.h (libmoty-hw) */
   #define HW_IDOT_KERNEL "vsx"
 
 /* --- fallback --- */
 #else
-  #include "hw_scalar.h"
+  /* tier impl: hw_impl.h (libmoty-hw) */
   #define HW_IDOT_KERNEL "scalar"
 #endif
 
@@ -152,19 +160,6 @@ enum { WF_F32=0, WF_I8=1, WF_I4=2, WF_I2=3, WF_I4G=4, WF_Q4K=5, WF_Q6K=6 };
 #define IDOT_KERNEL HW_IDOT_KERNEL
 #define F32_KERNEL  HW_F32_KERNEL
 
-/* ============================================================ *
- *  Section 2: Shared kernels (not SIMD-specific).              *
- *  These use whatever dot_f32 / dot_i8i8 the backend provides. *
- * ============================================================ */
-#include "hw_quant.h"       /* qrow_i8 (portable) */
-#include "hw_deltanet.h"    /* dn_row_decay_acc, dn_row_update_dot */
-
-/* ============================================================ *
- *  Section 3: Runtime dispatch (optional).                     *
- *  When HW_RUNTIME_DISPATCH is defined, includes hw_backend.h  *
- *  which provides function-pointer based dispatch for GPU/CPU  *
- *  selection at runtime. Otherwise this is a no-op.            *
- * ============================================================ */
 #include "hw_backend.h"
 
 #endif /* HW_H */

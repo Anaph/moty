@@ -10,6 +10,16 @@
 #ifndef NN_MATMUL_H
 #define NN_MATMUL_H
 
+/* M1: hw.h non diffonde piu' le intrinsics — chi le usa se le include */
+#if defined(__AVX2__)
+  #include <immintrin.h>
+  static inline float simd_hsum256_f32(__m256 v) {
+      __m128 lo=_mm256_castps256_ps128(v), hi=_mm256_extractf128_ps(v,1);
+      lo=_mm_add_ps(lo,hi); __m128 sh=_mm_movehl_ps(lo,lo); lo=_mm_add_ps(lo,sh);
+      sh=_mm_shuffle_ps(lo,lo,1); lo=_mm_add_ss(lo,sh); return _mm_cvtss_f32(lo);
+  }
+#endif
+
 #define NN_QROW_MAX 16384
 
 /* ---- f32 ---- */

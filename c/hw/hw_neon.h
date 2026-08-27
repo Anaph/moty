@@ -24,7 +24,7 @@ static inline int32_t neon_hsum_s32(int32x4_t v) {
 
 #ifdef __ARM_FEATURE_DOTPROD
 /* ---- DOTPROD path ---- */
-static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int n) {
+int32_t moty_hw_dot_i8i8(const int8_t *w, const int8_t *x, int n) {
     int32_t sum=0; int i=0;
     int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0);
     for(; i+64<=n; i+=64){
@@ -40,7 +40,7 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int n) {
     return sum;
 }
 
-static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
+int32_t moty_hw_dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
     int32_t sum=0; int i=0;
     const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
     int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0);
@@ -68,7 +68,7 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
 
 #else
 /* ---- baseline NEON (no DOTPROD) ---- */
-static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int n) {
+int32_t moty_hw_dot_i8i8(const int8_t *w, const int8_t *x, int n) {
     int32_t sum=0; int i=0;
     int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0);
     for(; i+64<=n; i+=64){
@@ -99,7 +99,7 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int n) {
     return sum;
 }
 
-static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
+int32_t moty_hw_dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
     int32_t sum=0; int i=0;
     const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
     int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0);
@@ -143,7 +143,7 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
 }
 #endif /* DOTPROD */
 
-static inline float dot_f32(const float *a, const float *b, int n) {
+float moty_hw_dot_f32(const float *a, const float *b, int n) {
     float32x4_t acc=vdupq_n_f32(0);
     int i=0;
     for(; i+16<=n; i+=16){
@@ -162,7 +162,7 @@ static inline float dot_f32(const float *a, const float *b, int n) {
     return s;
 }
 
-static inline float dot_f32i8(const float *x, const int8_t *w, int n) {
+float moty_hw_dot_f32i8(const float *x, const int8_t *w, int n) {
     float s=0;
     for(int i=0; i<n; i++) s+=x[i]*(float)w[i];
     return s;

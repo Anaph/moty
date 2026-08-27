@@ -7,7 +7,7 @@
 #define HW_DELTANET_H
 
 /* S[i*dv + j] *= dec; kv[j] += S[i*dv + j] * ki */
-static inline void dn_row_decay_acc(float *restrict S, float dec, float ki,
+void moty_hw_dn_row_decay_acc(float *restrict S, float dec, float ki,
                                      float *restrict kv, int dv) {
     int j = 0;
 #if defined(__AVX512F__)
@@ -35,7 +35,7 @@ static inline void dn_row_decay_acc(float *restrict S, float dec, float ki,
 }
 
 /* S[i*dv + j] += ki * delta[j]; oh[j] += S[i*dv + j] * qi */
-static inline void dn_row_update_dot(float *restrict S, float ki,
+void moty_hw_dn_row_update_dot(float *restrict S, float ki,
                                      const float *restrict delta, float qi,
                                      float *restrict oh, int dv) {
     int j = 0;

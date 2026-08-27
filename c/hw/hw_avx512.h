@@ -21,7 +21,7 @@ static inline float simd_hsum256_f32(__m256 v) {
 /* ---- dot_i8i8: int8 × int8 → int32 via VPDPBUSD ----
  * CONTRACT: x[i] must be in [-127, 127] (symmetric quant, e.g. qrow_i8).
  * The sign trick (|w|, sign(w)*x) overflows int8 when x == -128. ---- */
-static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int n) {
+int32_t moty_hw_dot_i8i8(const int8_t *w, const int8_t *x, int n) {
     int32_t sum = 0; int i = 0;
     __m512i a0=_mm512_setzero_si512(),a1=_mm512_setzero_si512(),
             a2=_mm512_setzero_si512(),a3=_mm512_setzero_si512();
@@ -87,7 +87,7 @@ static inline __m512i i4i8_dpbusd_chunk_xv(const uint8_t *w4, __m512i xv,
  * sub/mask/abs nel loop; VPDPBUSD(u8, s8) diretto sui nibble.
  * xp deve essere l'attivazione quantizzata permuted per granuli-64
  * [0,1,4,5,2,3,6,7] (px_permute()), sxsum = Σx[j] (scalare, pre-calcolato). */
-static inline void px_permute(const int8_t *x, int8_t *xp, int I) {
+void moty_hw_px_permute(const int8_t *x, int8_t *xp, int I) {
     int i = 0;
     for (; i + 64 <= I; i += 64) {
         const int8_t *p = x + i;
@@ -100,10 +100,10 @@ static inline void px_permute(const int8_t *x, int8_t *xp, int I) {
     }
     if (i < I) memcpy(xp + i, x + i, I - i);   /* residuo: identita' */
 }
-static inline int32_t px_sum(const int8_t *x, int I) {
+int32_t moty_hw_px_sum(const int8_t *x, int I) {
     int32_t s = 0; for (int i = 0; i < I; i++) s += x[i]; return s;
 }
-static inline int32_t dot_i4i8p(const uint8_t *w4, const int8_t *xp, int32_t sxsum, int I) {
+int32_t moty_hw_dot_i4i8p(const uint8_t *w4, const int8_t *xp, int32_t sxsum, int I) {
     int32_t sum = 0; int i = 0;
     const __m256i m4v=_mm256_set1_epi8(0x0F);
     __m512i a0=_mm512_setzero_si512(),a1=_mm512_setzero_si512(),
@@ -152,7 +152,7 @@ static inline int32_t dot_i4i8p(const uint8_t *w4, const int8_t *xp, int32_t sxs
  * sequenziali → G0 = lanes 0-7, G1 = lanes 8-15 → masked reduce.
  * Trucco nibble-offset: Σ(n-8)x = Σn·x - 8·Σx per gruppo (xgsum[g]).
  * x NON serve permuted (carico diretto). I multiplo di 64, gs=32. */
-static inline float dot_i4g8p(const uint8_t *w4, const float *scl,
+float moty_hw_dot_i4g8p(const uint8_t *w4, const float *scl,
                               const int8_t *x, const int32_t *xgsum, int I) {
     float acc = 0;
     const __m128i m4 = _mm_set1_epi8(0x0F);
@@ -179,7 +179,7 @@ static inline float dot_i4g8p(const uint8_t *w4, const float *scl,
  * 4 accumulator chains (latency hiding: vpdpbusd lat ~4-5cyc; una sola
  * catena seria 32 iter = ~160cyc → throughput-bound al 25%). Ogni chunk
  * ha la PROPRIA attivazione xv0..xv3 (bug storico: xv condiviso). */
-static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
+int32_t moty_hw_dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
     int32_t sum = 0; int i = 0;
     const __m256i m4v=_mm256_set1_epi8(0x0F);
     const __m512i b8v=_mm512_set1_epi8(8);
@@ -228,7 +228,7 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
 }
 
 /* ---- dot_f32: f32 × f32 → f32 via FMA ---- */
-static inline float dot_f32(const float *a, const float *b, int n) {
+float moty_hw_dot_f32(const float *a, const float *b, int n) {
     float s = 0; int i = 0;
     __m512 s0=_mm512_setzero_ps(), s1=_mm512_setzero_ps();
     for (; i+32 <= n; i += 32) {
@@ -243,7 +243,7 @@ static inline float dot_f32(const float *a, const float *b, int n) {
 }
 
 /* ---- dot_f32i8: f32 × int8 → f32 (dequant + FMA) ---- */
-static inline float dot_f32i8(const float *x, const int8_t *w, int n) {
+float moty_hw_dot_f32i8(const float *x, const int8_t *w, int n) {
     float s = 0; int i = 0;
     __m512 acc = _mm512_setzero_ps();
     for (; i+16 <= n; i += 16) {

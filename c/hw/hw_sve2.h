@@ -5,7 +5,7 @@
 #define HW_SVE2_H
 /* <arm_sve.h> is already included by hw.h before this backend */
 
-static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int n) {
+int32_t moty_hw_dot_i8i8(const int8_t *w, const int8_t *x, int n) {
     svint32_t a0=svdup_n_s32(0), a1=svdup_n_s32(0);
     int B=(int)svcntb(), i=0;
     for(; i+2*B<=n; i+=2*B){
@@ -20,7 +20,7 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int n) {
     return sum;
 }
 
-static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
+int32_t moty_hw_dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
     svint32_t acc=svdup_n_s32(0);
     int B=(int)svcntb(), i=0;
     for(; i+2*B<=I; i+=2*B){
@@ -39,7 +39,7 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
     return sum;
 }
 
-static inline float dot_f32(const float *a, const float *b, int n) {
+float moty_hw_dot_f32(const float *a, const float *b, int n) {
     svbool_t pg4=svptrue_b32();
     svfloat32_t acc=svdup_n_f32(0);
     int i=0, W=(int)svcntw();
@@ -55,7 +55,7 @@ static inline float dot_f32(const float *a, const float *b, int n) {
     return s;
 }
 
-static inline float dot_f32i8(const float *x, const int8_t *w, int n) {
+float moty_hw_dot_f32i8(const float *x, const int8_t *w, int n) {
     float s=0;
     for(int i=0; i<n; i++) s+=x[i]*(float)w[i];
     return s;

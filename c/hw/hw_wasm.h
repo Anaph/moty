@@ -30,7 +30,7 @@
 #ifdef HW_WASM
 #include <wasm_simd128.h>
 
-static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int n) {
+int32_t moty_hw_dot_i8i8(const int8_t *w, const int8_t *x, int n) {
     int32_t sum = 0; int i = 0;
     for (; i+16 <= n; i += 16) {
         v128_t wv = wasm_v128_load(w + i);
@@ -41,7 +41,7 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int n) {
     return sum;
 }
 
-static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
+int32_t moty_hw_dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
     int32_t sum = 0; int i = 0;
     const v128_t m4 = wasm_i8x16_splat(0x0F);
     const v128_t b8 = wasm_i8x16_splat(8);
@@ -61,7 +61,7 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
     return sum;
 }
 
-static inline float dot_f32(const float *a, const float *b, int n) {
+float moty_hw_dot_f32(const float *a, const float *b, int n) {
     float s = 0; int i = 0;
     v128_t acc = wasm_f32x4_splat(0);
     for (; i+4 <= n; i += 4)
@@ -72,7 +72,7 @@ static inline float dot_f32(const float *a, const float *b, int n) {
     return s;
 }
 
-static inline float dot_f32i8(const float *x, const int8_t *w, int n) {
+float moty_hw_dot_f32i8(const float *x, const int8_t *w, int n) {
     float s = 0;
     for (int i = 0; i < n; i++) s += x[i] * (float)w[i];
     return s;

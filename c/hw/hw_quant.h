@@ -6,7 +6,7 @@
 #define HW_QUANT_H
 
 /* Symmetric per-row quantization: amax/127. Returns scale. */
-static inline float qrow_i8(const float *x, int8_t *q, int n) {
+float moty_hw_qrow_i8(const float *x, int8_t *q, int n) {
     float amax = 0;
     for (int i = 0; i < n; i++) { float a = fabsf(x[i]); if (a > amax) amax = a; }
     float s = amax / 127.f; if (s < 1e-12f) s = 1e-12f;
@@ -18,13 +18,13 @@ static inline float qrow_i8(const float *x, int8_t *q, int n) {
 #ifndef __AVX512VNNI__
 /* fallback portabili (AVX2/scalar): l'unpack 128-bit dei backend non-AVX512
  * produce ordine SEQUENZIALE → px_permute = identita'; dot_i4i8p == dot_i4i8. */
-static inline void px_permute(const int8_t *x, int8_t *xp, int I) {
+void moty_hw_px_permute(const int8_t *x, int8_t *xp, int I) {
     for (int i = 0; i < I; i++) xp[i] = x[i];
 }
-static inline int32_t px_sum(const int8_t *x, int I) {
+int32_t moty_hw_px_sum(const int8_t *x, int I) {
     int32_t s = 0; for (int i = 0; i < I; i++) s += x[i]; return s;
 }
-static inline int32_t dot_i4i8p(const uint8_t *w4, const int8_t *xp, int32_t sxsum, int I) {
+int32_t moty_hw_dot_i4i8p(const uint8_t *w4, const int8_t *xp, int32_t sxsum, int I) {
     (void)sxsum;
     return dot_i4i8(w4, xp, I);
 }
@@ -32,7 +32,7 @@ static inline int32_t dot_i4i8p(const uint8_t *w4, const int8_t *xp, int32_t sxs
  * matmul_i4_grouped_s non la usa fuori AVX512, ma nn_attn/nn_conv la
  * referenziano nelle loro regioni VNNI (guardate da fmt==WF_I4G&&gs==32,
  * ma il simbolo deve esistere). */
-static inline float dot_i4g8p(const uint8_t *w4, const float *scl,
+float moty_hw_dot_i4g8p(const uint8_t *w4, const float *scl,
                               const int8_t *x, const int32_t *xgsum, int I) {
     float acc = 0;
     for (int g = 0; g*32 < I; g++) {

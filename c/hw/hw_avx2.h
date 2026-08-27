@@ -27,7 +27,7 @@ static inline int simd_hsum128_i32(__m128i v) {
 
 /* ---- dot_i8i8 ---- */
 #if defined(__AVXVNNI__) && defined(__AVX2__)
-static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int n) {
+int32_t moty_hw_dot_i8i8(const int8_t *w, const int8_t *x, int n) {
     int32_t sum=0; int i=0;
     __m128i acc=_mm_setzero_si128();
     for(; i+16<=n; i+=16){
@@ -41,7 +41,7 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int n) {
     return sum;
 }
 #elif defined(__AVX2__)
-static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int n) {
+int32_t moty_hw_dot_i8i8(const int8_t *w, const int8_t *x, int n) {
     int32_t sum=0; int i=0;
     const __m256i ones=_mm256_set1_epi16(1);
     __m256i acc=_mm256_setzero_si256();
@@ -59,7 +59,7 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int n) {
 
 /* ---- dot_i4i8 ---- */
 #if defined(__AVXVNNI__) && defined(__AVX2__)
-static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
+int32_t moty_hw_dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
     int32_t sum=0; int i=0;
     const __m128i m4=_mm_set1_epi8(0x0F); const __m128i b8=_mm_set1_epi8(8);
     __m128i acc=_mm_setzero_si128();
@@ -79,7 +79,7 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
     return sum;
 }
 #elif defined(__AVX2__)
-static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
+int32_t moty_hw_dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
     int32_t sum=0; int i=0;
     const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi8(8);
     const __m256i ones=_mm256_set1_epi16(1);
@@ -101,7 +101,7 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I) {
 #endif
 
 /* ---- dot_f32 + dot_f32i8 ---- */
-static inline float dot_f32(const float *a, const float *b, int n) {
+float moty_hw_dot_f32(const float *a, const float *b, int n) {
     float s=0; int i=0;
 #if defined(__AVX2__) && defined(__FMA__)
     __m256 acc=_mm256_setzero_ps();
@@ -112,7 +112,7 @@ static inline float dot_f32(const float *a, const float *b, int n) {
     return s;
 }
 
-static inline float dot_f32i8(const float *x, const int8_t *w, int n) {
+float moty_hw_dot_f32i8(const float *x, const int8_t *w, int n) {
     float s = 0;
     for (int i = 0; i < n; i++) s += x[i] * (float)w[i];
     return s;

@@ -149,6 +149,18 @@ gemma: gemma$(EXE)
 moty: moty$(EXE)
 endif
 
+# ---- libmoty-hw (M1): ONE compiled implementation of the hw kernels ----
+# Same CFLAGS as the engines: the -march tier hw.c selects is the tier the
+# whole program runs. Engines link the archive; hw.h holds only prototypes
+# + legacy name macros (docs/modularization-plan.md, docs/symbol-map.md).
+HW_SRCS = hw/hw.c
+HW_DEPS = hw/hw.h hw/hw_impl.h hw/hw_avx512.h hw/hw_avx2.h hw/hw_neon.h \
+          hw/hw_sve2.h hw/hw_vsx.h hw/hw_scalar.h hw/hw_quant.h \
+          hw/hw_deltanet.h hw/hw_backend.h
+libmoty-hw.a: $(HW_SRCS) $(HW_DEPS)
+	$(CC) $(CFLAGS) -c $(HW_SRCS) -o hw/hw.o
+	ar rcs $@ hw/hw.o
+
 # ---- source layout (v2): engines/ nn/ hw/ runtime/ io/ tok/ util/ ----
 # All includes are repo-c-relative ("nn/nn.h", "hw/hw.h", ...), so every
 # compile adds -I. A shared deps list keeps the .o rules honest.
@@ -158,20 +170,20 @@ IO_H      = io/st.h io/gguf.h io/tier.h
 TOK_H     = tok/tok.h tok/tok_unicode.h
 UTIL_H    = util/json.h util/compat.h util/prof.h
 
-glm$(EXE): engines/glm.c io/st.h io/uring.h util/json.h $(TOK_H) util/compat.h util/grammar.h
-	$(CC) $(CFLAGS) engines/glm.c -o glm$(EXE) $(LDFLAGS)
+glm$(EXE): libmoty-hw.a engines/glm.c io/st.h io/uring.h util/json.h $(TOK_H) util/compat.h util/grammar.h
+	$(CC) $(CFLAGS) engines/glm.c -o glm$(EXE) $(LDFLAGS) libmoty-hw.a
 
-olmoe$(EXE): engines/olmoe.c $(NN_CORE) runtime/moe.h $(IO_H) $(TOK_H) $(UTIL_H)
-	$(CC) $(CFLAGS) engines/olmoe.c -o olmoe$(EXE) $(LDFLAGS)
+olmoe$(EXE): libmoty-hw.a engines/olmoe.c $(NN_CORE) runtime/moe.h $(IO_H) $(TOK_H) $(UTIL_H)
+	$(CC) $(CFLAGS) engines/olmoe.c -o olmoe$(EXE) $(LDFLAGS) libmoty-hw.a
 
-qwen$(EXE): engines/qwen.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/runtime.h $(IO_H) util/stw.h engines/qwen_train.h $(UTIL_H)
-	$(CC) $(CFLAGS) engines/qwen.c -o qwen$(EXE) $(LDFLAGS)
+qwen$(EXE): libmoty-hw.a engines/qwen.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/runtime.h $(IO_H) util/stw.h engines/qwen_train.h $(UTIL_H)
+	$(CC) $(CFLAGS) engines/qwen.c -o qwen$(EXE) $(LDFLAGS) libmoty-hw.a
 
-qwenmoe$(EXE): engines/qwenmoe.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/moe.h runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
-	$(CC) $(CFLAGS) engines/qwenmoe.c -o qwenmoe$(EXE) $(LDFLAGS)
+qwenmoe$(EXE): libmoty-hw.a engines/qwenmoe.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/moe.h runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+	$(CC) $(CFLAGS) engines/qwenmoe.c -o qwenmoe$(EXE) $(LDFLAGS) libmoty-hw.a
 
-lfm2$(EXE): engines/lfm2.c $(NN_CORE) nn/nn_rope.h nn/nn_attn.h nn/nn_conv.h nn/nn_ffn.h nn/nn_moe_sigmoid.h runtime/moe.h runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
-	$(CC) $(CFLAGS) engines/lfm2.c -o lfm2$(EXE) $(LDFLAGS)
+lfm2$(EXE): libmoty-hw.a engines/lfm2.c $(NN_CORE) nn/nn_rope.h nn/nn_attn.h nn/nn_conv.h nn/nn_ffn.h nn/nn_moe_sigmoid.h runtime/moe.h runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+	$(CC) $(CFLAGS) engines/lfm2.c -o lfm2$(EXE) $(LDFLAGS) libmoty-hw.a
 
 # ---- Unified multi-model binary ----
 # Each engines/model_X.c is compiled to model_X.o with its main() renamed.
@@ -181,29 +193,29 @@ lfm2$(EXE): engines/lfm2.c $(NN_CORE) nn/nn_rope.h nn/nn_attn.h nn/nn_conv.h nn/
 #   3. Add {"arch", model_X_main} to the models[] table in moty.c
 # See docs/adding-a-model.md for the full recipe (config, hooks, layers, tests).
 
-lfm2.o: engines/lfm2.c $(NN_CORE) nn/nn_rope.h nn/nn_attn.h nn/nn_conv.h nn/nn_ffn.h nn/nn_moe_sigmoid.h runtime/moe.h runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+lfm2.o: libmoty-hw.a engines/lfm2.c $(NN_CORE) nn/nn_rope.h nn/nn_attn.h nn/nn_conv.h nn/nn_ffn.h nn/nn_moe_sigmoid.h runtime/moe.h runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
 	$(CC) $(CFLAGS) -Dmain=lfm2_main -c engines/lfm2.c -o lfm2.o
 
-qwenmoe.o: engines/qwenmoe.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/moe.h runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+qwenmoe.o: libmoty-hw.a engines/qwenmoe.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/moe.h runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
 	$(CC) $(CFLAGS) -Dmain=qwenmoe_main -c engines/qwenmoe.c -o qwenmoe.o
 
-gemma.o: engines/gemma.c $(NN_CORE) runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+gemma.o: libmoty-hw.a engines/gemma.c $(NN_CORE) runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
 	$(CC) $(CFLAGS) -Dmain=gemma_main -c engines/gemma.c -o gemma.o
 
-olmoe.o: engines/olmoe.c $(NN_CORE) runtime/moe.h $(IO_H) $(TOK_H) $(UTIL_H)
+olmoe.o: libmoty-hw.a engines/olmoe.c $(NN_CORE) runtime/moe.h $(IO_H) $(TOK_H) $(UTIL_H)
 	$(CC) $(CFLAGS) -Dmain=olmoe_main -c engines/olmoe.c -o olmoe.o
 
-qwen.o: engines/qwen.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/runtime.h $(IO_H) util/stw.h engines/qwen_train.h $(UTIL_H)
+qwen.o: libmoty-hw.a engines/qwen.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/runtime.h $(IO_H) util/stw.h engines/qwen_train.h $(UTIL_H)
 	$(CC) $(CFLAGS) -Dmain=qwen_main -c engines/qwen.c -o qwen.o
 
-glm.o: engines/glm.c io/st.h io/uring.h util/json.h $(TOK_H) util/compat.h util/grammar.h
+glm.o: libmoty-hw.a engines/glm.c io/st.h io/uring.h util/json.h $(TOK_H) util/compat.h util/grammar.h
 	$(CC) $(CFLAGS) -Dmain=glm_main -c engines/glm.c -o glm.o
 
-moty$(EXE): moty.c lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o
-	$(CC) $(CFLAGS) moty.c lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o -o moty$(EXE) $(LDFLAGS)
+moty$(EXE): libmoty-hw.a moty.c lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o
+	$(CC) $(CFLAGS) moty.c lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o -o moty$(EXE) $(LDFLAGS) libmoty-hw.a
 
-gemma$(EXE): engines/gemma.c $(NN_CORE) runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
-	$(CC) $(CFLAGS) engines/gemma.c -o gemma$(EXE) $(LDFLAGS)
+gemma$(EXE): libmoty-hw.a engines/gemma.c $(NN_CORE) runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+	$(CC) $(CFLAGS) engines/gemma.c -o gemma$(EXE) $(LDFLAGS) libmoty-hw.a
 
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
@@ -263,7 +275,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f moty lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o glm glm.exe olmoe olmoe.exe qwen qwen.exe gemma gemma.exe
+	rm -f libmoty-hw.a hw/hw.o moty lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o glm glm.exe olmoe olmoe.exe qwen qwen.exe gemma gemma.exe
 	rm -rf $(TESTS_BUILD)
 	rm -rf $(TESTS_BUILD_NATIVE)
 
