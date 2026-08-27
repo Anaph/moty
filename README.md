@@ -285,6 +285,9 @@ Documentation:
   architecture end-to-end (hooks, registration, validation, tests)
 - [docs/supporting-layers.md](docs/supporting-layers.md) — extract or add
   a shared layer in `nn/` (design rules, template, mandatory tests)
+- [docs/modularization-plan.md](docs/modularization-plan.md) — phased plan:
+  paste-in headers → layered libraries (hw/nn/runtime), ops-table engines,
+  explicit layer variants, unified build
 
 ### Gemma engine notes
 
