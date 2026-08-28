@@ -4,11 +4,10 @@
 dependencies: no BLAS, no Python at runtime, no GPU required. Weights load
 straight from HuggingFace safetensors snapshots.
 
-Three standalone engines, one per architecture:
+Standalone engines, one per architecture:
 
 | Engine | Model family | Notes |
 |---|---|---|
-| `glm` | GLM-5.2 (744B MoE) | MLA attention, experts streamed from disk, ~25 GB RAM |
 | `olmoe` | OLMoE | Reference GQA-MoE engine |
 | `qwen` | Qwen3 dense / Qwen3.5 hybrid | GQA + QK-norm; Gated DeltaNet + Gated Attention |
 | `gemma` | Gemma 4 (e.g. 12B-it, text-only) | Sliding/global hybrid, p-RoPE, GeGLU, SP tokenizer |
@@ -17,7 +16,7 @@ Three standalone engines, one per architecture:
 
 ```
 make            # builds all engines (from repo root or c/)
-make glm        # just one engine
+make qwen       # just one engine
 make portable   # portable CPU baseline (x86-64-v3 / armv8-a / power8)
 make test       # test suite (GoogleTest via a separate CMake build path)
 
@@ -58,7 +57,7 @@ docker run --rm -it -v ~/models:/models:ro \
   -e GGUF=/models/Qwen3-0.6B-Q4_K_M.gguf -e PROMPT="hi" moty
 ```
 
-Or with compose (services `qwen`, `gemma`, `glm`; the whole env-knob table
+Or with compose (services `qwen`, `gemma`, `olmoe`; the whole env-knob table
 passes through from the host):
 
 ```bash
@@ -107,9 +106,6 @@ SNAP=/path/to/Qwen3-4B PROMPT="Hello!" ./c/qwen
 
 # interactive chat (persistent KV cache)
 SNAP=/path/to/Qwen3-4B ./c/qwen
-
-# GLM-5.2 (see the glm.c header for its full env reference)
-SNAP=/path/to/glm-snapshot PROMPT="ciao" ./c/glm
 ```
 
 Common environment variables (qwen engine):
@@ -284,7 +280,7 @@ c/tok/       tokenizers (BPE byte-level, SentencePiece)
 c/util/      json, compat shims, grammar, profiling
 c/tests/     test suite: C logic + GoogleTest glue (make test)
 Dockerfile   multi-stage image: build -> (test) -> slim runtime
-docker-compose.yml  services qwen/gemma/glm with /models mounted
+docker-compose.yml  services qwen/gemma/olmoe with /models mounted
 docs/        architecture + how-to guides
 ```
 
@@ -299,6 +295,9 @@ Documentation:
 - [docs/modularization-plan.md](docs/modularization-plan.md) — phased plan:
   paste-in headers → layered libraries (hw/nn/runtime), ops-table engines,
   explicit layer variants, unified build
+- [docs/gemma-plan.md](docs/gemma-plan.md) — engine review + the gemma
+  improvement plan (bring-up on a real model, shared-attention migration,
+  arena, VNNI int4, sliding-window KV)
 
 ### Gemma engine notes
 

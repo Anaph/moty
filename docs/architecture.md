@@ -45,7 +45,12 @@ c/
 
 | Folder | Key files | Role |
 |---|---|---|
-| `engines/` | `moty.c`, `lfm2.c`, `qwenmoe.c`, `qwen.c`, `gemma.c`, `olmoe.c`, `glm.c` | `moty` dispatches by GGUF arch string to per-family engines; each can also build standalone |
+| `engines/` | `moty.c`, `lfm2.c`, `qwenmoe.c`, `qwen.c`, `gemma.c`, `olmoe.c` | `moty` dispatches by GGUF arch string to per-family engines; each can also build standalone |
+
+> `engines/glm.c` (GLM-5.2, `glm_moe_dsa`) is **compile-only and not
+> documented as supported**: it has never been validated against a real
+> model in this tree. It still builds and registers, but no claims are
+> made about it. It is excluded from the user-facing surface on purpose.
 | `nn/` | `nn.h` (umbrella), `nn_mat.h` (`Mat`, `MotyCommon`, `mat_apply`), `nn_matmul.h`, `nn_attn_kernels.h`, `attn.h` (`MotyAttnView`), `conv.h`, `ffn.h`, `moe.h` (views + variants), `nn_deltanet.h`, `nn_rope.h`, `nn_norm.h`, `nn_sample.h`, `nn_quant.h`, `nn_alloc.h`, `mla.h` | All shared math — **one compiled copy** in `libmoty-nn` (M3). Layers take view structs (weights + config + `MotyCommon` storage); gate/shared-expert variants are named functions, not macros |
 | `hw/` | `hw.h` (single include point), `hw_avx512.h`, `hw_avx2.h`, `hw_neon.h`, `hw_sve2.h`, `hw_vsx.h`, `hw_scalar.h`, `hw_quant.h` (portable fallbacks), `hw_backend.h` (runtime dispatch), stubs for CUDA/Metal/OpenCL/Vulkan/WASM | One compile-time ladder, no runtime CPUID dispatch |
 | `runtime/` | `runtime.h` (hook contract + umbrella), `rt_model_load.h`, `rt_kv_cache.h`, `rt_gen_loop.h`, `rt_env_cfg.h`, `moe.h` (expert cache, LRU/pin), `decode_batch.h` | The engine scaffolding: load a model from GGUF/safetensors, budget RAM, run prefill/decode, env config. Engines implement ~10 hooks |

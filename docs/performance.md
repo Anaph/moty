@@ -47,7 +47,7 @@ Container: 4 shared cores, AVX512-VNNI, portable-build kernels for the table
 `bench` output).
 
 1. **OpenMP hot-thread tuning + re-exec** (`runtime.h: omp_hot_tune`, ported
-   from glm.c where it measured **66.9 s → 20.9 s** on a 32-core Zen5 matmul
+   measured **66.9 s → 20.9 s** on a 32-core Zen5 matmul workload
    run). Dense decode enters ~250–290 tiny parallel regions per token; with
    the default passive wait policy the team goes to sleep between them.
    `OMP_WAIT_POLICY=active` + `GOMP_SPINCOUNT` + `OMP_PROC_BIND=close` +
@@ -62,7 +62,7 @@ Container: 4 shared cores, AVX512-VNNI, portable-build kernels for the table
    used to `malloc`/`free` a per-thread score buffer on **every layer, every
    token** (2×36 allocations/token at 4B); now one buffer sized
    `threads × max_t` lives on the Model, indexed by `omp_get_thread_num()`
-   (glm's pattern).
+   (the big-MoE engine's pattern).
 4. **Batched activation quantization** (`matmul_q_s`): the int8 GEMV now
    quantizes all S activation rows once and reads each weight row **once for
    all S tokens** inside a single parallel region. Measured on the container:
@@ -86,7 +86,7 @@ Container: 4 shared cores, AVX512-VNNI, portable-build kernels for the table
    the same wall as §1 with the disk in place of RAM. For hard cgroup /
    embedded limits where tok/s is secondary.
 8. **int4 weights (`QBITS=4`)** — the "single largest available win" from
-   the deferred list, now landed: glm's bit-exact-validated int4 kernels
+   the deferred list, now landed: bit-exact-validated int4 kernels
    (packing, exact f32×int4 matmul, group-wise scales `QGROUP`, default 32)
    lifted into the shared core. Layer weights halve again vs int8 (~2 GB at
    4B → ~2× decode ceiling per §1); embeddings and the lm_head deliberately
@@ -115,7 +115,7 @@ landed as §2.8/§2.9 above):
 1. **Speculative decoding** — the structural escape from the wall: draft
    cheaply, verify K tokens in one batched forward (weight bytes amortize
    over K like prefill). Qwen3.5's cheap linear layers or an n-gram draft
-   both fit; glm.c has a working MTP/n-gram speculation loop to model on.
+   both fit; a working MTP/n-gram speculation loop exists in the tree to model on.
 2. **Weight interleave for VNNI** — reorder int8 rows so the dot kernel loads
    are perfectly sequential across the unrolled accumulators (llama.cpp /
    [Neural Speed](https://arxiv.org/abs/2411.19542)-style fused layouts

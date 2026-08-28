@@ -28,7 +28,7 @@ RUN make -C c test
 FROM ${BASE}
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /src/c/qwen /src/c/gemma /src/c/glm /src/c/olmoe /usr/local/bin/
+COPY --from=build /src/c/qwen /src/c/gemma /src/c/olmoe /usr/local/bin/
 WORKDIR /work
 # i modelli si montano qui: -v ~/models:/models:ro, poi SNAP=/models/<dir>
 # (oppure GGUF=/models/<file.gguf> per il single-file)

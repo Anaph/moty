@@ -49,6 +49,6 @@ services:
     <<: *moty
     entrypoint: ["/usr/local/bin/gemma"]
 
-  glm:
+  olmoe:
     <<: *moty
-    entrypoint: ["/usr/local/bin/glm"]
+    entrypoint: ["/usr/local/bin/olmoe"]

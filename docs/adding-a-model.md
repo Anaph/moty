@@ -23,7 +23,7 @@ Read this alongside `docs/architecture.md` for the layering.
 |---|---|
 | Architecture is a recombination of existing layers (GQA attention, SwiGLU/Dense FFN, short-conv, sigmoid-MoE, softmax-topk-MoE) | **Thin engine on shared kernels** — this guide. LFM2 needed 280 lines. |
 | One layer type is new (e.g. a new attention variant) | First extract/extend a shared header (`nn/nn_*.h`) following `docs/supporting-layers.md`, then write the thin engine. |
-| Radically different execution model | Study `engines/glm.c` — a fully self-contained engine (own kernels, own serving loop). Last resort. |
+| Radically different execution model | Write a fully self-contained engine (own kernels, own serving loop), compiled and registered like the rest. Last resort — large surface, no shared-kernel leverage. |
 
 ## 2. Write the engine: `engines/<name>.c`
 
