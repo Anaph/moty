@@ -50,7 +50,7 @@ static void banner(Model *m);
  * gguf_index riempie lo stesso indice shards con nomi HF: da qui in poi il
  * runtime non distingue le due sorgenti, salvo config (sintetico dai
  * metadati) e tokenizer (tokenizer.ggml.*). */
-static const char *g_gguf = NULL;
+#include "runtime/config.h"      /* M4: g_gguf/micro/... esportati dalla lib */
 static GgufMeta g_gguf_meta;
 
 /* ---------- config: range check ---------- */

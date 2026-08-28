@@ -33,9 +33,22 @@ set(ENGDIR ${CMAKE_CURRENT_SOURCE_DIR}/..)
 # opzionale: -march per abilitare i kernel AVX512/i8mm nei test locali
 set(MOTY_TEST_MARCH "" CACHE STRING "march per i sorgenti C dei test (es. native)")
 
+
+# libmoty-runtime (M4)
+add_library(moty_rt STATIC ../runtime/env.c ../runtime/kvcache.c)
+target_include_directories(moty_rt PRIVATE ${ENGDIR})
+target_link_libraries(moty_rt PRIVATE moty_core moty_hw)
+if(OpenMP_C_FOUND)
+  target_link_libraries(moty_rt PRIVATE OpenMP::OpenMP_C)
+endif()
+if(MOTY_TEST_MARCH)
+  set_source_files_properties(../runtime/env.c ../runtime/kvcache.c PROPERTIES COMPILE_OPTIONS "-march=${MOTY_TEST_MARCH}")
+endif()
+
 # libmoty-hw (M1): la stessa implementazione unica dei kernel che usano i
 # motori. MOTY_TEST_MARCH si applica anche a hw.c: i test esercitano il
 # tier SIMD reale della macchina.
+
 # libmoty-hw (M1): la stessa implementazione unica dei kernel che usano i
 # motori. MOTY_TEST_MARCH si applica anche a hw.c: i test esercitano il
 # tier SIMD reale della macchina.
@@ -67,7 +80,7 @@ endif()
 function(moty_test name)
   add_executable(${name} ${ARGN})
   target_include_directories(${name} PRIVATE ${ENGDIR})
-  target_link_libraries(${name} PRIVATE GTest::gtest_main m moty_hw moty_core)
+  target_link_libraries(${name} PRIVATE GTest::gtest_main m moty_rt moty_core moty_hw)
   if(OpenMP_C_FOUND)
     target_link_libraries(${name} PRIVATE OpenMP::OpenMP_C)
   endif()
@@ -114,7 +127,7 @@ target_link_libraries(tok_oracle PRIVATE m)
 # utility C pura (non un test ctest): micro-bench dei percorsi caldi
 add_executable(bench bench.c)
 target_include_directories(bench PRIVATE ${ENGDIR})
-target_link_libraries(bench PRIVATE m moty_hw moty_core)
+target_link_libraries(bench PRIVATE m moty_rt moty_core moty_hw)
 if(OpenMP_C_FOUND)
   target_link_libraries(bench PRIVATE OpenMP::OpenMP_C)
 endif()

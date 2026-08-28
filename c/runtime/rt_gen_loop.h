@@ -17,7 +17,6 @@
  * g_skip_logits: sui blocchi intermedi il motore esce da step() PRIMA di
  * final-norm/lm_head (e dello stash TTA) e ritorna NULL — i logits (e lo
  * stash) esistono solo per l'ultimo token del prompt, come non-chunked. */
-static int g_prefill_chunk = 0;
 static int g_skip_logits = 0;
 
 static float *step_chunked(Model *m, const int *ids, int S, int pos_base) {
@@ -78,7 +77,6 @@ static int run_ref(Model *m, const char *refpath) {
  * hist[len..len+k) = token nuovi da prefillare; genera fino a n_new token o stop.
  * Stampa il testo su stdout se echo!=0. Ritorna il numero di token generati
  * (stop incluso se emesso); *stopped=1 se l'ultimo token e' uno stop. */
-static int g_tokens_dump = 0;           /* TOKENS=1 (parse_env) */
 static int gen_turn(Model *m, Tok *T, int *hist, int len, int k, int n_new, int echo, int *stopped) {
     int dump = g_tokens_dump;
     double t0 = now_s();

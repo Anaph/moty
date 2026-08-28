@@ -159,6 +159,18 @@ accepted here**); batch-invariance + serial-reference tests still green;
 
 ### M4 — runtime as a library + ops table (2 days)
 
+> **Status note (post-M3/M4 landing):** the config/env half shipped as
+> `libmoty-runtime.a` (`runtime/env.c` + `kvcache.c`): the `g_*` runtime
+> knobs (`g_gguf`, `g_kv_bits`, `g_micro`, …) are exported program state
+> instead of per-TU statics, and `moty_rt_parse_env` is the single
+> environment reader. The **ops-table half** (vtable + `moty_rt_serve`)
+> turned out to be gated on a prerequisite the plan underestimated:
+> `rt_model_load.h`/`rt_gen_loop.h` touch engine-typed `Cfg`/`shards`
+> directly, so they cannot move into a library until the common Cfg
+> prefix becomes a real struct (same treatment `MotyCommon` got in M2).
+> Tracked as **M4b** — do M2-for-Cfg first, then the vtable conversion is
+> mechanical.
+
 - The 11 static hooks become the vtable:
 
   ```c

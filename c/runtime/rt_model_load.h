@@ -13,7 +13,6 @@ static float *load_t(Model *m, const char *name, int64_t expect) {
 }
 
 /* gruppo delle scale int4 (QGROUP): 32 = blocco Q4_0 di GGUF; 0 = per riga */
-static int g_qgroup = 32;
 
 /* carica [O,I] e quantizza secondo bits: 0=f32, 8=int8+scala per riga,
  * 4=int4 impacchettato con scale per gruppo (g_qgroup; 0 -> per riga) */
@@ -160,8 +159,6 @@ static void layer_prefetch(Model *m, int li) {
  * footprint e' davvero solo attivazioni + KV + tokenizer, pensato per limiti
  * HARD (cgroup/embedded). Prezzo: l'intero modello transita dal disco a OGNI
  * token — la velocita' e' bandwidth-del-disco, non della RAM. */
-static int     g_micro = 0;             /* attivato da MICRO=1 (engine_main) o dai test */
-static int     g_micro_drop = 1;        /* MICRO_DROP=0 -> lascia vivere la page cache */
 static int64_t g_micro_chunk = 4 << 20; /* byte f32 dello scratch di streaming */
 
 /* y[S,O] = x[S,I] @ W^T leggendo W dal disco a blocchi di righe; installata in
@@ -348,7 +345,6 @@ static void model_init(Model *m, const char *snap, int qbits) {
 
 /* KV_BITS=8: KV-cache int8 con scala per (testa_kv, posizione). Default 0
  * (f32): la numerica di REF non cambia mai in silenzio. */
-static int g_kv_bits = 0;
 
 /* riga id dell'embedding -> dst[D] moltiplicata per scale (gemma passa
  * sqrt(D), qwen 1): f32 residente, int8 dequant, oppure micro-RSS (lettura
