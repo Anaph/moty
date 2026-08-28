@@ -96,7 +96,7 @@ jobs:
             lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o \
             libmoty-runtime.a libmoty-nn.a libmoty-hw.a \
             -o /tmp/moty-plugins -lm -fopenmp -pthread -ldl
-      - name: Smoke: plugin dispatch end-to-end
+      - name: "Smoke: plugin dispatch end-to-end"
         run: |
           python3 - <<'PY'
           import struct
