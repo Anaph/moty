@@ -536,16 +536,16 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
     }
     /* scrive k,v nella kv-cache alle posizioni pos_base..pos_base+S-1 */
-    int kv8 = m->K8[layer] != NULL;           /* KV_BITS=8 su questo layer */
+    int kv8 = m->base.K8[layer] != NULL;           /* KV_BITS=8 su questo layer */
     for (int s = 0; s < S; s++) for (int hh = 0; hh < KV; hh++) {
         int t = pos_base + s;
-        int64_t slot = (int64_t)hh*m->max_t + t;
+        int64_t slot = (int64_t)hh*m->base.max_t + t;
         if (kv8) {
-            kv_store_row(m->K8[layer] + slot*hd, &m->Ks[layer][slot], k + s*kw + (int64_t)hh*hd, hd);
-            kv_store_row(m->V8[layer] + slot*hd, &m->Vs[layer][slot], vv + s*kw + (int64_t)hh*hd, hd);
+            kv_store_row(m->base.K8[layer] + slot*hd, &m->base.Ks[layer][slot], k + s*kw + (int64_t)hh*hd, hd);
+            kv_store_row(m->base.V8[layer] + slot*hd, &m->base.Vs[layer][slot], vv + s*kw + (int64_t)hh*hd, hd);
         } else {
-            memcpy(m->K[layer] + slot*hd, k + s*kw + (int64_t)hh*hd, hd*sizeof(float));
-            memcpy(m->V[layer] + slot*hd, vv + s*kw + (int64_t)hh*hd, hd*sizeof(float));
+            memcpy(m->base.K[layer] + slot*hd, k + s*kw + (int64_t)hh*hd, hd*sizeof(float));
+            memcpy(m->base.V[layer] + slot*hd, vv + s*kw + (int64_t)hh*hd, hd*sizeof(float));
         }
     }
     float scale = 1.f / sqrtf((float)hd);
@@ -555,17 +555,17 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         for (int s = 0; s < S; s++) {
             /* scratch pre-allocato per thread (att_sc, vedi kv_alloc): niente
              * malloc/free dentro la regione calda */
-            float *sc = m->att_sc + (int64_t)omp_get_thread_num() * m->max_t;
+            float *sc = m->base.att_sc + (int64_t)omp_get_thread_num() * m->base.max_t;
             int kvh = hh / G;                 /* GQA: testa kv condivisa */
             int qpos = pos_base + s;
             const float *qv = q + s*qw + (int64_t)hh*hd;
-            int64_t kvbase = (int64_t)kvh * m->max_t;
-            if (kv8) att_scores_i8(sc, qv, m->K8[layer], m->Ks[layer], kvbase, 0, qpos, hd, scale);
-            else     att_scores_f32(sc, qv, m->K[layer], kvbase, 0, qpos, hd, scale);
+            int64_t kvbase = (int64_t)kvh * m->base.max_t;
+            if (kv8) att_scores_i8(sc, qv, m->base.K8[layer], m->base.Ks[layer], kvbase, 0, qpos, hd, scale);
+            else     att_scores_f32(sc, qv, m->base.K[layer], kvbase, 0, qpos, hd, scale);
             softmax_row(sc, qpos+1);
             float *cx = ctx + s*qw + (int64_t)hh*hd;
-            if (kv8) att_accum_i8(cx, sc, m->V8[layer], m->Vs[layer], kvbase, 0, qpos, hd);
-            else     att_accum_f32(cx, sc, m->V[layer], kvbase, 0, qpos, hd);
+            if (kv8) att_accum_i8(cx, sc, m->base.V8[layer], m->base.Vs[layer], kvbase, 0, qpos, hd);
+            else     att_accum_f32(cx, sc, m->base.V[layer], kvbase, 0, qpos, hd);
         }
     }
     if (gate) {                            /* Qwen3.5: gating per-elemento sull'output */
@@ -612,13 +612,13 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
     /* gli scratch di streaming esistono solo nel percorso MEM_GB classico;
      * in micro-RSS lo streaming avviene DENTRO mat_apply, matrice per matrice */
-    int strm = m->stream_buf != NULL || m->stream_q != NULL;
-    if (strm && m->n_resident < c->n_layers) layer_prefetch(m, m->n_resident);
+    int strm = m->base.stream_buf != NULL || m->base.stream_q != NULL;
+    if (strm && m->base.n_resident < c->n_layers) layer_prefetch(m, m->base.n_resident);
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
-        if (strm && i >= m->n_resident) {
+        if (strm && i >= m->base.n_resident) {
             layer_stream_in(m, i);                  /* rilegge il layer dal disco (f32) */
-            if (i + 1 < c->n_layers && i + 1 >= m->n_resident) layer_prefetch(m, i + 1);
+            if (i + 1 < c->n_layers && i + 1 >= m->base.n_resident) layer_prefetch(m, i + 1);
         }
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
         if (l->type == LT_LINEAR) deltanet(m, l, nrm, S, tmp);
@@ -628,19 +628,19 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         mlp(m, l, nrm, S, tmp);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
     }
-    m->kv_len = pos_base + S;
+    m->base.kv_len = pos_base + S;
     /* blocco intermedio di un prefill a blocchi: KV/stati aggiornati, ma
      * niente final-norm/lm_head/stash TTA (validi solo per l'ultimo token) */
     if (g_skip_logits) { free(x); free(nrm); free(tmp); return NULL; }
     float *last = falloc(D);
-    rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
+    rmsnorm_row(last, x + (int64_t)(S-1)*D, m->base.final_norm, D, c->eps);
     if ((g_tta.mode == TTA_CACHE || g_tta.mode == TTA_LORA) && g_tta.alloc) {
         memcpy(g_tta.h_cur, last, D*sizeof(float)); /* stash per cache / adattatore online */
         g_tta.h_valid = 1;
     }
     float *logit = falloc(c->vocab);
-    mat_apply(logit, last, &m->lm_head, 1);
-    lora_apply(&m->lm_lora, logit, last, 1, m->lm_head.I, m->lm_head.O);
+    mat_apply(logit, last, &m->base.lm_head, 1);
+    lora_apply(&m->lm_lora, logit, last, 1, m->base.lm_head.I, m->base.lm_head.O);
     free(x); free(nrm); free(tmp); free(last);
     return logit;
 }
@@ -674,7 +674,7 @@ static void banner(Model *m) {
     int nlin = 0; for (int i = 0; i < m->c.n_layers; i++) nlin += (m->c.ltype[i] == LT_LINEAR);
     fprintf(stderr, "[qwen] %d layer (%d deltanet), hidden %d, %d/%d teste (hd %d, rot %d), inter %d, vocab %d%s | load %.1fs | RSS %.2f GB | idot %s | f32 %s\n",
             m->c.n_layers, nlin, m->c.hidden, m->c.n_heads, m->c.n_kv_heads, m->c.head_dim, m->c.rot, m->c.inter, m->c.vocab,
-            m->lm_tied ? " | lm_head=embed" : "", m->load_s, rss_gb(), IDOT_KERNEL, F32_KERNEL);
+            m->base.lm_tied ? " | lm_head=embed" : "", m->base.load_s, rss_gb(), IDOT_KERNEL, F32_KERNEL);
 }
 
 #include "qwen_train.h"

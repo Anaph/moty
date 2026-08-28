@@ -129,7 +129,7 @@ static void load_small(Model *m) {
             load_mat(m, &l->down, HFN(nm,sizeof(nm),i,"mlp.down_proj.weight"), D, c->inter);
         }
     }
-    m->final_norm = load_t(m, "token_embd_norm.weight", D);
+    m->base.final_norm = load_t(m, "token_embd_norm.weight", D);
 }
 
 /* ---------- expert load hook ---------- */
@@ -170,20 +170,20 @@ static void ldm_layer_load_expert(void *ctx, int layer, int eid, ExpertSlot *s, 
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     /* P5: stream buffers per-Step nell'arena bscr (vive attraverso le
-     * chiamate kernel del layer loop; m->scr si resetta dentro i kernel) */
-    scr_reset(&m->bscr);
-    scr_reserve(&m->bscr, 3*scr_al((int64_t)S*D*4));
-    float *xb = scr_take(&m->bscr, (int64_t)S*D*4);
-    float *nb = scr_take(&m->bscr, (int64_t)S*D*4);
-    float *tb = scr_take(&m->bscr, (int64_t)S*D*4);
+     * chiamate kernel del layer loop; m->base.scr si resetta dentro i kernel) */
+    scr_reset(&m->base.bscr);
+    scr_reserve(&m->base.bscr, 3*scr_al((int64_t)S*D*4));
+    float *xb = scr_take(&m->base.bscr, (int64_t)S*D*4);
+    float *nb = scr_take(&m->base.bscr, (int64_t)S*D*4);
+    float *tb = scr_take(&m->base.bscr, (int64_t)S*D*4);
     float *x=xb,*nrm=nb,*tmp=tb;
     for (int s = 0; s < S; s++) embed_row(m, ids[s], 1.f, x + (int64_t)s*D);
-    int strm = m->stream_buf != NULL || m->stream_q != NULL;
-    if (strm && m->n_resident < c->n_layers) layer_prefetch(m, m->n_resident);
+    int strm = m->base.stream_buf != NULL || m->base.stream_q != NULL;
+    if (strm && m->base.n_resident < c->n_layers) layer_prefetch(m, m->base.n_resident);
     PROF_DECL();
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
-        if (strm && i >= m->n_resident) { layer_stream_in(m, i); if (i+1 < c->n_layers && i+1 >= m->n_resident) layer_prefetch(m, i+1); }
+        if (strm && i >= m->base.n_resident) { layer_stream_in(m, i); if (i+1 < c->n_layers && i+1 >= m->base.n_resident) layer_prefetch(m, i+1); }
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->attn_norm, D, c->eps);
         double c0 = 0;
         if (PROF_ON) c0 = now_s();
@@ -199,11 +199,11 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
     }
     PROF_COUNT();
-    m->kv_len = pos_base + S;
+    m->base.kv_len = pos_base + S;
     if (g_skip_logits) return NULL;
     double t_c1 = 0; if (PROF_ON) t_c1 = now_s(); else (void)t_c1;
-    float *last = falloc(D); rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
-    float *logit = falloc(c->vocab); mat_apply(logit, last, &m->lm_head, 1);
+    float *last = falloc(D); rmsnorm_row(last, x + (int64_t)(S-1)*D, m->base.final_norm, D, c->eps);
+    float *logit = falloc(c->vocab); mat_apply(logit, last, &m->base.lm_head, 1);
     PROF_ACC(log, t_c1);
     PROF_WINDOW(m->c.vocab);
     free(last); return logit;
@@ -260,7 +260,7 @@ static void banner(Model *m) {
         "load %.1fs | RSS %.2f GB | idot %s | f32 %s\n",
         c->n_layers, nc, nf, c->hidden, c->n_heads, c->n_kv_heads, c->head_dim,
         c->n_experts, c->topk, c->moe_inter, c->inter, c->n_dense_layers, c->conv_L, c->vocab,
-        m->load_s, rss_gb(), IDOT_KERNEL, F32_KERNEL);
+        m->base.load_s, rss_gb(), IDOT_KERNEL, F32_KERNEL);
 }
 
 int main(int argc, char **argv) {

@@ -18,22 +18,30 @@ typedef struct Mat { int fmt;             /* WF_F32/WF_I8/WF_I4/WF_I4G/WF_I2 */
 
 static void (*g_mat_stream_fn)(float *y, const float *x, const struct Mat *w, int S) = NULL;
 
+/* M2: il contratto runtime/engine e' un TIPO reale, non solo testo. Gli
+ * engine scrivono `typedef struct { MODEL_COMMON_FIELDS; ...extra... }
+ * Model;` — l'accesso ai campi comuni passa da m->base.<campo> (il resto
+ * del motore — Cfg/Layer/extra — resta del motore). docs/symbol-map.md. */
+typedef struct MotyCommon {
+    int qbits;                                       /* 0 f32 / 8 i8 / 4 i4 / -1 nativo GGUF */
+    float *embed, *final_norm;
+    int8_t *embed_q; float *embed_qs;                /* QBITS=8: embedding int8 */
+    Mat lm_head; int lm_tied;
+    float **K, **V; int kv_len, max_t;               /* KV f32: [li][h*max_t*hd] */
+    int8_t **K8, **V8; float **Ks, **Vs;             /* KV_BITS=8: [li] + scale per (h,t) */
+    float *att_sc;                                   /* score per-thread: nth*max_t */
+    int n_resident;                                  /* MEM_GB: layer residenti */
+    float *stream_buf;                               /* streaming layer f32 */
+    int8_t *stream_q; float *stream_qs;              /* QBITS=8: layer streamato int8 */
+    Scratch scr, bscr;   /* P5: kernel scratch (reset/kernel) e stream (reset/step) */
+    double load_s;
+} MotyCommon;
+
 #define MODEL_COMMON_FIELDS \
+    MotyCommon base;                               \
     Cfg c;                                          \
     shards S;                                       \
-    int qbits;                                      \
-    float *embed, *final_norm;                      \
-    int8_t *embed_q; float *embed_qs;               \
-    Mat lm_head; int lm_tied;                       \
-    Layer *L;                                       \
-    float **K, **V; int kv_len, max_t;              \
-    int8_t **K8, **V8; float **Ks, **Vs;            \
-    float *att_sc;                                  \
-    int n_resident;                                 \
-    float *stream_buf;                              \
-    int8_t *stream_q; float *stream_qs;             \
-    Scratch scr, bscr;   /* P5: kernel scratch (reset/kernel) e stream (reset/step) */ \
-    double load_s
+    Layer *L;
 
 static inline void mat_reset_storage(Mat *w) {
     w->fmt = WF_F32;

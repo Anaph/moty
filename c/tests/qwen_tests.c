@@ -550,7 +550,7 @@ static void qt_setup_both(char *dense, char *hyb) {
 static int qt_run8(const char *dir, int qbits, int hybrid, int *out) {
     Model m;
     model_init(&m, dir, qbits);
-    CHECK(m.lm_tied);
+    CHECK(m.base.lm_tied);
     CHECK(m.c.head_dim == 8);
     CHECK(m.c.hybrid == hybrid);
     if (hybrid) {
@@ -593,13 +593,13 @@ int qt_tiny_qbits4(void) {
      * lm_head qbits=4: copia INT4 separata (GEMV del logit = ~43% del
      * traffico decode); altrimenti condivide lo storage int8 dell'embed. */
     Model m; model_init(&m, dense, 4);
-    CHECK(m.embed == NULL && m.embed_q != NULL);
-    CHECK(m.lm_tied);
+    CHECK(m.base.embed == NULL && m.base.embed_q != NULL);
+    CHECK(m.base.lm_tied);
     if (m.c.hidden <= 2048) {
-        CHECK(m.lm_head.fmt == WF_I4 && m.lm_head.q4 != NULL && m.lm_head.q == NULL);
-        CHECK(m.lm_head.O == m.c.vocab && m.lm_head.I == m.c.hidden);
+        CHECK(m.base.lm_head.fmt == WF_I4 && m.base.lm_head.q4 != NULL && m.base.lm_head.q == NULL);
+        CHECK(m.base.lm_head.O == m.c.vocab && m.base.lm_head.I == m.c.hidden);
     } else
-        CHECK(m.lm_head.q == m.embed_q && m.lm_head.q4 == NULL);
+        CHECK(m.base.lm_head.q == m.base.embed_q && m.base.lm_head.q4 == NULL);
     CHECK(m.L[0].q.q4 != NULL && m.L[0].q.q == NULL && m.L[0].q.f == NULL && m.L[0].q.gs == g_qgroup);
     CHECK(m.L[0].down.q4 != NULL && m.L[1].up.q4 != NULL);
     return 0;
@@ -620,7 +620,7 @@ int qt_tiny_hybrid(void) {
 static int qt_run8_budget(const char *dir, int qbits, int64_t budget, int *out, int *resident_out) {
     Model m;
     model_init_ex(&m, dir, qbits, budget, 16);
-    if (resident_out) *resident_out = m.n_resident;
+    if (resident_out) *resident_out = m.base.n_resident;
     kv_alloc(&m, 16);
     return drive_greedy8(&m, out);
 }
@@ -676,10 +676,10 @@ static int qt_run8_micro(const char *dir, int *out) {
     g_micro = 1; g_micro_chunk = 256;   /* blocchi minuscoli: esercita il loop di chunking */
     Model m;
     model_init_ex(&m, dir, 0, 0, 16);
-    CHECK(m.embed == NULL);
-    CHECK(m.n_resident == 0);
-    CHECK(m.stream_buf == NULL);
-    CHECK(m.lm_tied && m.lm_head.sh != NULL && m.lm_head.f == NULL);
+    CHECK(m.base.embed == NULL);
+    CHECK(m.base.n_resident == 0);
+    CHECK(m.base.stream_buf == NULL);
+    CHECK(m.base.lm_tied && m.base.lm_head.sh != NULL && m.base.lm_head.f == NULL);
     kv_alloc(&m, 16);
     int rc = drive_greedy8(&m, out);
     g_micro = 0; g_mat_stream_fn = NULL; g_micro_chunk = 4<<20;
@@ -696,15 +696,15 @@ int qt_embed_q8(void) {
     Model m;
     model_init(&m, dir, 8);
     g_embed_chunk_rows = save;
-    CHECK(m.embed == NULL && m.embed_q != NULL && m.embed_qs != NULL);
-    CHECK(m.lm_tied && m.lm_head.q == m.embed_q && m.lm_head.qs == m.embed_qs && m.lm_head.f == NULL);
+    CHECK(m.base.embed == NULL && m.base.embed_q != NULL && m.base.embed_qs != NULL);
+    CHECK(m.base.lm_tied && m.base.lm_head.q == m.base.embed_q && m.base.lm_head.qs == m.base.embed_qs && m.base.lm_head.f == NULL);
     int V = m.c.vocab, D = m.c.hidden;
     float *ref = falloc((int64_t)V*D);
     st_read_f32(&m.S, "model.embed_tokens.weight", ref, 0);
     int8_t *rq = malloc((size_t)V*D); float *rs = falloc(V);
     quantize_rows(ref, rq, rs, V, D, 8);
-    CHECK(memcmp(rq, m.embed_q, (size_t)V*D) == 0);
-    CHECK(memcmp(rs, m.embed_qs, (size_t)V*sizeof(float)) == 0);
+    CHECK(memcmp(rq, m.base.embed_q, (size_t)V*D) == 0);
+    CHECK(memcmp(rs, m.base.embed_qs, (size_t)V*sizeof(float)) == 0);
     free(ref); free(rq); free(rs);
     /* generazione deterministica sul percorso embed int8 (gather = dequant) */
     int a[16], b[16];
@@ -788,7 +788,7 @@ int qt_gguf_tiny_parity(void) {
     Model b; model_init(&b, NULL, 0);
     g_gguf = NULL;
     CHECK(b.c.hidden == 16 && b.c.n_layers == 2 && b.c.head_dim == 8 && b.c.vocab == 32);
-    CHECK(b.lm_tied);                                    /* niente output.weight nel GGUF */
+    CHECK(b.base.lm_tied);                                    /* niente output.weight nel GGUF */
     kv_alloc(&b, 16);
     float *lb = step(&b, prompt, 3, 0);
     CHECK(memcmp(la, lb, a.c.vocab*sizeof(float)) == 0);
@@ -880,9 +880,9 @@ static int qt_kv8_drive(const char *dir, int kvbits, float *out, int steps, int 
     Model m; model_init(&m, dir, 0);
     kv_alloc(&m, 16);
     if (kvbits == 8) {
-        CHECK(m.K8[0] != NULL && m.Ks[0] != NULL && m.K[0] == NULL);
+        CHECK(m.base.K8[0] != NULL && m.base.Ks[0] != NULL && m.base.K[0] == NULL);
     } else {
-        CHECK(m.K[0] != NULL && m.K8[0] == NULL);
+        CHECK(m.base.K[0] != NULL && m.base.K8[0] == NULL);
     }
     int rc = drive_capture(&m, out, steps, V);
     g_kv_bits = 0;
@@ -915,13 +915,13 @@ int qt_kv_i8_hybrid(void) {
     g_kv_bits = 8;
     Model m; model_init(&m, dir, 0);
     kv_alloc(&m, 16);
-    CHECK(m.K8[0] == NULL && m.K[0] == NULL);          /* layer 0 = deltanet */
-    CHECK(m.K8[1] != NULL && m.Vs[1] != NULL);         /* layer 1 = full int8 */
+    CHECK(m.base.K8[0] == NULL && m.base.K[0] == NULL);          /* layer 0 = deltanet */
+    CHECK(m.base.K8[1] != NULL && m.base.Vs[1] != NULL);         /* layer 1 = full int8 */
     int out[16];
     CHECK(drive_greedy8(&m, out) == 0);
     g_kv_bits = 0;
     /* le scale sono state scritte davvero */
-    CHECK(m.Ks[1][0] > 0.f && m.Vs[1][0] > 0.f);
+    CHECK(m.base.Ks[1][0] > 0.f && m.base.Vs[1][0] > 0.f);
     return 0;
 }
 
@@ -938,7 +938,7 @@ static int qt_prefill_chunk_dir(const char *dir, int hybrid) {
     float *lb = step_chunked(&b, prompt, 11, 0);
     g_prefill_chunk = 0;
     CHECK(memcmp(la, lb, a.c.vocab*sizeof(float)) == 0);
-    CHECK(a.kv_len == b.kv_len && b.kv_len == 11);
+    CHECK(a.base.kv_len == b.base.kv_len && b.base.kv_len == 11);
     /* il decode successivo parte dallo stesso stato: ancora bit-esatto */
     int t = argmax_v(la, a.c.vocab);
     float *da = step(&a, &t, 1, 11);
@@ -1247,7 +1247,7 @@ int qt_train_e2e(void) {
         double sum = 0; int nw = 0;
         for (int off = 0; off + 8 <= 200; off += 16) {
             int S = 200 - off < 16 ? 200 - off : 16;
-            m->kv_len = 0;
+            m->base.kv_len = 0;
             t_grads_zero();
             sum += train_loss_and_backward(m, ids + off, S, 0, qt_train_st, qt_train_gl, NULL);
             t_adamw_all(1e-2f, 0.f, ++t);
@@ -1417,7 +1417,7 @@ int qt_tta_lora_reset(void) {
     for (int64_t i = 0; i < (int64_t)32*g_tta.lr_rank; i++) bnorm += fabs(g_tta.lB[i]);
     CHECK(bnorm > 0);                  /* B si e' mosso davvero */
     state_reset(&m2);                  /* B azzerato -> adattatore no-op */
-    m2.kv_len = 0;
+    m2.base.kv_len = 0;
     float *b = qt_tta_two_steps(&m2);
     for (int v = 0; v < 32; v++) CHECK(a[v] == b[v]);
     free(a); free(b);

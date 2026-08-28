@@ -181,8 +181,8 @@ int main(int argc, char **argv) {
         l.qn = falloc(hd); bn_fill(l.qn, hd);
         l.kn = falloc(hd); bn_fill(l.kn, hd);
         kv_alloc(&m, T + 1);
-        bn_fill(m.K[0], (int64_t)KV*(T+1)*hd);          /* cache pre-riempita direttamente */
-        bn_fill(m.V[0], (int64_t)KV*(T+1)*hd);
+        bn_fill(m.base.K[0], (int64_t)KV*(T+1)*hd);          /* cache pre-riempita direttamente */
+        bn_fill(m.base.V[0], (int64_t)KV*(T+1)*hd);
         float *x = falloc(D), *out = falloc(D);
         bn_fill(x, D);
         attention(&m, &l, 0, x, 1, T, out);             /* warm-up */

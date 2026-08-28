@@ -74,7 +74,7 @@ static void load_mat_bits(Model *m, Mat *w, const char *name, int O, int I, int 
 }
 
 static void load_mat(Model *m, Mat *w, const char *name, int O, int I) {
-    load_mat_bits(m, w, name, O, I, m->qbits);
+    load_mat_bits(m, w, name, O, I, m->base.qbits);
 }
 
 /* legge un tensore [N,I] dal disco a blocchi di righe e lo quantizza int8
@@ -100,9 +100,9 @@ static int g_embed_chunk_rows = 0;      /* 0 = auto; i test lo stringono */
 static void load_embed_q8(Model *m) {
     Cfg *c = &m->c; int D = c->hidden; int64_t V = c->vocab;
     st_expect(&m->S, "model.embed_tokens.weight", V*D);
-    m->embed_q  = balloc(V*D, "embed int8");
-    m->embed_qs = falloc(V);
-    quantize_from_disk(m, "model.embed_tokens.weight", m->embed_q, m->embed_qs,
+    m->base.embed_q  = balloc(V*D, "embed int8");
+    m->base.embed_qs = falloc(V);
+    quantize_from_disk(m, "model.embed_tokens.weight", m->base.embed_q, m->base.embed_qs,
                        V, D, g_embed_chunk_rows);
 }
 
@@ -121,13 +121,13 @@ static int64_t layer_f32_bytes(Model *m, int li) {
  * quantizzazione per riga rende il risultato bit-identico al load residente). */
 static void layer_stream_in(Model *m, int li) {
     MatRef r[MAX_LAYER_MATS]; int n = layer_matrefs(m, li, r);
-    if (m->qbits == 8) {
+    if (m->base.qbits == 8) {
         int64_t qoff = 0, soff = 0;
         for (int j = 0; j < n; j++) {
             int O = r[j].O, I = r[j].I;
-            quantize_from_disk(m, r[j].name, m->stream_q + qoff, m->stream_qs + soff, O, I, 0);
+            quantize_from_disk(m, r[j].name, m->base.stream_q + qoff, m->base.stream_qs + soff, O, I, 0);
             mat_reset_storage(r[j].mat);
-            r[j].mat->q = m->stream_q + qoff; r[j].mat->qs = m->stream_qs + soff;
+            r[j].mat->q = m->base.stream_q + qoff; r[j].mat->qs = m->base.stream_qs + soff;
             r[j].mat->O = O; r[j].mat->I = I; r[j].mat->fmt = WF_I8;
             qoff += (int64_t)O*I; soff += O;
         }
@@ -135,9 +135,9 @@ static void layer_stream_in(Model *m, int li) {
     }
     int64_t off = 0;
     for (int j = 0; j < n; j++) {
-        st_read_f32(&m->S, r[j].name, m->stream_buf + off, 0);  /* drop=0: la page cache aiuta */
+        st_read_f32(&m->S, r[j].name, m->base.stream_buf + off, 0);  /* drop=0: la page cache aiuta */
         mat_reset_storage(r[j].mat);
-        r[j].mat->f = m->stream_buf + off;
+        r[j].mat->f = m->base.stream_buf + off;
         r[j].mat->O = r[j].O; r[j].mat->I = r[j].I;
         off += (int64_t)r[j].O*r[j].I;
     }
@@ -200,14 +200,14 @@ static void model_init_micro(Model *m) {
 #if ENGINE_MICRO
     Cfg *c = &m->c;
     g_mat_stream_fn = mat_stream;
-    mat_stream_init(m, &m->lm_head,
-                    m->lm_tied ? "model.embed_tokens.weight" : "lm_head.weight",
+    mat_stream_init(m, &m->base.lm_head,
+                    m->base.lm_tied ? "model.embed_tokens.weight" : "lm_head.weight",
                     c->vocab, c->hidden);
     for (int i = 0; i < c->n_layers; i++) {
         MatRef r[MAX_LAYER_MATS]; int n = layer_matrefs(m, i, r);
         for (int j = 0; j < n; j++) mat_stream_init(m, r[j].mat, r[j].name, r[j].O, r[j].I);
     }
-    m->n_resident = 0;                    /* verita': zero layer residenti */
+    m->base.n_resident = 0;                    /* verita': zero layer residenti */
     fprintf(stderr, "[" ENGINE_TAG "] micro-RSS: 0 pesi residenti, matmul streamato a blocchi da %lld MB, page cache %s\n",
             (long long)(g_micro_chunk >> 20), g_micro_drop ? "scartata (MICRO_DROP=0 per tenerla)" : "attiva");
 #else
@@ -225,20 +225,20 @@ static int budget_resident(Model *m, int64_t budget_bytes, int ctx_hint) {
     for (int i = 0; i < c->n_layers; i++) { int64_t b = layer_f32_bytes(m, i); if (b > max_lb) max_lb = b; }
     /* embed (e l'eventuale lm_head separato): f32 oppure int8+scala
      * (con QBITS=4 embed e testa restano comunque int8) */
-    int64_t vd = m->qbits ? (int64_t)c->vocab*D + (int64_t)c->vocab*4
+    int64_t vd = m->base.qbits ? (int64_t)c->vocab*D + (int64_t)c->vocab*4
                           : (int64_t)c->vocab*D*4;
     int64_t fixed = vd + (int64_t)D*4;                          /* + final_norm */
-    if (!m->lm_tied) fixed += vd;
+    if (!m->base.lm_tied) fixed += vd;
     fixed += (int64_t)c->n_layers * 8 * D * 4;                  /* norme/vettori: stima larga */
     fixed += fixed_bytes(m, ctx_hint > 0 ? ctx_hint : 4096);    /* hook: KV, PLE... */
     /* scratch di streaming: int8 con QBITS=8 (layer_stream_in quantizza), f32 altrimenti */
-    int64_t scratch = (m->qbits == 8) ? max_lb/4 + max_lb/64 : max_lb;
+    int64_t scratch = (m->base.qbits == 8) ? max_lb/4 + max_lb/64 : max_lb;
     int64_t used = fixed + scratch;
     int R = 0;
     for (; R < c->n_layers; R++) {
         int64_t lb = layer_f32_bytes(m, R);
-        if (m->qbits == 8) lb = lb/4 + lb/64;                   /* int8 + scale */
-        else if (m->qbits == 4) lb = lb/8 + lb/32;              /* int4 + scale di gruppo (gs=32) */
+        if (m->base.qbits == 8) lb = lb/4 + lb/64;                   /* int8 + scale */
+        else if (m->base.qbits == 4) lb = lb/8 + lb/32;              /* int4 + scale di gruppo (gs=32) */
         if (used + lb > budget_bytes) break;
         used += lb;
     }
@@ -258,24 +258,24 @@ static int budget_resident(Model *m, int64_t budget_bytes, int ctx_hint) {
 static void stream_scratch_alloc(Model *m) {
     Cfg *c = &m->c;
     int64_t smax = 0, rmax = 0;
-    for (int i = m->n_resident; i < c->n_layers; i++) {
+    for (int i = m->base.n_resident; i < c->n_layers; i++) {
         int64_t b = layer_f32_bytes(m, i); if (b > smax) smax = b;
         MatRef r[MAX_LAYER_MATS]; int n = layer_matrefs(m, i, r);
         int64_t rows = 0; for (int j = 0; j < n; j++) rows += r[j].O;
         if (rows > rmax) rmax = rows;
     }
-    if (m->qbits == 8) {
-        m->stream_q = balloc(smax/4, "scratch stream int8");  /* 1 byte per elemento f32 */
-        m->stream_qs = falloc(rmax);
+    if (m->base.qbits == 8) {
+        m->base.stream_q = balloc(smax/4, "scratch stream int8");  /* 1 byte per elemento f32 */
+        m->base.stream_qs = falloc(rmax);
     } else {
-        m->stream_buf = falloc(smax/4);
+        m->base.stream_buf = falloc(smax/4);
     }
 }
 
 /* budget_bytes==0 -> tutto residente (comportamento classico) */
 static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_bytes, int ctx_hint) {
     memset(m, 0, sizeof(*m));
-    m->qbits = qbits;
+    m->base.qbits = qbits;
     /* GGUF: l'indice va costruito PRIMA del config (i metadati SONO il config) */
     if (g_gguf) gguf_index(&m->S, &g_gguf_meta, g_gguf);
     load_cfg(&m->c, snap);
@@ -285,52 +285,52 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
     int D = c->hidden;
     /* final norm: model.norm.weight (standard); se assente (LFM2: token_embd_norm) lo fornira" load_small */
     if (st_has(&m->S, "model.norm.weight"))
-        m->final_norm = load_t(m, "model.norm.weight", D);
-    m->lm_tied = c->tie_emb || !st_has(&m->S, "lm_head.weight");
+        m->base.final_norm = load_t(m, "model.norm.weight", D);
+    m->base.lm_tied = c->tie_emb || !st_has(&m->S, "lm_head.weight");
     m->L = calloc(c->n_layers, sizeof(Layer));
     /* 1) parte piccola SEMPRE residente (hook: norme, vettori, stati, PLE...) */
     load_small(m);
     /* micro-RSS: nessun peso residente, embed compreso (gather per riga nello
      * step del motore); ogni Mat diventa un descrittore streamato. */
-    if (g_micro) { model_init_micro(m); m->load_s = now_s() - t0; return; }
+    if (g_micro) { model_init_micro(m); m->base.load_s = now_s() - t0; return; }
     /* QBITS!=0 copre anche l'embed, ma SEMPRE a int8 (anche con QBITS=4):
      * l'lm_head e' il GEMV piu' sensibile alla quantizzazione e l'int4 li'
      * risparmierebbe poco rispetto alle matrici dei layer */
-    if (m->qbits > 0 || getenv("EMBED_Q8")) load_embed_q8(m);  /* qbits=-1 (native): f32 embed */
-    else m->embed = load_t(m, "model.embed_tokens.weight", (int64_t)c->vocab*D);
-    if (m->lm_tied) {
-        mat_reset_storage(&m->lm_head);
-        m->lm_head.O = c->vocab; m->lm_head.I = D;
-        if (m->qbits == 4 && m->embed_q && D <= 2048) {
+    if (m->base.qbits > 0 || getenv("EMBED_Q8")) load_embed_q8(m);  /* qbits=-1 (native): f32 embed */
+    else m->base.embed = load_t(m, "model.embed_tokens.weight", (int64_t)c->vocab*D);
+    if (m->base.lm_tied) {
+        mat_reset_storage(&m->base.lm_head);
+        m->base.lm_head.O = c->vocab; m->base.lm_head.I = D;
+        if (m->base.qbits == 4 && m->base.embed_q && D <= 2048) {
             /* lm_head separato in INT4: il GEMV del logit e' ~43% del traffico
              * per-token in decode (262MB→131). Lookup embed resta int8. */
             int64_t V = c->vocab, rb = (D+1)/2;
-            m->lm_head.q4 = balloc(V*rb, "lm_head i4");
-            m->lm_head.qs = falloc(V);
-            m->lm_head.fmt = WF_I4;
+            m->base.lm_head.q4 = balloc(V*rb, "lm_head i4");
+            m->base.lm_head.qs = falloc(V);
+            m->base.lm_head.fmt = WF_I4;
             #pragma omp parallel for schedule(static)
             for (int64_t v = 0; v < V; v++) {
                 float row[2048];
-                const int8_t *er = m->embed_q + v*D;
-                float es = m->embed_qs[v];
+                const int8_t *er = m->base.embed_q + v*D;
+                float es = m->base.embed_qs[v];
                 for (int i = 0; i < D; i++) row[i] = er[i] * es;
-                pack_int4(row, m->lm_head.q4 + v*rb, m->lm_head.qs + v, 1, D);
+                pack_int4(row, m->base.lm_head.q4 + v*rb, m->base.lm_head.qs + v, 1, D);
             }
         } else {
-            m->lm_head.f = m->embed; m->lm_head.q = m->embed_q; m->lm_head.qs = m->embed_qs;
-            m->lm_head.fmt = m->embed_q ? WF_I8 : WF_F32;
+            m->base.lm_head.f = m->base.embed; m->base.lm_head.q = m->base.embed_q; m->base.lm_head.qs = m->base.embed_qs;
+            m->base.lm_head.fmt = m->base.embed_q ? WF_I8 : WF_F32;
         }
     } else {
-        load_mat_bits(m, &m->lm_head, "lm_head.weight", c->vocab, D, m->qbits);
+        load_mat_bits(m, &m->base.lm_head, "lm_head.weight", c->vocab, D, m->base.qbits);
     }
     /* 2) budget -> quanti layer di matrici stanno residenti */
-    m->n_resident = budget_bytes > 0 ? budget_resident(m, budget_bytes, ctx_hint)
+    m->base.n_resident = budget_bytes > 0 ? budget_resident(m, budget_bytes, ctx_hint)
                                      : c->n_layers;
     /* 3) matrici: residenti (QBITS onorato) o streamate (dims impostate, f=NULL) */
     for (int i = 0; i < c->n_layers; i++) {
         MatRef r[MAX_LAYER_MATS]; int n = layer_matrefs(m, i, r);
         for (int j = 0; j < n; j++) {
-            if (i < m->n_resident) load_mat(m, r[j].mat, r[j].name, r[j].O, r[j].I);
+            if (i < m->base.n_resident) load_mat(m, r[j].mat, r[j].name, r[j].O, r[j].I);
             else {
                 st_expect(&m->S, r[j].name, (int64_t)r[j].O*r[j].I);
                 mat_reset_storage(r[j].mat);
@@ -338,8 +338,8 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
             }
         }
     }
-    if (m->n_resident < c->n_layers) stream_scratch_alloc(m);
-    m->load_s = now_s() - t0;
+    if (m->base.n_resident < c->n_layers) stream_scratch_alloc(m);
+    m->base.load_s = now_s() - t0;
 }
 
 static void model_init(Model *m, const char *snap, int qbits) {
@@ -356,13 +356,13 @@ static int g_kv_bits = 0;
  * open-coded in tre punti fra i due motori. */
 static void embed_row(Model *m, int id, float scale, float *dst) {
     int D = m->c.hidden;
-    if (m->embed) {
-        const float *er = m->embed + (int64_t)id*D;
+    if (m->base.embed) {
+        const float *er = m->base.embed + (int64_t)id*D;
         if (scale == 1.f) memcpy(dst, er, D*sizeof(float));
         else for (int i = 0; i < D; i++) dst[i] = er[i] * scale;
-    } else if (m->embed_q) {
-        const int8_t *er = m->embed_q + (int64_t)id*D;
-        float es = m->embed_qs[id] * scale;
+    } else if (m->base.embed_q) {
+        const int8_t *er = m->base.embed_q + (int64_t)id*D;
+        float es = m->base.embed_qs[id] * scale;
         for (int i = 0; i < D; i++) dst[i] = er[i] * es;
     } else {
         st_read_slice_f32(&m->S, "model.embed_tokens.weight", (int64_t)id*D, D, dst, 0);

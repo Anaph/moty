@@ -173,7 +173,7 @@ static int engine_main(int argc, char **argv) {
         int k = tok_encode(&T, buf, bl, hist + len, maxctx - len - 2);
         if (len + k + 8 >= maxctx) {                /* contesto pieno: reset conversazione */
             fprintf(stderr, "[" ENGINE_TAG "] contesto pieno, reset della conversazione\n");
-            len = 0; m.kv_len = 0; state_reset(&m);  /* lo stato ricorrente non e' troncabile */
+            len = 0; m.base.kv_len = 0; state_reset(&m);  /* lo stato ricorrente non e' troncabile */
             k = tok_encode(&T, buf, bl, hist, maxctx - 2);
         }
         int cur = ngen; if (len + k + cur + 1 > maxctx) cur = maxctx - len - k - 1;

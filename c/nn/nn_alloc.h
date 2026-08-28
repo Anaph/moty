@@ -1,6 +1,8 @@
 /* nn_alloc.h — fondazione condivisa: tempo (now_s), RSS, allocatori con check,
- * scratch statico grow + stub OpenMP. Estratto da nn.h per granularita': un
- * motore che vuole solo gli allocatori (niente gemm/sampler) include questo.
+ * scratch arena. M2: le IMPLEMENTAZIONI vivono in nn/alloc.c (libmoty-nn);
+ * qui restano i tipi, le utility pure inline e le macro legacy che riscrivono
+ * i vecchi nomi (balloc -> moty_balloc) finche' i chiamanti non migrano
+ * (docs/symbol-map.md).
  * Dipende solo da libc; niente simd.h, niente Mat. */
 #ifndef NN_ALLOC_H
 #define NN_ALLOC_H
@@ -25,74 +27,45 @@ static inline int  omp_get_thread_num(void)  { return 0; }
 static inline void omp_set_num_threads(int n) { (void)n; }
 #endif
 
-/* ---------- utility ---------- */
+/* ---------- utility pure (restano inline) ---------- */
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
 #if defined(__APPLE__)
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }
 #else
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
 #endif
-/* allocatori con check: UN solo formato di messaggio OOM (prima: sette
- * varianti scritte a mano nei call site) */
-static void *balloc(int64_t n, const char *what) {
-    void *p = malloc(n > 0 ? n : 1);
-    if (!p) { fprintf(stderr, "OOM %s (%lld byte)\n", what, (long long)n); exit(1); }
-    return p;
-}
-static void *bzalloc(int64_t n, const char *what) {
-    void *p = calloc(1, n > 0 ? n : 1);
-    if (!p) { fprintf(stderr, "OOM %s (%lld byte)\n", what, (long long)n); exit(1); }
-    return p;
-}
-static float *falloc(int64_t n) { return (float *)balloc(n*sizeof(float), "f32"); }
 
-/* scratch che cresce e basta (l'idioma static-grow dei kernel: contratto di
- * chiamata SERIALE, mai da dentro una regione parallela) */
-static void grow(void **p, int64_t *cap, int64_t need, size_t esz, const char *what) {
-    if (need <= *cap) return;
-    *cap = need;
-    *p = realloc(*p, (size_t)need * esz);
-    if (!*p) { fprintf(stderr, "OOM %s (%lld x %zu byte)\n", what, (long long)need, esz); exit(1); }
-}
-
-/* ---------- P5: arena scratch per-Model ----------
- * Sostituisce gli static-grow function-local nei kernel condivisi: due Model
- * nello stesso processo non si calpestano piu' la memoria.
- * Contratto (come grow(), SERIALE, mai dentro una regione parallela):
- *   1. scr_reset()   all'ingresso del kernel/step
- *   2. scr_reserve() PRIMA di tutti i take della fase: la reserve e' l'unica
- *      che puo' reallocare; un take dopo la reserve non muove mai la base,
- *      quindi i puntatori consegnati prima restano validi
- *   3. scr_take()    consegna chunk allineati a 64 byte (cache line) */
 typedef struct Scratch { char *raw; int off; char *base; int64_t cap, used; } Scratch;
 
-static void scr_reset(Scratch *s) { s->used = 0; }
-static void scr_free(Scratch *s) { free(s->raw); s->raw = NULL; s->base = NULL; s->off = 0; s->cap = s->used = 0; }
+/* ---------- allocatori + arena: prototipi (nn/alloc.c) ---------- */
+void *moty_grow(void **p, int64_t *cap, int64_t need, size_t esz, const char *what);
+void *moty_balloc(int64_t n, const char *what);
+void *moty_bzalloc(int64_t n, const char *what);
+static inline float *moty_falloc(int64_t n) { return (float *)moty_balloc(n*sizeof(float), "f32"); }
 
-/* La base deve essere allineata a 64 (i take lo ereditano): malloc garantisce
- * solo 16, quindi si sovra-alloca di 63 e si tiene `raw` per la free. Se la
- * realloc sposta il blocco con un allineamento diverso, il contenuto va
- * riportato al nuovo offset (memmove: le zone si sovrappongono). */
-static void scr_reserve(Scratch *s, int64_t bytes) {
-    if (bytes <= s->cap) return;
-    int64_t nc = s->cap ? s->cap : (int64_t)1 << 20;   /* 1MB iniziale, x2 */
-    while (nc < bytes) nc *= 2;
-    char *nr = realloc(s->raw, (size_t)nc + 63);
-    if (!nr) { fprintf(stderr, "OOM scratch (%lld byte)\n", (long long)nc); exit(1); }
-    int noff = (int)((64 - ((uintptr_t)nr & 63)) & 63);
-    if (s->base && noff != s->off && s->used > 0) {
-        int64_t live = s->used < s->cap ? s->used : s->cap;
-        memmove(nr + noff, nr + s->off, (size_t)live);
-    }
-    s->raw = nr; s->off = noff; s->base = nr + noff; s->cap = nc;
-}
-static void *scr_take(Scratch *s, int64_t bytes) {
-    bytes = (bytes + 63) & ~(int64_t)63;
-    void *p = s->base + s->used;
-    s->used += bytes;
-    return p;
-}
+void  moty_scr_reset(Scratch *s);
+void  moty_scr_free(Scratch *s);
+void  moty_scr_reserve(Scratch *s, int64_t bytes);
+void *moty_scr_take(Scratch *s, int64_t bytes);
+
+/* Contratto dell'arena (SERIALE, mai dentro una regione parallela):
+ *   1. scr_reset()   all'ingresso del kernel/step
+ *   2. scr_reserve() PRIMA di tutti i take della fase: la reserve e' l'unica
+ *      che puo' reallocare; un take dopo la reserve non muove mai la base
+ *   3. scr_take()    consegna chunk allineati a 64 byte (cache line) */
 /* allineamento a 64 per il calcolo dei totale di reserve */
 static inline int64_t scr_al(int64_t bytes) { return (bytes + 63) & ~(int64_t)63; }
+
+/* macro legacy: i vecchi nomi continuano a comporre (M2 strangler) */
+#ifndef MOTY_CORE_NO_LEGACY
+#define grow       moty_grow
+#define balloc     moty_balloc
+#define bzalloc    moty_bzalloc
+#define falloc     moty_falloc
+#define scr_reset  moty_scr_reset
+#define scr_free   moty_scr_free
+#define scr_reserve moty_scr_reserve
+#define scr_take   moty_scr_take
+#endif
 
 #endif /* NN_ALLOC_H */

@@ -304,8 +304,18 @@ static float *falloc(int64_t n){
  * EN: same lossless math as matmul_i4, 32 weights/iter on two independent FMA
  * chains. Not bit-identical to the old order: tree reduction accumulates LESS
  * rounding than sequential summation. I4_ACC512=0 restores the old order (A/B). */
-#if defined(__AVX512F__) && defined(__AVX512BW__)
+#if defined(__AVX2__) || defined(__AVX512F__)
 #include <immintrin.h>                 /* proprie intrinsics (M1: hw.h non le diffonde piu') */
+#endif
+#if defined(__AVX2__) && !(defined(__AVX512F__) && defined(__AVX512BW__))
+/* tier AVX2 puro: hsum locale (nel tier AVX512 e' nel blocco sotto) */
+static inline float simd_hsum256_f32(__m256 v){
+    __m128 lo=_mm256_castps256_ps128(v), hi=_mm256_extractf128_ps(v,1);
+    lo=_mm_add_ps(lo,hi); __m128 sh=_mm_movehl_ps(lo,lo); lo=_mm_add_ps(lo,sh);
+    sh=_mm_shuffle_ps(lo,lo,1); lo=_mm_add_ss(lo,sh); return _mm_cvtss_f32(lo);
+}
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__)
 /* hsum locale: prima arrivava da hw_avx512.h (M1: il backend non e' piu'
  * incluso dai motori — il contratto pubblico passa da hw/hw.h) */
 static inline float simd_hsum256_f32(__m256 v){

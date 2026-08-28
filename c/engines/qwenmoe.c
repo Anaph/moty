@@ -223,7 +223,7 @@ static void load_small(Model *m) {
             { for (int r=0;r<D;r++) vhead_ungroup(l->aout.f + (int64_t)r*vd, hv, dv, hk); }
             #undef LDMQ
             /* quantizza le Mat f32 (post-ungroup) se qbits>0: int8 resident */
-            if (m->qbits) {
+            if (m->base.qbits) {
                 #define QZ(field, O_, I_) do { Mat *w=&l->field; int8_t *q=balloc((int64_t)(O_)*(I_),#field); \
                     float *qs=falloc(O_); quantize_rows(w->f,q,qs,(O_),(I_),8); \
                     free(w->f); w->f=NULL; w->q=q; w->qs=qs; w->fmt=WF_I8; } while(0)
@@ -447,7 +447,7 @@ static int gen_turn_spec(Model *m, Tok *T, const int *prompt, int np,
     int ng_gen = 0;
     SpecStateBackup backup; spec_state_alloc(m, &backup);
     for (int si = 0; si < n_new; ) {
-        int tok = pick_tok(&m->scr, logit, c->vocab); free(logit); logit = NULL;
+        int tok = pick_tok(&m->base.scr, logit, c->vocab); free(logit); logit = NULL;
         out[len++] = tok; ng_gen++; pos++;
         if (g_tokens_dump) fprintf(stderr, "%d ", tok);
         if (echo && T) { char buf[64]; int bn = tok_decode(T, &tok, 1, buf, 63); fwrite(buf,1,bn,stdout); fflush(stdout); }
@@ -514,21 +514,21 @@ static int gen_turn_spec(Model *m, Tok *T, const int *prompt, int np,
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     /* P5: stream buffers per-Step nell'arena bscr (vive attraverso le
-     * chiamate kernel del layer loop; m->scr si resetta dentro i kernel) */
-    scr_reset(&m->bscr);
-    scr_reserve(&m->bscr, 3*scr_al((int64_t)S*D*4));
-    float *xb = scr_take(&m->bscr, (int64_t)S*D*4);
-    float *nb = scr_take(&m->bscr, (int64_t)S*D*4);
-    float *tb = scr_take(&m->bscr, (int64_t)S*D*4);
+     * chiamate kernel del layer loop; m->base.scr si resetta dentro i kernel) */
+    scr_reset(&m->base.bscr);
+    scr_reserve(&m->base.bscr, 3*scr_al((int64_t)S*D*4));
+    float *xb = scr_take(&m->base.bscr, (int64_t)S*D*4);
+    float *nb = scr_take(&m->base.bscr, (int64_t)S*D*4);
+    float *tb = scr_take(&m->base.bscr, (int64_t)S*D*4);
     float *x=xb,*nrm=nb,*tmp=tb;
     for (int s = 0; s < S; s++) embed_row(m, ids[s], 1.f, x + (int64_t)s*D);
-    int strm = m->stream_buf != NULL || m->stream_q != NULL;
-    if (strm && m->n_resident < c->n_layers) layer_prefetch(m, m->n_resident);
+    int strm = m->base.stream_buf != NULL || m->base.stream_q != NULL;
+    if (strm && m->base.n_resident < c->n_layers) layer_prefetch(m, m->base.n_resident);
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
-        if (strm && i >= m->n_resident) {
+        if (strm && i >= m->base.n_resident) {
             layer_stream_in(m, i);
-            if (i+1 < c->n_layers && i+1 >= m->n_resident) layer_prefetch(m, i+1);
+            if (i+1 < c->n_layers && i+1 >= m->base.n_resident) layer_prefetch(m, i+1);
         }
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
         if (l->type == LT_LINEAR) deltanet(m, l, nrm, S, tmp);
@@ -539,12 +539,12 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         else moe_batch(m, l, i, nrm, S, tmp);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
     }
-    m->kv_len = pos_base + S;
+    m->base.kv_len = pos_base + S;
     if (g_skip_logits) return NULL;
     float *last = falloc(D);
-    rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
+    rmsnorm_row(last, x + (int64_t)(S-1)*D, m->base.final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
-    mat_apply(logit, last, &m->lm_head, 1);
+    mat_apply(logit, last, &m->base.lm_head, 1);
     free(last);
     return logit;
 }
@@ -570,14 +570,14 @@ static int *step_argmax_all(Model *m, const int *ids, int S, int pos_base) {
         else moe_batch(m, l, i, nrm, S, tmp);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
     }
-    m->kv_len = pos_base + S;
+    m->base.kv_len = pos_base + S;
     /* argmax per ogni posizione: lm_head su ogni hidden normato */
     int *am = malloc(S * sizeof(int));
     float *hn = falloc(D);
     for (int s = 0; s < S; s++) {
-        rmsnorm_row(hn, x + (int64_t)s*D, m->final_norm, D, c->eps);
+        rmsnorm_row(hn, x + (int64_t)s*D, m->base.final_norm, D, c->eps);
         float *lo = falloc(c->vocab);
-        mat_apply(lo, hn, &m->lm_head, 1);
+        mat_apply(lo, hn, &m->base.lm_head, 1);
         am[s] = argmax_v(lo, c->vocab);
         free(lo);
     }
@@ -650,7 +650,7 @@ static void banner(Model *m) {
         "%d expert top-%d (moe_inter %d, shared %d), vocab %d%s | load %.1fs | RSS %.2f GB | idot %s | f32 %s\n",
         m->c.n_layers, nfull, nlin, m->c.hidden, m->c.n_heads, m->c.n_kv_heads, m->c.head_dim, m->c.rot,
         m->c.n_experts, m->c.topk, m->c.moe_inter, m->c.sh_inter, m->c.vocab,
-        m->lm_tied?" | lm_head=embed":"", m->load_s, rss_gb(), IDOT_KERNEL, F32_KERNEL);
+        m->base.lm_tied?" | lm_head=embed":"", m->base.load_s, rss_gb(), IDOT_KERNEL, F32_KERNEL);
 }
 
 #ifndef QWENMOE_TEST
@@ -711,7 +711,7 @@ int main(int argc, char **argv) {
             int k = tok_encode(&T, line, (int)nr, hist + len, maxctx - len - 2);
             if (len + k + 8 >= maxctx) {
                 fprintf(stderr, "[qwenmoe] contesto pieno, reset\n");
-                len = 0; m.kv_len = 0; state_reset(&m);
+                len = 0; m.base.kv_len = 0; state_reset(&m);
                 k = tok_encode(&T, line, (int)nr, hist, maxctx - 2);
             }
             int cur = ngen; if (len + k + cur + 1 > maxctx) cur = maxctx - len - k - 1;

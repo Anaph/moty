@@ -21,19 +21,19 @@ static void conv_layer(Model *m, Layer *l, float *x, int S, float *out) {
     /* P5: arena per-Model, reserve unica per tutti i chunk (path VNNI completo) */
     {
         int ng_ = (D+31)/32;
-        scr_reset(&m->scr);
-        scr_reserve(&m->scr, scr_al((int64_t)S*3*D*4) + scr_al((int64_t)S*D*4)
+        scr_reset(&m->base.scr);
+        scr_reserve(&m->base.scr, scr_al((int64_t)S*3*D*4) + scr_al((int64_t)S*D*4)
                           + 2*scr_al((int64_t)S*D) + 2*scr_al((int64_t)S*ng_*4)
                           + 2*scr_al((int64_t)S*4));
     }
-    float *bcx = scr_take(&m->scr, (int64_t)S*3*D*4);
-    float *ybuf = scr_take(&m->scr, (int64_t)S*D*4);
-    int8_t *cxi = scr_take(&m->scr, scr_al((int64_t)S*D));
-    int32_t *cxg = scr_take(&m->scr, scr_al((int64_t)S*((D+31)/32)*4));
-    float   *csx = scr_take(&m->scr, scr_al((int64_t)S*4));
-    int8_t *yqi = scr_take(&m->scr, scr_al((int64_t)S*D));
-    int32_t *yqg = scr_take(&m->scr, scr_al((int64_t)S*((D+31)/32)*4));
-    float   *ysx = scr_take(&m->scr, scr_al((int64_t)S*4));
+    float *bcx = scr_take(&m->base.scr, (int64_t)S*3*D*4);
+    float *ybuf = scr_take(&m->base.scr, (int64_t)S*D*4);
+    int8_t *cxi = scr_take(&m->base.scr, scr_al((int64_t)S*D));
+    int32_t *cxg = scr_take(&m->base.scr, scr_al((int64_t)S*((D+31)/32)*4));
+    float   *csx = scr_take(&m->base.scr, scr_al((int64_t)S*4));
+    int8_t *yqi = scr_take(&m->base.scr, scr_al((int64_t)S*D));
+    int32_t *yqg = scr_take(&m->base.scr, scr_al((int64_t)S*((D+31)/32)*4));
+    float   *ysx = scr_take(&m->base.scr, scr_al((int64_t)S*4));
     Mat *wi = &l->in_proj, *wo = &l->out_proj;
     int gs = wi->gs, ngD = (D+gs-1)/gs;
     int vnni_in  = (wi->fmt == WF_I4G && gs == 32 && (D & 63) == 0);

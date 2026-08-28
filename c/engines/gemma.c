@@ -335,15 +335,15 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
         for (int s = 0; s < S; s++) for (int hh = 0; hh < KV; hh++) {
             int t = pos_base + s;
-            int64_t slot = (int64_t)hh*m->max_t + t;
-            if (m->K8[layer]) {                  /* KV_BITS=8: K post-RoPE e V (anche la
+            int64_t slot = (int64_t)hh*m->base.max_t + t;
+            if (m->base.K8[layer]) {                  /* KV_BITS=8: K post-RoPE e V (anche la
                                                   * copia k_eq_v pre-RoPE) quantizzati
                                                   * indipendentemente, ognuno con la sua scala */
-                kv_store_row(m->K8[layer] + slot*hd, &m->Ks[layer][slot], k + s*kw + (int64_t)hh*hd, hd);
-                kv_store_row(m->V8[layer] + slot*hd, &m->Vs[layer][slot], vv + s*kw + (int64_t)hh*hd, hd);
+                kv_store_row(m->base.K8[layer] + slot*hd, &m->base.Ks[layer][slot], k + s*kw + (int64_t)hh*hd, hd);
+                kv_store_row(m->base.V8[layer] + slot*hd, &m->base.Vs[layer][slot], vv + s*kw + (int64_t)hh*hd, hd);
             } else {
-                memcpy(m->K[layer] + slot*hd, k + s*kw + (int64_t)hh*hd, hd*sizeof(float));
-                memcpy(m->V[layer] + slot*hd, vv + s*kw + (int64_t)hh*hd, hd*sizeof(float));
+                memcpy(m->base.K[layer] + slot*hd, k + s*kw + (int64_t)hh*hd, hd*sizeof(float));
+                memcpy(m->base.V[layer] + slot*hd, vv + s*kw + (int64_t)hh*hd, hd*sizeof(float));
             }
         }
         free(k); free(vv);
@@ -357,9 +357,9 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             gemma_rope_head(qh, pos, theta, hd, rot);
         }
     }
-    float *Kc = m->K[src], *Vc = m->V[src];
-    const int8_t *K8c = m->K8[src], *V8c = m->V8[src];
-    const float *Ksc = m->Ks[src], *Vsc = m->Vs[src];
+    float *Kc = m->base.K[src], *Vc = m->base.V[src];
+    const int8_t *K8c = m->base.K8[src], *V8c = m->base.V8[src];
+    const float *Ksc = m->base.Ks[src], *Vsc = m->base.Vs[src];
     float scale = c->qscalar > 0 ? 1.f/sqrtf(c->qscalar) : 1.f/sqrtf((float)hd);
     float *ctx = falloc(S*qw);
     #pragma omp parallel for collapse(2) schedule(static)
@@ -367,12 +367,12 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         for (int s = 0; s < S; s++) {
             /* scratch pre-allocato per thread (att_sc, vedi kv_alloc): niente
              * malloc/free dentro la regione calda */
-            float *sc = m->att_sc + (int64_t)omp_get_thread_num() * m->max_t;
+            float *sc = m->base.att_sc + (int64_t)omp_get_thread_num() * m->base.max_t;
             int kvh = hh / G;
             int qpos = pos_base + s;
             int t0 = l->type == LT_FULL ? 0 : (qpos - c->window + 1 > 0 ? qpos - c->window + 1 : 0);
             const float *qv = q + s*qw + (int64_t)hh*hd;
-            int64_t kvbase = (int64_t)kvh * m->max_t;
+            int64_t kvbase = (int64_t)kvh * m->base.max_t;
             if (K8c) att_scores_i8(sc, qv, K8c, Ksc, kvbase, t0, qpos, hd, scale);
             else     att_scores_f32(sc, qv, Kc, kvbase, t0, qpos, hd, scale);
             softmax_row(sc, qpos-t0+1);
@@ -462,12 +462,12 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         ple_inputs(m, ids, S, ple);
     }
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
-    if (m->n_resident < c->n_layers) layer_prefetch(m, m->n_resident);
+    if (m->base.n_resident < c->n_layers) layer_prefetch(m, m->base.n_resident);
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
-        if (i >= m->n_resident) {
+        if (i >= m->base.n_resident) {
             layer_stream_in(m, i);                  /* rilegge il layer dal disco (f32) */
-            if (i + 1 < c->n_layers && i + 1 >= m->n_resident) layer_prefetch(m, i + 1);
+            if (i + 1 < c->n_layers && i + 1 >= m->base.n_resident) layer_prefetch(m, i + 1);
         }
         /* sandwich: x += post_attn_norm(attn(in_norm(x))) */
         for (int s = 0; s < S; s++) gnorm_row(c, nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D);
@@ -487,13 +487,13 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         }
         if (c->ple_dim > 0) ple_apply(m, l, i, ple, x, S);
     }
-    m->kv_len = pos_base + S;
+    m->base.kv_len = pos_base + S;
     /* blocco intermedio di un prefill a blocchi: niente final-norm/lm_head */
     if (g_skip_logits) { free(x); free(nrm); free(tmp); if (ple) free(ple); return NULL; }
     float *last = falloc(D);
-    gnorm_row(c, last, x + (int64_t)(S-1)*D, m->final_norm, D);
+    gnorm_row(c, last, x + (int64_t)(S-1)*D, m->base.final_norm, D);
     float *logit = falloc(c->vocab);
-    mat_apply(logit, last, &m->lm_head, 1);
+    mat_apply(logit, last, &m->base.lm_head, 1);
     if (c->softcap > 0)
         for (int i = 0; i < c->vocab; i++) logit[i] = c->softcap * tanhf(logit[i]/c->softcap);
     free(x); free(nrm); free(tmp); free(last);
@@ -512,9 +512,9 @@ static void kv_alloc(Model *m, int max_t) {
     }
     for (int i = 0; i < c->n_layers; i++)
         if (c->kv_src[i] != i) {                   /* alias del sorgente, scale comprese */
-            m->K[i] = m->K[c->kv_src[i]];   m->V[i] = m->V[c->kv_src[i]];
-            m->K8[i] = m->K8[c->kv_src[i]]; m->V8[i] = m->V8[c->kv_src[i]];
-            m->Ks[i] = m->Ks[c->kv_src[i]]; m->Vs[i] = m->Vs[c->kv_src[i]];
+            m->base.K[i] = m->base.K[c->kv_src[i]];   m->base.V[i] = m->base.V[c->kv_src[i]];
+            m->base.K8[i] = m->base.K8[c->kv_src[i]]; m->base.V8[i] = m->base.V8[c->kv_src[i]];
+            m->base.Ks[i] = m->base.Ks[c->kv_src[i]]; m->base.Vs[i] = m->base.Vs[c->kv_src[i]];
         }
     state_reset(m);   /* no-op per gemma: simmetria col gemello qwen */
 }
@@ -535,10 +535,10 @@ static void banner(Model *m) {
     fprintf(stderr, "[gemma] %d layer (%d full/%d sliding, finestra %d), hidden %d, %d teste (hd %d/%d, rot %d), vocab %d%s%s%s | load %.1fs | RSS %.2f GB | idot %s | f32 %s\n",
             m->c.n_layers, nfull, m->c.n_layers-nfull, m->c.window, m->c.hidden, m->c.n_heads,
             m->c.head_dim, m->c.ghd, m->c.rot_angles, m->c.vocab,
-            m->lm_tied ? " | lm_head=embed" : "",
+            m->base.lm_tied ? " | lm_head=embed" : "",
             m->c.n_kv_shared ? " | kv-shared" : "",
             m->c.ple_dim ? " | PLE" : "",
-            m->load_s, rss_gb(), IDOT_KERNEL, F32_KERNEL);
+            m->base.load_s, rss_gb(), IDOT_KERNEL, F32_KERNEL);
 }
 
 #ifndef GEMMA_TEST

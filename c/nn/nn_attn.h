@@ -34,11 +34,11 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos_base,
         int64_t aux = vnni_all
             ? scr_al((int64_t)S*c->hidden) + scr_al((int64_t)S*((c->hidden+31)/32)*4) + scr_al((int64_t)S*4)
             : 0;
-        scr_reset(&m->scr);
-        scr_reserve(&m->scr, scr_al((int64_t)S*qw*4) + 2*scr_al((int64_t)S*kw*4) + aux);
+        scr_reset(&m->base.scr);
+        scr_reserve(&m->base.scr, scr_al((int64_t)S*qw*4) + 2*scr_al((int64_t)S*kw*4) + aux);
     }
-    float *q = scr_take(&m->scr, (int64_t)S*qw*4);
-    float *k = scr_take(&m->scr, (int64_t)S*kw*4), *vv = scr_take(&m->scr, (int64_t)S*kw*4);
+    float *q = scr_take(&m->base.scr, (int64_t)S*qw*4);
+    float *k = scr_take(&m->base.scr, (int64_t)S*kw*4), *vv = scr_take(&m->base.scr, (int64_t)S*kw*4);
 #ifdef ENGINE_GATED_ATTN
     float *gate = NULL;
     {   /* q_proj raddoppiata [query|gate] interleaved per head: sequenziale */
@@ -62,9 +62,9 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos_base,
         int vnni = (l->q.fmt == WF_I4G && l->k.fmt == WF_I4G && l->v.fmt == WF_I4G
                     && gs == 32 && (D & 63) == 0);
         if (vnni) {
-            int8_t *axi = scr_take(&m->scr, scr_al((int64_t)S*D));
-            int32_t *axg = scr_take(&m->scr, scr_al((int64_t)S*ng*4));
-            float   *asx = scr_take(&m->scr, scr_al((int64_t)S*4));
+            int8_t *axi = scr_take(&m->base.scr, scr_al((int64_t)S*D));
+            int32_t *axg = scr_take(&m->base.scr, scr_al((int64_t)S*ng*4));
+            float   *asx = scr_take(&m->base.scr, scr_al((int64_t)S*4));
             for (int s = 0; s < S; s++) {
                 asx[s] = qrow_i8(x + (int64_t)s*D, axi + (int64_t)s*D, D);
                 for (int g = 0; g < ng; g++) {
@@ -105,32 +105,32 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos_base,
         }
     }
     /* KV store */
-    int kv8 = m->K8[li] != NULL;
+    int kv8 = m->base.K8[li] != NULL;
     for (int s = 0; s < S; s++) for (int hh = 0; hh < KV; hh++) {
-        int t = pos_base + s; int64_t slot = (int64_t)hh*m->max_t + t;
+        int t = pos_base + s; int64_t slot = (int64_t)hh*m->base.max_t + t;
         if (kv8) {
-            kv_store_row(m->K8[li] + slot*hd, &m->Ks[li][slot], k + s*kw + hh*hd, hd);
-            kv_store_row(m->V8[li] + slot*hd, &m->Vs[li][slot], vv + s*kw + hh*hd, hd);
+            kv_store_row(m->base.K8[li] + slot*hd, &m->base.Ks[li][slot], k + s*kw + hh*hd, hd);
+            kv_store_row(m->base.V8[li] + slot*hd, &m->base.Vs[li][slot], vv + s*kw + hh*hd, hd);
         } else {
-            memcpy(m->K[li] + slot*hd, k + s*kw + hh*hd, hd*sizeof(float));
-            memcpy(m->V[li] + slot*hd, vv + s*kw + hh*hd, hd*sizeof(float));
+            memcpy(m->base.K[li] + slot*hd, k + s*kw + hh*hd, hd*sizeof(float));
+            memcpy(m->base.V[li] + slot*hd, vv + s*kw + hh*hd, hd*sizeof(float));
         }
     }
     /* scores + accumulation */
     float scale = 1.f / sqrtf((float)hd);
-    float *ctx = scr_take(&m->scr, (int64_t)S*qw*4);
+    float *ctx = scr_take(&m->base.scr, (int64_t)S*qw*4);
     #pragma omp parallel for collapse(2) schedule(static)
     for (int hh = 0; hh < H; hh++) for (int s = 0; s < S; s++) {
-        float *sc = m->att_sc + (int64_t)omp_get_thread_num()*m->max_t;
+        float *sc = m->base.att_sc + (int64_t)omp_get_thread_num()*m->base.max_t;
         int kvh = hh / G, qpos = pos_base + s;
         const float *qv = q + s*qw + (int64_t)hh*hd;
-        int64_t kvbase = (int64_t)kvh * m->max_t;
-        if (kv8) att_scores_i8(sc, qv, m->K8[li], m->Ks[li], kvbase, 0, qpos, hd, scale);
-        else     att_scores_f32(sc, qv, m->K[li], kvbase, 0, qpos, hd, scale);
+        int64_t kvbase = (int64_t)kvh * m->base.max_t;
+        if (kv8) att_scores_i8(sc, qv, m->base.K8[li], m->base.Ks[li], kvbase, 0, qpos, hd, scale);
+        else     att_scores_f32(sc, qv, m->base.K[li], kvbase, 0, qpos, hd, scale);
         softmax_row(sc, qpos+1);
         float *cx = ctx + s*qw + (int64_t)hh*hd;
-        if (kv8) att_accum_i8(cx, sc, m->V8[li], m->Vs[li], kvbase, 0, qpos, hd);
-        else     att_accum_f32(cx, sc, m->V[li], kvbase, 0, qpos, hd);
+        if (kv8) att_accum_i8(cx, sc, m->base.V8[li], m->base.Vs[li], kvbase, 0, qpos, hd);
+        else     att_accum_f32(cx, sc, m->base.V[li], kvbase, 0, qpos, hd);
     }
 #ifdef ENGINE_GATED_ATTN
     for (int64_t i = 0; i < (int64_t)S*qw; i++) ctx[i] *= 1.f/(1.f + expf(-gate[i]));

@@ -112,7 +112,7 @@ static void bw_lora_mat(const Mat *W, const Lora *lo, Lora *g, const float *x,
 typedef struct {
     float *x_in, *nrm_a;        /* [S,D] residuo in ingresso e post in_ln */
     float *q_pre, *q_rot, *ctx; /* [S,H*hd] pre qk-norm, post rope, contesto */
-    float *k_pre;               /* [S,KV*hd] pre qk-norm (k post-rope in m->K) */
+    float *k_pre;               /* [S,KV*hd] pre qk-norm (k post-rope in m->base.K) */
     float *probs;               /* [H,S,S] pesi attention (0 sopra la diagonale) */
     float *x_mid, *nrm_m;       /* [S,D] residuo dopo attention e post post_ln */
     float *g_pre, *u;           /* [S,inter] gate PRE-attivazione e up */
@@ -166,10 +166,10 @@ static void t_attention(Model *m, Layer *l, int layer, int S, LStash *st, float 
             rope_head(qr, s, c->theta, c->rot);
         }
         for (int hh = 0; hh < KV; hh++) {
-            float *kdst = m->K[layer] + ((int64_t)hh * m->max_t + s) * hd;
+            float *kdst = m->base.K[layer] + ((int64_t)hh * m->base.max_t + s) * hd;
             t_rmsnorm_row(kdst, st->k_pre + s * kw + (int64_t)hh * hd, l->kn, hd, c->eps, &st->rk[s * KV + hh]);
             rope_head(kdst, s, c->theta, c->rot);
-            memcpy(m->V[layer] + ((int64_t)hh * m->max_t + s) * hd, vv + s * kw + (int64_t)hh * hd, hd * sizeof(float));
+            memcpy(m->base.V[layer] + ((int64_t)hh * m->base.max_t + s) * hd, vv + s * kw + (int64_t)hh * hd, hd * sizeof(float));
         }
     }
     float scale = 1.f / sqrtf((float)hd);
@@ -180,12 +180,12 @@ static void t_attention(Model *m, Layer *l, int layer, int S, LStash *st, float 
             float *pr = st->probs + ((int64_t)hh * S + s) * S;
             const float *qv = st->q_rot + s * qw + (int64_t)hh * hd;
             for (int t = 0; t <= s; t++)
-                pr[t] = dot_f32(qv, m->K[layer] + ((int64_t)kvh * m->max_t + t) * hd, hd) * scale;
+                pr[t] = dot_f32(qv, m->base.K[layer] + ((int64_t)kvh * m->base.max_t + t) * hd, hd) * scale;
             softmax_row(pr, s + 1);
             float *cx = st->ctx + s * qw + (int64_t)hh * hd;
             for (int dd = 0; dd < hd; dd++) cx[dd] = 0;
             for (int t = 0; t <= s; t++) {
-                const float *vr = m->V[layer] + ((int64_t)kvh * m->max_t + t) * hd;
+                const float *vr = m->base.V[layer] + ((int64_t)kvh * m->base.max_t + t) * hd;
                 float a = pr[t];
                 for (int dd = 0; dd < hd; dd++) cx[dd] += a * vr[dd];
             }
@@ -230,10 +230,10 @@ static void t_layer_forward(Model *m, Layer *l, int layer, float *x, int S, LSta
  * step()), layer >= L0 con stash. x_out [S,D] = residuo finale (pre-norma). */
 static void train_forward(Model *m, const int *ids, int S, LStash *st, int L0, float *x_out) {
     Cfg *c = &m->c; int D = c->hidden;
-    m->kv_len = 0;
+    m->base.kv_len = 0;
     float *x = x_out;
     for (int s = 0; s < S; s++)
-        memcpy(x + (int64_t)s * D, m->embed + (int64_t)ids[s] * D, D * sizeof(float));
+        memcpy(x + (int64_t)s * D, m->base.embed + (int64_t)ids[s] * D, D * sizeof(float));
     float *nrm = falloc((int64_t)S * D), *tmp = falloc((int64_t)S * D);
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
@@ -248,7 +248,7 @@ static void train_forward(Model *m, const int *ids, int S, LStash *st, int L0, f
             t_layer_forward(m, l, i, x, S, &st[i - L0]);
         }
     }
-    m->kv_len = S;
+    m->base.kv_len = S;
     free(nrm); free(tmp);
 }
 
@@ -293,14 +293,14 @@ static void t_layer_backward(Model *m, Layer *l, int layer, int S, LStash *st, L
             const float *pr = st->probs + ((int64_t)hh * S + s) * S;
             double psum = 0;
             for (int t = 0; t <= s; t++) {
-                dp[t] = dot_f32(dcx, m->V[layer] + ((int64_t)kvh * m->max_t + t) * hd, hd);
+                dp[t] = dot_f32(dcx, m->base.V[layer] + ((int64_t)kvh * m->base.max_t + t) * hd, hd);
                 psum += (double)pr[t] * dp[t];
             }
             float *dq = dqrot + s * qw + (int64_t)hh * hd;
             const float *qv = st->q_rot + s * qw + (int64_t)hh * hd;
             for (int t = 0; t <= s; t++) {
                 float dsv = pr[t] * (dp[t] - (float)psum);    /* softmax backward */
-                const float *kr = m->K[layer] + ((int64_t)kvh * m->max_t + t) * hd;
+                const float *kr = m->base.K[layer] + ((int64_t)kvh * m->base.max_t + t) * hd;
                 float *dk = dkrot + t * kw + (int64_t)kvh * hd;
                 float *dvt = dv + t * kw + (int64_t)kvh * hd;
                 for (int dd = 0; dd < hd; dd++) {
@@ -354,7 +354,7 @@ static double train_loss_and_backward(Model *m, const int *ids, int S, int L0,
     train_forward(m, ids, S, st, L0, x);
     float *fx = falloc((int64_t)S * D), *rf = falloc(S);
     for (int s = 0; s < S; s++)
-        t_rmsnorm_row(fx + (int64_t)s * D, x + (int64_t)s * D, m->final_norm, D, c->eps, &rf[s]);
+        t_rmsnorm_row(fx + (int64_t)s * D, x + (int64_t)s * D, m->base.final_norm, D, c->eps, &rf[s]);
     int Ntok = S - 1;
     int CH = t_ce_chunk < 1 ? 32 : t_ce_chunk;
     float *lg = falloc((int64_t)CH * V);
@@ -363,8 +363,8 @@ static double train_loss_and_backward(Model *m, const int *ids, int S, int L0,
     double loss = 0;
     for (int s0 = 0; s0 < Ntok; s0 += CH) {
         int n = Ntok - s0 < CH ? Ntok - s0 : CH;
-        mat_apply(lg, fx + (int64_t)s0 * D, &m->lm_head, n);
-        lora_apply(&m->lm_lora, lg, fx + (int64_t)s0 * D, n, m->lm_head.I, m->lm_head.O);
+        mat_apply(lg, fx + (int64_t)s0 * D, &m->base.lm_head, n);
+        lora_apply(&m->lm_lora, lg, fx + (int64_t)s0 * D, n, m->base.lm_head.I, m->base.lm_head.O);
         for (int p = 0; p < n; p++) {
             float *row = lg + (int64_t)p * V;
             int y = ids[s0 + p + 1];
@@ -378,7 +378,7 @@ static double train_loss_and_backward(Model *m, const int *ids, int S, int L0,
             }
         }
         if (dlg)
-            bw_lora_mat(&m->lm_head, m->lm_lora.r ? &m->lm_lora : NULL, gHead,
+            bw_lora_mat(&m->base.lm_head, m->lm_lora.r ? &m->lm_lora : NULL, gHead,
                         fx + (int64_t)s0 * D, dlg, dfx + (int64_t)s0 * D, n);
     }
     loss /= Ntok;
@@ -388,7 +388,7 @@ static double train_loss_and_backward(Model *m, const int *ids, int S, int L0,
     /* norma finale (la posizione S-1 non contribuisce: dfx li' resta 0) */
     float *dxr = fzalloc((int64_t)S * D);
     for (int s = 0; s < S; s++)
-        bw_rmsnorm(dxr + (int64_t)s * D, dfx + (int64_t)s * D, x + (int64_t)s * D, m->final_norm, rf[s], D);
+        bw_rmsnorm(dxr + (int64_t)s * D, dfx + (int64_t)s * D, x + (int64_t)s * D, m->base.final_norm, rf[s], D);
     free(dfx);
     for (int i = c->n_layers - 1; i >= L0; i--)
         t_layer_backward(m, &m->L[i], i, S, &st[i - L0], gL ? &gL[i - L0] : NULL, dxr);
@@ -400,10 +400,10 @@ static double train_loss_and_backward(Model *m, const int *ids, int S, int L0,
 
 /* la v1 del trainer copre solo il percorso su cui il backward e' scritto */
 static void train_guard(Model *m, int L0) {
-    if (m->qbits != 0) { fprintf(stderr, "[train] richiede pesi f32 (QBITS=0)\n"); exit(1); }
+    if (m->base.qbits != 0) { fprintf(stderr, "[train] richiede pesi f32 (QBITS=0)\n"); exit(1); }
     if (m->c.hybrid)   { fprintf(stderr, "[train] training v1: solo modelli Qwen3 densi (niente layer deltanet)\n"); exit(1); }
-    if (m->n_resident != m->c.n_layers) { fprintf(stderr, "[train] richiede tutti i layer residenti (niente MEM_GB/MEM_FRAC/MICRO)\n"); exit(1); }
-    if (g_kv_bits) { fprintf(stderr, "[train] richiede KV f32 (niente KV_BITS: lo stash legge m->K/V)\n"); exit(1); }
+    if (m->base.n_resident != m->c.n_layers) { fprintf(stderr, "[train] richiede tutti i layer residenti (niente MEM_GB/MEM_FRAC/MICRO)\n"); exit(1); }
+    if (g_kv_bits) { fprintf(stderr, "[train] richiede KV f32 (niente KV_BITS: lo stash legge m->base.K/V)\n"); exit(1); }
     for (int i = L0; i < m->c.n_layers; i++)
         if (m->L[i].gated) { fprintf(stderr, "[train] layer %d gated: non supportato nel range addestrato\n", i); exit(1); }
 }
@@ -607,7 +607,7 @@ static int train_main(int argc, char **argv) {
         int wi = 0;
         for (int off = 0; off + 8 <= nids; off += stride) {   /* finestre <8 token saltate */
             int S = nids - off < ctx ? nids - off : ctx;
-            m.kv_len = 0;
+            m.base.kv_len = 0;
             double t0 = now_s();
             t_grads_zero();
             double loss = train_loss_and_backward(&m, ids + off, S, L0, st, gL, head ? &gHead : NULL);

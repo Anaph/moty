@@ -88,7 +88,7 @@ static int gen_turn(Model *m, Tok *T, int *hist, int len, int k, int n_new, int 
     int base = len + k, ng = 0; *stopped = 0;
     t0 = now_s();
     for (int s = 0; s < n_new; s++) {
-        int t = pick_tok(&m->scr, logit, m->c.vocab);
+        int t = pick_tok(&m->base.scr, logit, m->c.vocab);
         free(logit); logit = NULL;
         hist[base + ng++] = t;
         ENGINE_OBSERVE(m, t);

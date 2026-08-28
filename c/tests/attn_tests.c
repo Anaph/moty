@@ -29,8 +29,7 @@
 
 typedef struct { int hidden, n_heads, n_kv_heads, head_dim, max_t; float eps, theta; int rot; } Cfg;
 typedef struct { Mat q, k, v, o; float *qn, *kn; } Layer;
-typedef struct { Cfg c; float **K, **V; int8_t **K8, **V8; float **Ks, **Vs;
-                 float *att_sc; int kv_len, max_t; Scratch scr; } Model;
+typedef struct { MotyCommon base; Cfg c; } Model;   /* M2: contratto MotyCommon */
 
 #include "../nn/nn_attn.h"
 
@@ -77,32 +76,32 @@ static void at_ctx_init(AtCtx *ctx, int kv8, int grouped) {
     ctx->l.qn = malloc(AT_HD*sizeof(float)); ctx->l.kn = malloc(AT_HD*sizeof(float));
     for (int i = 0; i < AT_HD; i++) { ctx->l.qn[i] = 1.f + 0.1f*at_frnd(); ctx->l.kn[i] = 1.f + 0.1f*at_frnd(); }
     int max_t = ctx->m.c.max_t;
-    ctx->m.max_t = max_t;
-    ctx->m.K = calloc(1, sizeof(float*)); ctx->m.V = calloc(1, sizeof(float*));
-    ctx->m.K[0] = calloc((size_t)AT_KV*max_t*AT_HD, sizeof(float));
-    ctx->m.V[0] = calloc((size_t)AT_KV*max_t*AT_HD, sizeof(float));
-    ctx->m.K8 = calloc(1, sizeof(int8_t*)); ctx->m.V8 = calloc(1, sizeof(int8_t*));
-    ctx->m.Ks = calloc(1, sizeof(float*)); ctx->m.Vs = calloc(1, sizeof(float*));
+    ctx->m.base.max_t = max_t;
+    ctx->m.base.K = calloc(1, sizeof(float*)); ctx->m.base.V = calloc(1, sizeof(float*));
+    ctx->m.base.K[0] = calloc((size_t)AT_KV*max_t*AT_HD, sizeof(float));
+    ctx->m.base.V[0] = calloc((size_t)AT_KV*max_t*AT_HD, sizeof(float));
+    ctx->m.base.K8 = calloc(1, sizeof(int8_t*)); ctx->m.base.V8 = calloc(1, sizeof(int8_t*));
+    ctx->m.base.Ks = calloc(1, sizeof(float*)); ctx->m.base.Vs = calloc(1, sizeof(float*));
     if (kv8) {
-        ctx->m.K8[0] = calloc((size_t)AT_KV*max_t*AT_HD, 1);
-        ctx->m.V8[0] = calloc((size_t)AT_KV*max_t*AT_HD, 1);
-        ctx->m.Ks[0] = calloc((size_t)AT_KV*max_t, sizeof(float));
-        ctx->m.Vs[0] = calloc((size_t)AT_KV*max_t, sizeof(float));
+        ctx->m.base.K8[0] = calloc((size_t)AT_KV*max_t*AT_HD, 1);
+        ctx->m.base.V8[0] = calloc((size_t)AT_KV*max_t*AT_HD, 1);
+        ctx->m.base.Ks[0] = calloc((size_t)AT_KV*max_t, sizeof(float));
+        ctx->m.base.Vs[0] = calloc((size_t)AT_KV*max_t, sizeof(float));
     } else {
-        ctx->m.K8[0] = NULL; ctx->m.V8[0] = NULL;
+        ctx->m.base.K8[0] = NULL; ctx->m.base.V8[0] = NULL;
     }
     int nth = omp_get_max_threads();
-    ctx->m.att_sc = calloc((size_t)nth*max_t, sizeof(float));
+    ctx->m.base.att_sc = calloc((size_t)nth*max_t, sizeof(float));
 }
 
 static void at_ctx_free(AtCtx *ctx) {
     Mat *ms[4] = { &ctx->l.q, &ctx->l.k, &ctx->l.v, &ctx->l.o };
     for (int i = 0; i < 4; i++) { free((void*)ms[i]->f); free(ms[i]->q4); free(ms[i]->qs); }
     free(ctx->l.qn); free(ctx->l.kn);
-    free(ctx->m.K[0]); free(ctx->m.V[0]); free(ctx->m.K); free(ctx->m.V);
-    free(ctx->m.K8[0]); free(ctx->m.V8[0]); free(ctx->m.K8); free(ctx->m.V8);
-    free(ctx->m.Ks[0]); free(ctx->m.Vs[0]); free(ctx->m.Ks); free(ctx->m.Vs);
-    free(ctx->m.att_sc); scr_free(&ctx->m.scr);
+    free(ctx->m.base.K[0]); free(ctx->m.base.V[0]); free(ctx->m.base.K); free(ctx->m.base.V);
+    free(ctx->m.base.K8[0]); free(ctx->m.base.V8[0]); free(ctx->m.base.K8); free(ctx->m.base.V8);
+    free(ctx->m.base.Ks[0]); free(ctx->m.base.Vs[0]); free(ctx->m.base.Ks); free(ctx->m.base.Vs);
+    free(ctx->m.base.att_sc); scr_free(&ctx->m.base.scr);
 }
 
 static void at_mk_input(float *x, int S) {
@@ -174,10 +173,10 @@ static int at_causality_impl(int kv8, int grouped) {
     /* lo stato kv deve coincidere nei due cammini */
     if (!bad && !kv8) {
         for (int i = 0; i < AT_KV*AT_T*AT_HD; i++)
-            if (A.m.K[0][i] != B.m.K[0][i] || A.m.V[0][i] != B.m.V[0][i]) { fprintf(stderr, "kv mismatch @%d\n", i); bad = 1; break; }
+            if (A.m.base.K[0][i] != B.m.base.K[0][i] || A.m.base.V[0][i] != B.m.base.V[0][i]) { fprintf(stderr, "kv mismatch @%d\n", i); bad = 1; break; }
     } else if (!bad) {
         for (int i = 0; i < AT_KV*AT_T*AT_HD; i++)
-            if (A.m.K8[0][i] != B.m.K8[0][i] || A.m.V8[0][i] != B.m.V8[0][i]) { fprintf(stderr, "kv8 mismatch @%d\n", i); bad = 1; break; }
+            if (A.m.base.K8[0][i] != B.m.base.K8[0][i] || A.m.base.V8[0][i] != B.m.base.V8[0][i]) { fprintf(stderr, "kv8 mismatch @%d\n", i); bad = 1; break; }
     }
     at_ctx_free(&A); at_ctx_free(&B);
     return bad;

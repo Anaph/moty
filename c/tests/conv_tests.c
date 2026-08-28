@@ -24,7 +24,7 @@ typedef struct { int hidden, n_heads, n_kv_heads, head_dim, n_layers, inter, voc
                  max_pos, n_eos, eos[4], tie_emb; float eps, theta; int rot,
                  n_experts, topk, moe_inter, n_dense_layers, conv_L; int *ltype; } Cfg;
 typedef struct { Mat in_proj, out_proj; float *conv_w; float *conv_state; } Layer;
-typedef struct { Cfg c; Scratch scr; } Model;   /* P5: arena nel Model del test */
+typedef struct { MotyCommon base; Cfg c; } Model;   /* M2: contratto MotyCommon nel Model del test */
 
 #include "../nn/nn_conv.h"
 

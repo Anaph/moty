@@ -38,13 +38,13 @@ static void moe_decode1(Model *m, Layer *l, int li, const float *x, float *out) 
 #ifdef MOE_SHARED_EXPERT
     Sh_ = c->sh_inter;
 #endif
-    scr_reset(&m->scr);
-    scr_reserve(&m->scr, scr_al((int64_t)E*4) + 2*scr_al((int64_t)K*I*4) + scr_al((int64_t)K*D*4)
+    scr_reset(&m->base.scr);
+    scr_reserve(&m->base.scr, scr_al((int64_t)E*4) + 2*scr_al((int64_t)K*I*4) + scr_al((int64_t)K*D*4)
                       + 2*scr_al(D) + 2*scr_al((int64_t)K*I) + 2*scr_al((int64_t)Sh_*4));
-    float *lb = scr_take(&m->scr, (int64_t)E*4);
-    float *gb = scr_take(&m->scr, (int64_t)K*I*4), *ub = scr_take(&m->scr, (int64_t)K*I*4);
-    float *hb = scr_take(&m->scr, (int64_t)K*D*4);
-    int8_t *xi = scr_take(&m->scr, scr_al(D)), *gi = NULL;
+    float *lb = scr_take(&m->base.scr, (int64_t)E*4);
+    float *gb = scr_take(&m->base.scr, (int64_t)K*I*4), *ub = scr_take(&m->base.scr, (int64_t)K*I*4);
+    float *hb = scr_take(&m->base.scr, (int64_t)K*D*4);
+    int8_t *xi = scr_take(&m->base.scr, scr_al(D)), *gi = NULL;
 #ifdef MOTY_PROF
     static double _sA=0,_sB=0,_sC=0; double _a = now_s();
 #endif
@@ -76,8 +76,8 @@ static void moe_decode1(Model *m, Layer *l, int li, const float *x, float *out) 
 #ifdef MOE_SHARED_EXPERT
     {   /* shared expert gated: fuori dalle regioni (pesi ~2MB, mat_apply) */
         int Sh = c->sh_inter;
-        float *sgb = scr_take(&m->scr, scr_al((int64_t)Sh*4));
-        float *sub = scr_take(&m->scr, scr_al((int64_t)Sh*4));
+        float *sgb = scr_take(&m->base.scr, scr_al((int64_t)Sh*4));
+        float *sub = scr_take(&m->base.scr, scr_al((int64_t)Sh*4));
         mat_apply(sgb, x, &l->sh_gate, 1); mat_apply(sub, x, &l->sh_up, 1);
         for (int i = 0; i < Sh; i++) { float gv=sgb[i]; sgb[i] = (gv/(1.f+expf(-gv)))*sub[i]; }
         mat_apply(out, sgb, &l->sh_down, 1);
@@ -95,8 +95,8 @@ static void moe_decode1(Model *m, Layer *l, int li, const float *x, float *out) 
 #endif
     /* x -> int8 una volta, condiviso da gate/up di tutti gli expert;
      * px: versione permuted per dot_i4i8p (niente permutex nel loop) */
-    int8_t *xip = scr_take(&m->scr, scr_al(D));
-    int8_t *gip = scr_take(&m->scr, scr_al((int64_t)K*I));
+    int8_t *xip = scr_take(&m->base.scr, scr_al(D));
+    int8_t *gip = scr_take(&m->base.scr, scr_al((int64_t)K*I));
 #ifdef MOTY_PROF
     _sC += now_s()-_a;
 #endif
@@ -127,7 +127,7 @@ static void moe_decode1(Model *m, Layer *l, int li, const float *x, float *out) 
     _r1 += now_s()-_t0; _t0 = now_s();
 #endif
     /* silu-mul seriale + quant g per expert */
-    gi = scr_take(&m->scr, scr_al((int64_t)K*I));
+    gi = scr_take(&m->base.scr, scr_al((int64_t)K*I));
     static float sgb[64]; static int32_t sgb_sum[64];
     /* silu+quant per expert: PARALLELI (era ~250us seriali/call = 5.5ms/tok) */
     #pragma omp parallel for schedule(static)

@@ -232,7 +232,7 @@ static int drive_capture(Model *m, float *out, int steps, int V) {
 static int gm_run8(const char *dir, int qbits, int *out, int expect_shared, int expect_keqv) {
     Model m;
     model_init(&m, dir, qbits);
-    CHECK(m.lm_tied);
+    CHECK(m.base.lm_tied);
     CHECK(m.c.ltype[2] == LT_FULL && m.c.ltype[0] == LT_SLIDING && m.c.ltype[3] == LT_SLIDING);
     CHECK(m.c.rot_angles == 1);                    /* int(0.25*8)/2 */
     if (expect_shared) {
@@ -267,10 +267,10 @@ static int gm_kv8_drive(const char *dir, int shared, int keqv, int kvbits, float
     Model m; model_init(&m, dir, 0);
     kv_alloc(&m, 16);
     if (kvbits == 8) {
-        CHECK(m.K8[0] != NULL && m.Ks[0] != NULL && m.K[0] == NULL);
+        CHECK(m.base.K8[0] != NULL && m.base.Ks[0] != NULL && m.base.K[0] == NULL);
         if (shared) {                              /* alias: dati E scale */
-            CHECK(m.K8[3] == m.K8[m.c.kv_src[3]] && m.Ks[3] == m.Ks[m.c.kv_src[3]]);
-            CHECK(m.V8[3] == m.V8[m.c.kv_src[3]] && m.Vs[3] == m.Vs[m.c.kv_src[3]]);
+            CHECK(m.base.K8[3] == m.base.K8[m.c.kv_src[3]] && m.base.Ks[3] == m.base.Ks[m.c.kv_src[3]]);
+            CHECK(m.base.V8[3] == m.base.V8[m.c.kv_src[3]] && m.base.Vs[3] == m.base.Vs[m.c.kv_src[3]]);
         }
     }
     int rc = drive_capture(&m, out, steps, V);
@@ -341,7 +341,7 @@ int gm_tiny_keqv(void) {
 static int gm_run8_budget(const char *dir, int64_t budget, int *out, int *resident_out) {
     Model m;
     model_init_ex(&m, dir, 0, budget, 16);
-    if (resident_out) *resident_out = m.n_resident;
+    if (resident_out) *resident_out = m.base.n_resident;
     kv_alloc(&m, 16);
     return drive_greedy8(&m, out);
 }
