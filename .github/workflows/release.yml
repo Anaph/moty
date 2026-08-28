@@ -1,0 +1,116 @@
+# CD: release builds. On tag v* — builds the portable binaries for every
+# supported desktop/cross target, packages them with docs, publishes a
+# GitHub Release.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Matrix:
+#   linux-amd64   x86-64-v3 (AVX2+FMA baseline, runs on any modern x86-64)
+#   linux-arm64   armv8-a   (NEON baseline)
+#   linux-armv7   armv7-a   (dense trio; glm excluded — AArch64-only)
+#   windows-amd64 x86-64-v3 MinGW-w64 static (LTO off: mingw+static lto flaky)
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            cc: gcc
+            arch: x86-64-v3
+            ext: tar.gz
+            lto: '1'
+          - name: linux-arm64
+            cc: aarch64-linux-gnu-gcc
+            apt: gcc-aarch64-linux-gnu
+            arch: armv8-a
+            ext: tar.gz
+            lto: '1'
+          - name: linux-armv7
+            cc: arm-linux-gnueabihf-gcc
+            apt: gcc-arm-linux-gnueabihf
+            arch: armv7-a
+            ext: tar.gz
+            lto: '0'
+          - name: windows-amd64
+            cc: x86_64-w64-mingw32-gcc
+            apt: gcc-mingw-w64-x86-64
+            arch: x86-64-v3
+            ext: zip
+            lto: '0'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross toolchain
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ${{ matrix.apt }}
+
+      - name: Build (portable tier ${{ matrix.arch }})
+        run: |
+          cd c
+          make clean
+          make all CC=${{ matrix.cc }} ARCH=${{ matrix.arch }} MOTY_LTO=${{ matrix.lto }}
+
+      - name: Sanity-check the binaries (native target only)
+        if: matrix.cc == 'gcc'
+        run: |
+          ./c/moty 2>&1 | grep -q "Supported architectures"
+          ./c/moty 2>&1 | grep -q "glm_moe_dsa"
+
+      - name: Package
+        run: |
+          name="moty-${GITHUB_REF_NAME}-${{ matrix.name }}"
+          mkdir -p pkg/${name}
+          # copia binario-per-binario: su armv7 moty non c'e' (linka glm,
+          # escluso per contratto dal Makefile ALL_ENGS di quel triplet)
+          for b in moty lfm2 qwenmoe qwen gemma olmoe; do
+            cp c/$b pkg/${name}/ 2>/dev/null || true
+            cp c/$b.exe pkg/${name}/ 2>/dev/null || true
+          done
+          test "$(ls pkg/${name}/*.exe pkg/${name}/moty pkg/${name}/lfm2 2>/dev/null | wc -l)" -ge 2
+          cp LICENSE README.md pkg/${name}/
+          if [ "${{ matrix.ext }}" = tar.gz ]; then
+            tar -C pkg -czf ${name}.tar.gz ${name}
+          else
+            cd pkg && zip -r ../${name}.zip ${name}
+          fi
+          sha256sum ${name}.* > ${name}.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: moty-*
+
+  publish:
+    name: Publish GitHub Release
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List
+        run: ls -la dist/
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*

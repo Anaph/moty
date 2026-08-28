@@ -11,6 +11,18 @@
 #define NN_MATMUL_H
 
 /* M1: hw.h non diffonde piu' le intrinsics — chi le usa se le include */
+#if defined(__ARM_NEON) || defined(__ARM_FEATURE_SVE)
+  #include <arm_neon.h>
+  /* hsum locale (prima arrivava da hw_neon.h, che i motori non includono piu') */
+  static inline float neon_hsum_f32(float32x4_t v) {
+  #ifdef __aarch64__
+      return vaddvq_f32(v);
+  #else
+      float32x2_t r = vadd_f32(vget_low_f32(v), vget_high_f32(v));
+      return vget_lane_f32(vpadd_f32(r, r), 0);
+  #endif
+  }
+#endif
 #if defined(__AVX2__)
   #include <immintrin.h>
   static inline float simd_hsum256_f32(__m256 v) {

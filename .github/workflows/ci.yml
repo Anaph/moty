@@ -43,7 +43,7 @@ jobs:
           runner=../../.github/simd_runner.c
           for spec in "armv8-a:neon" "armv8.2-a+dotprod:dotprod" "armv8-a+sve:sve1" "armv9-a:sve2"; do
             march=${spec%%:*}; tier=${spec#*:}
-            aarch64-linux-gnu-gcc -O2 -march=$march -static -I. simd_tests.c $runner -o /tmp/sm_$tier -lm
+            aarch64-linux-gnu-gcc -O2 -march=$march -static -I. -I.. simd_tests.c ../hw/hw.c $runner -o /tmp/sm_$tier -lm
             echo ":: $tier ($(qemu-aarch64 -cpu max /tmp/sm_$tier 2>&1 | grep -o 'idot=[^ ]* f32=[^ ]*' | head -1))"
             qemu-aarch64 -cpu max /tmp/sm_$tier 2>&1 | tail -1 | grep -q "ALL PASS" || { echo "FAIL $tier"; exit 1; }
           done
@@ -53,11 +53,65 @@ jobs:
         run: |
           cd c/tests
           runner=../../.github/simd_runner.c
-          arm-linux-gnueabihf-gcc -O2 -march=armv7-a -mfpu=neon-vfpv4 -static -I. simd_tests.c $runner -o /tmp/sm_armv7 -lm
+          arm-linux-gnueabihf-gcc -O2 -march=armv7-a -mfpu=neon-vfpv4 -static -I. -I.. simd_tests.c ../hw/hw.c $runner -o /tmp/sm_armv7 -lm
           for cpu in cortex-a7 cortex-a15; do
             echo ":: armv7 $cpu"
             qemu-arm -cpu $cpu /tmp/sm_armv7 2>&1 | tail -1 | grep -q "ALL PASS" || { echo "FAIL armv7 $cpu"; exit 1; }
           done
       - name: armv7 engine cross-compile (dense trio; glm excluded, AArch64-only)
-        run: cd c && make clean && make all CC=arm-linux-gnueabihf-gcc
+        run: cd c && make clean && make all CC=arm-linux-gnueabihf-gcc MOTY_LTO=0
 
+
+  # M6: the CMake build of record — same sources, same libraries.
+  cmake:
+    name: CMake (portable + native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure + build (portable tier)
+        run: |
+          cmake -B c/build -S c
+          cmake --build c/build -j
+      - name: Test (portable tier)
+        run: ctest --test-dir c/build --output-on-failure
+      - name: Configure + build + test (native tier)
+        run: |
+          rm -rf c/build
+          cmake -B c/build -S c -DMOTY_ARCH=native
+          cmake --build c/build -j
+          ctest --test-dir c/build --output-on-failure
+
+  # M5: the plugin path must keep compiling (opt-in).
+  plugins:
+    name: Plugin build (moty -DMOTY_PLUGINS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build plugin-enabled moty + sample plugin
+        run: |
+          cd c
+          make all >/dev/null
+          make plugins/sample.so
+          gcc -I. -O2 -march=native -fopenmp -pthread -Wall -DMOTY_PLUGINS moty.c \
+            lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o \
+            libmoty-runtime.a libmoty-nn.a libmoty-hw.a \
+            -o /tmp/moty-plugins -lm -fopenmp -pthread -ldl
+      - name: Smoke: plugin dispatch end-to-end
+        run: |
+          python3 - <<'PY'
+          import struct
+          buf = b'GGUF' + struct.pack('<I',3) + struct.pack('<Q',0) + struct.pack('<Q',1)
+          kv = b'general.architecture'
+          buf += struct.pack('<Q', len(kv)) + kv + struct.pack('<I',8) + struct.pack('<Q',6) + b'sample'
+          open('/tmp/sample.gguf','wb').write(buf)
+          PY
+          MOTY_PLUGIN=c/plugins/sample.so GGUF=/tmp/sample.gguf /tmp/moty-plugins | grep -q "sample plugin"
+
+  # Dockerfile must keep building (the slim runtime image).
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build test image (runs the gtest suite inside the build)
+        run: docker build --target test -t moty-ci-test .

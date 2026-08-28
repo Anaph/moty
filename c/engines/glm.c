@@ -307,6 +307,9 @@ static float *falloc(int64_t n){
 #if defined(__AVX2__) || defined(__AVX512F__)
 #include <immintrin.h>                 /* proprie intrinsics (M1: hw.h non le diffonde piu') */
 #endif
+#if defined(__ARM_NEON)
+#include <arm_neon.h>                  /* idem, lato ARM */
+#endif
 #if defined(__AVX2__) && !(defined(__AVX512F__) && defined(__AVX512BW__))
 /* tier AVX2 puro: hsum locale (nel tier AVX512 e' nel blocco sotto) */
 static inline float simd_hsum256_f32(__m256 v){
