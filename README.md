@@ -20,7 +20,18 @@ make            # builds all engines (from repo root or c/)
 make glm        # just one engine
 make portable   # portable CPU baseline (x86-64-v3 / armv8-a / power8)
 make test       # test suite (GoogleTest via a separate CMake build path)
+
+# CMake build of record (same sources, same libraries):
+cmake -B c/build -S c && cmake --build c/build -j       # portable tier
+cmake -B c/build -S c -DMOTY_ARCH=native && cmake --build c/build -j
+ctest --test-dir c/build                                # the full suite
 ```
+
+Both builds produce the same layered libraries
+(`libmoty-hw` → `libmoty-nn` → `libmoty-runtime`) and the engine
+binaries; the Makefile additionally covers the exotic cross targets
+(ARMv7, PPC64, portable-v4/sve2) and docker, CMake covers the desktop
+paths and is what CI-grade tooling should consume.
 
 Requirements: a C compiler (gcc/clang) and GNU make. Linux, macOS, Windows
 (MinGW/MSYS2), *BSD and PowerPC are supported. OpenMP is used when available.
