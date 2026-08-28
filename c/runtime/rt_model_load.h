@@ -199,7 +199,7 @@ static void mat_stream_init(Model *m, Mat *w, const char *name, int O, int I) {
 static void model_init_micro(Model *m) {
 #if ENGINE_MICRO
     Cfg *c = &m->c;
-    g_mat_stream_fn = mat_stream;
+    moty_nn_set_stream_fn(mat_stream);   /* M3: setter invece del simbolo */
     mat_stream_init(m, &m->base.lm_head,
                     m->base.lm_tied ? "model.embed_tokens.weight" : "lm_head.weight",
                     c->vocab, c->hidden);

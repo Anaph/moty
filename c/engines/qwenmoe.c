@@ -101,9 +101,7 @@ typedef struct {
 /* Shared DeltaNet kernel (after Model/Layer defined). ENGINE_PRECOOKED_A:
  * qwen35moe GGUF stores -exp(A_log) directly, unlike raw A_log in qwen.c. */
 #define ENGINE_PRECOOKED_A
-#define ENGINE_GATED_ATTN
-#define ATTN_NORM in_ln
-#include "nn/nn_attn.h"
+#include "nn/attn.h"
 #include "nn/nn_deltanet.h"
 
 /* (gli hook load_cfg/load_small/... sono dichiarati forward da runtime.h subito sotto,
@@ -270,9 +268,30 @@ static void qwenmoe_load_expert(void *ctx, int layer, int eid, ExpertSlot *s, in
     free(tmp);
 }
 
-#define MOE_LOAD_EXPERT qwenmoe_load_expert
-#define MOE_SHARED_EXPERT
-#include "nn/nn_moe_sigmoid.h"
+#include "nn/moe.h"
+
+static void att_run(Model *m, Layer *l, int li, const float *x, int S, int pos_base, float *out) {
+    Cfg *c = &m->c;
+    MotyAttnView a = { .q=&l->q, .k=&l->k, .v=&l->v, .o=&l->o, .qn=l->qn, .kn=l->kn,
+        .n_heads=c->n_heads, .n_kv_heads=c->n_kv_heads, .head_dim=c->head_dim,
+        .theta=c->theta, .eps=c->eps, .rot=c->rot,
+        .K=m->base.K, .V=m->base.V, .K8=m->base.K8, .V8=m->base.V8,
+        .Ks=m->base.Ks, .Vs=m->base.Vs,
+        .att_sc=m->base.att_sc, .max_t=m->base.max_t, .scr=&m->base.scr, .li=li };
+    moty_nn_attention_gated(&a, x, S, pos_base, out);
+}
+static void moe_run(Model *m, Layer *l, int li, const float *x, int S, float *out) {
+    Cfg *c = &m->c;
+    MotyMoeView v = { .router=&l->router, .expert_bias=NULL, .ec=l->ec,
+        .load_expert=qwenmoe_load_expert, .ectx=m,
+        .E=c->n_experts, .K=c->topk, .I=c->moe_inter, .D=c->hidden,
+        .li=li, .ebits=g_ebits,
+        .has_shared=1, .sh_gate=&l->sh_gate, .sh_up=&l->sh_up,
+        .sh_down=&l->sh_down, .sh_router_gate=&l->sh_router_gate,
+        .sh_inter=c->sh_inter, .scr=&m->base.scr };
+    if (S == 1) moty_nn_moe_topk_d1(&v, x, out);
+    else        moty_nn_moe_topk_batch(&v, x, S, out);
+}
 
 /* ---------- MoE: router(top-K) + shared(gated) + Σ expert ---------- */
 /* g_expert_cap e' dichiarato sopra (prima di runtime.h/load_small) */
@@ -532,11 +551,10 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         }
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
         if (l->type == LT_LINEAR) deltanet(m, l, nrm, S, tmp);
-        else attention(m, l, i, nrm, S, pos_base, tmp);
+        else att_run(m, l, i, nrm, S, pos_base, tmp);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
-        if (S == 1) moe_decode1(m, l, i, nrm, tmp);
-        else moe_batch(m, l, i, nrm, S, tmp);
+        moe_run(m, l, i, nrm, S, tmp);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
     }
     m->base.kv_len = pos_base + S;
@@ -563,11 +581,10 @@ static int *step_argmax_all(Model *m, const int *ids, int S, int pos_base) {
         Layer *l = &m->L[i];
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
         if (l->type == LT_LINEAR) deltanet(m, l, nrm, S, tmp);
-        else attention(m, l, i, nrm, S, pos_base, tmp);
+        else att_run(m, l, i, nrm, S, pos_base, tmp);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
-        if (S == 1) moe_decode1(m, l, i, nrm, tmp);
-        else moe_batch(m, l, i, nrm, S, tmp);
+        moe_run(m, l, i, nrm, S, tmp);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
     }
     m->base.kv_len = pos_base + S;

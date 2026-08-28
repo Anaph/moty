@@ -31,7 +31,7 @@ typedef struct { int hidden, n_heads, n_kv_heads, head_dim, max_t; float eps, th
 typedef struct { Mat q, k, v, o; float *qn, *kn; } Layer;
 typedef struct { MotyCommon base; Cfg c; } Model;   /* M2: contratto MotyCommon */
 
-#include "../nn/nn_attn.h"
+#include "../nn/attn.h"
 
 static uint64_t at_lcg = 0x1234ABCD5678EF90ULL;
 static uint32_t at_rnd(void) {
@@ -92,6 +92,17 @@ static void at_ctx_init(AtCtx *ctx, int kv8, int grouped) {
     }
     int nth = omp_get_max_threads();
     ctx->m.base.att_sc = calloc((size_t)nth*max_t, sizeof(float));
+}
+
+
+static MotyAttnView at_view(AtCtx *ctx) {
+    Model *m = &ctx->m; Layer *l = &ctx->l;
+    return (MotyAttnView){ .q=&l->q, .k=&l->k, .v=&l->v, .o=&l->o, .qn=l->qn, .kn=l->kn,
+        .n_heads=AT_H, .n_kv_heads=AT_KV, .head_dim=AT_HD,
+        .theta=ctx->m.c.theta, .eps=ctx->m.c.eps, .rot=AT_ROT,
+        .K=m->base.K, .V=m->base.V, .K8=m->base.K8, .V8=m->base.V8,
+        .Ks=m->base.Ks, .Vs=m->base.Vs,
+        .att_sc=m->base.att_sc, .max_t=m->base.max_t, .scr=&m->base.scr, .li=0 };
 }
 
 static void at_ctx_free(AtCtx *ctx) {
@@ -164,9 +175,12 @@ static int at_causality_impl(int kv8, int grouped) {
     float x[AT_T*AT_D]; at_mk_input(x, AT_T);
     float outb[AT_T*AT_D], outi[AT_T*AT_D], o1[AT_D];
 
-    attention(&A.m, &A.l, 0, x, AT_T, 0, outb);                 /* batch */
-    for (int s = 0; s < AT_T; s++) attention(&B.m, &B.l, 0, x + (int64_t)s*AT_D, 1, s, o1),
+    MotyAttnView va = at_view(&A); moty_nn_attention(&va, x, AT_T, 0, outb);                 /* batch */
+    MotyAttnView vb = at_view(&B);
+    for (int s = 0; s < AT_T; s++) {
+        moty_nn_attention(&vb, x + (int64_t)s*AT_D, 1, s, o1);
         memcpy(outi + (int64_t)s*AT_D, o1, AT_D*sizeof(float)); /* incrementale */
+    }
     int bad = 0;
     for (int i = 0; i < AT_T*AT_D; i++)
         if (outb[i] != outi[i]) { if (!bad) fprintf(stderr, "mismatch @%d: %g vs %g (kv8=%d grouped=%d)\n", i, outb[i], outi[i], kv8, grouped); bad = 1; }
@@ -189,7 +203,7 @@ int at_vs_reference(void) {
     AtCtx A; at_ctx_init(&A, 0, 0);
     float x[AT_T*AT_D]; at_mk_input(x, AT_T);
     float got[AT_T*AT_D], ref[AT_T*AT_D];
-    attention(&A.m, &A.l, 0, x, AT_T, 0, got);
+    MotyAttnView v1 = at_view(&A); moty_nn_attention(&v1, x, AT_T, 0, got);
     at_reference(&A, x, AT_T, ref);
     double num = 0, den = 0;
     for (int i = 0; i < AT_T*AT_D; i++) { double d = got[i]-ref[i]; num += d*d; den += (double)ref[i]*ref[i]; }
@@ -205,8 +219,8 @@ int at_fused_vs_f32(void) {
     AtCtx B; at_ctx_init(&B, 0, 1);   /* tutto I4G: q/k/v fusi + o_proj */
     float x[AT_T*AT_D]; at_mk_input(x, AT_T);
     float got_f32[AT_T*AT_D], got_i4g[AT_T*AT_D];
-    attention(&A.m, &A.l, 0, x, AT_T, 0, got_f32);
-    attention(&B.m, &B.l, 0, x, AT_T, 0, got_i4g);
+    MotyAttnView v2 = at_view(&A); moty_nn_attention(&v2, x, AT_T, 0, got_f32);
+    MotyAttnView v3 = at_view(&B); moty_nn_attention(&v3, x, AT_T, 0, got_i4g);
     double num = 0, den = 0;
     for (int i = 0; i < AT_T*AT_D; i++) { double d = got_f32[i]-got_i4g[i]; num += d*d; den += (double)got_f32[i]*got_f32[i]; }
     double rel = sqrt(num/(den + 1e-30));

@@ -157,14 +157,43 @@ static void ldm_layer_load_expert(void *ctx, int layer, int eid, ExpertSlot *s, 
     free(tmp);
 }
 
-/* ---------- shared layer compute ---------- */
-#define ATTN_NORM attn_norm
-#include "nn/nn_attn.h"       /* attention() */
-#include "nn/nn_conv.h"        /* conv_token(), conv_layer() */
-#include "nn/nn_ffn.h"         /* dense_ffn() */
-#define MOE_LOAD_EXPERT ldm_layer_load_expert
-#define MOE_GATE_SIGMOID
-#include "nn/nn_moe_sigmoid.h" /* moe_decode1(), moe_batch() */
+/* ---------- shared layer compute (M3: view → libmoty-nn) ---------- */
+#include "nn/attn.h"
+#include "nn/conv.h"
+#include "nn/ffn.h"
+#include "nn/moe.h"
+
+static void att_run(Model *m, Layer *l, int li, const float *x, int S, int pos_base, float *out) {
+    Cfg *c = &m->c;
+    MotyAttnView a = { .q=&l->q, .k=&l->k, .v=&l->v, .o=&l->o, .qn=l->qn, .kn=l->kn,
+        .n_heads=c->n_heads, .n_kv_heads=c->n_kv_heads, .head_dim=c->head_dim,
+        .theta=c->theta, .eps=c->eps, .rot=c->rot,
+        .K=m->base.K, .V=m->base.V, .K8=m->base.K8, .V8=m->base.V8,
+        .Ks=m->base.Ks, .Vs=m->base.Vs,
+        .att_sc=m->base.att_sc, .max_t=m->base.max_t, .scr=&m->base.scr, .li=li };
+    moty_nn_attention(&a, x, S, pos_base, out);
+}
+static void conv_run(Model *m, Layer *l, const float *x, int S, float *out) {
+    MotyConvView cv = { .in_proj=&l->in_proj, .out_proj=&l->out_proj,
+        .conv_w=l->conv_w, .conv_state=l->conv_state,
+        .hidden=m->c.hidden, .conv_L=m->c.conv_L, .scr=&m->base.scr };
+    moty_nn_conv_layer(&cv, x, S, out);
+}
+static void ffn_run(Model *m, Layer *l, const float *x, int S, float *out) {
+    MotyFfnView f = { .gate=&l->gate, .up=&l->up, .down=&l->down,
+        .inter=m->c.inter, .scr=&m->base.scr };
+    moty_nn_dense_ffn(&f, x, S, out);
+}
+static void moe_run(Model *m, Layer *l, int li, const float *x, int S, float *out) {
+    Cfg *c = &m->c;
+    MotyMoeView v = { .router=&l->router, .expert_bias=l->expert_bias, .ec=l->ec,
+        .load_expert=ldm_layer_load_expert, .ectx=m,
+        .E=c->n_experts, .K=c->topk, .I=c->moe_inter, .D=c->hidden,
+        .li=li, .ebits=g_ebits,
+        .has_shared=0, .scr=&m->base.scr };
+    if (S == 1) moty_nn_moe_sigmoid_d1(&v, x, out);
+    else        moty_nn_moe_sigmoid_batch(&v, x, S, out);
+}
 
 /* ---------- forward pass ---------- */
 static float *step(Model *m, const int *ids, int S, int pos_base) {
@@ -188,13 +217,13 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         double c0 = 0;
         if (PROF_ON) c0 = now_s();
         else (void)c0;
-        if (l->type == LT_CONV) conv_layer(m, l, nrm, S, tmp); else attention(m, l, i, nrm, S, pos_base, tmp);
+        if (l->type == LT_CONV) conv_run(m, l, nrm, S, tmp); else att_run(m, l, i, nrm, S, pos_base, tmp);
         if (l->type == LT_CONV) { PROF_ACC(conv, c0); } else { PROF_ACC(attn, c0); }
         if (PROF_ON) c0 = now_s();
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->ffn_norm, D, c->eps);
-        if (l->is_moe) { if (S == 1) moe_decode1(m, l, i, nrm, tmp); else moe_batch(m, l, i, nrm, S, tmp); }
-        else dense_ffn(m, l, nrm, S, tmp);
+        if (l->is_moe) moe_run(m, l, i, nrm, S, tmp);
+        else ffn_run(m, l, nrm, S, tmp);
         if (l->is_moe) { PROF_ACC(moe, c0); } else { PROF_ACC(ffn, c0); }
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
     }

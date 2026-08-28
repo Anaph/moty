@@ -1,5 +1,7 @@
-/* nn.h — umbrella for all NN primitive headers.
- * Include this from engine .c files to get everything below L1. */
+/* nn.h — umbrella for all NN primitive headers (M3: le implementazioni sono
+ * in libmoty-nn; gli header dichiarano tipi/prototipi + macro legacy).
+ * Layer headless (attn/conv/ffn/moe) si includono DIRETTAMENTE dai motori
+ * con le loro view: nn/attn.h, nn/conv.h, nn/ffn.h, nn/moe.h. */
 #ifndef NN_H
 #define NN_H
 

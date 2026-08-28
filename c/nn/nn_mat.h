@@ -8,6 +8,10 @@
  */
 #ifndef NN_MAT_H
 #define NN_MAT_H
+#include <stdint.h>
+#include <stddef.h>
+#include "hw/hw.h"            /* WF_* enum */
+#include "nn/nn_alloc.h"      /* Scratch (MotyCommon) */
 
 #include <stdint.h>
 
@@ -16,7 +20,15 @@ typedef struct Mat { int fmt;             /* WF_F32/WF_I8/WF_I4/WF_I4G/WF_I2 */
                      uint8_t *q4; int gs;
                      const void *sh; const char *sname; } Mat;
 
-static void (*g_mat_stream_fn)(float *y, const float *x, const struct Mat *w, int S) = NULL;
+/* M3: implementazioni in nn/mat.c (libmoty-nn) */
+typedef void (*MotyMatStreamFn)(float *y, const float *x, const struct Mat *w, int S);
+void  moty_nn_set_stream_fn(MotyMatStreamFn fn);   /* MEM_GB: hook dello streamer */
+void  moty_mat_apply(float *y, const float *x, const Mat *w, int S);
+void  moty_kv_store_row(int8_t *dst, float *scale_slot, const float *src, int hd);
+#ifndef MOTY_CORE_NO_LEGACY
+#define mat_apply     moty_mat_apply
+#define kv_store_row  moty_kv_store_row
+#endif
 
 /* M2: il contratto runtime/engine e' un TIPO reale, non solo testo. Gli
  * engine scrivono `typedef struct { MODEL_COMMON_FIELDS; ...extra... }
@@ -50,23 +62,7 @@ static inline void mat_reset_storage(Mat *w) {
     w->sh = NULL; w->sname = NULL;
 }
 
-static inline void kv_store_row(int8_t *dst, float *scale_slot, const float *src, int hd) {
-    *scale_slot = qrow_i8(src, dst, hd);
-}
 
-static void mat_apply(float *y, const float *x, const Mat *w, int S) {
-    if (g_mat_stream_fn && w->sh) { g_mat_stream_fn(y, x, w, S); return; }
-    switch (w->fmt) {
-        case WF_I4G: matmul_i4_grouped_s(y, x, w->q4, w->qs, S, w->I, w->O, w->gs); return;
-        case WF_I4:  matmul_i4_s(y, x, w->q4, w->qs, S, w->I, w->O); return;
-        case WF_I8:  matmul_q_s(y, x, w->q, w->qs, S, w->I, w->O); return;
-        case WF_I2:  matmul_i2_s(y, x, w->q4, w->qs, S, w->I, w->O); return;
-#ifdef GGUF_H
-        case WF_Q4K: matmul_q4k_native(y, x, w->q4, S, w->I, w->O); return;
-        case WF_Q6K: matmul_q6k_native(y, x, w->q4, S, w->I, w->O); return;
-#endif
-        default:     matmul(y, x, w->f, S, w->I, w->O); return;
-    }
-}
+
 
 #endif /* NN_MAT_H */

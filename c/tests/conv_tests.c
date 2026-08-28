@@ -26,7 +26,12 @@ typedef struct { int hidden, n_heads, n_kv_heads, head_dim, n_layers, inter, voc
 typedef struct { Mat in_proj, out_proj; float *conv_w; float *conv_state; } Layer;
 typedef struct { MotyCommon base; Cfg c; } Model;   /* M2: contratto MotyCommon nel Model del test */
 
-#include "../nn/nn_conv.h"
+#include "../nn/conv.h"
+static MotyConvView cv_view(Model *m, Layer *l) {
+    return (MotyConvView){ .in_proj=&l->in_proj, .out_proj=&l->out_proj,
+        .conv_w=l->conv_w, .conv_state=l->conv_state,
+        .hidden=m->c.hidden, .conv_L=m->c.conv_L, .scr=&m->base.scr };
+}
 
 static uint64_t cv_lcg = 0xA5A5F00DULL;
 static uint32_t cv_rnd(void) {
@@ -76,11 +81,13 @@ int cv_causality(void) {
 
     /* cammino A: una chiamata S=N */
     for (int s = 0; s < CV_N; s++) for (int i = 0; i < CV_D; i++) { (void)xs; }
-    conv_layer(&m, &la, (float*)xs, CV_N, (float*)ya);
+    MotyConvView va = cv_view(&m, &la);
+    moty_nn_conv_layer(&va, &xs[0][0], CV_N, &ya[0][0]);
 
     /* cammino B: N chiamate S=1 */
+    MotyConvView vb = cv_view(&m, &lb);
     for (int s = 0; s < CV_N; s++)
-        conv_layer(&m, &lb, xs[s], 1, yb[s]);
+        moty_nn_conv_layer(&vb, xs[s], 1, yb[s]);
 
     for (int s = 0; s < CV_N; s++)
         for (int i = 0; i < CV_D; i++)
@@ -109,8 +116,12 @@ int cv_fused_vs_legacy(void) {
 
     float x[CV_D], yf[CV_D], yl[CV_D];
     for (int i = 0; i < CV_D; i++) x[i] = cv_frnd();
-    conv_layer(&m, &lf, x, 1, yf);
-    conv_layer(&m, &ll, x, 1, yl);
+    MotyConvView vf = cv_view(&m, &lf);
+    moty_nn_conv_layer(&vf, x, 1, yf);
+    setenv("CONV_VNNI", "0", 1);
+    MotyConvView vl = cv_view(&m, &ll);
+    moty_nn_conv_layer(&vl, x, 1, yl);
+    setenv("CONV_VNNI", "1", 1);
     double mx = 0, mv = 0;
     for (int i = 0; i < CV_D; i++) {
         double e = fabs((double)yf[i]-yl[i]);

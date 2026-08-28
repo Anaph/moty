@@ -36,13 +36,24 @@ set(MOTY_TEST_MARCH "" CACHE STRING "march per i sorgenti C dei test (es. native
 # libmoty-hw (M1): la stessa implementazione unica dei kernel che usano i
 # motori. MOTY_TEST_MARCH si applica anche a hw.c: i test esercitano il
 # tier SIMD reale della macchina.
-add_library(moty_core STATIC ../nn/alloc.c ../nn/quant.c)
+# libmoty-hw (M1): la stessa implementazione unica dei kernel che usano i
+# motori. MOTY_TEST_MARCH si applica anche a hw.c: i test esercitano il
+# tier SIMD reale della macchina.
+# libmoty-nn completa (M3): stessa lista del Makefile
+set(MOTY_NN_SRCS ../nn/alloc.c ../nn/quant.c ../nn/mat.c ../nn/matmul.c
+                 ../nn/norm.c ../nn/rope.c ../nn/attn_kernels.c ../nn/sample.c
+                 ../nn/attn.c ../nn/conv.c ../nn/ffn.c ../nn/moe.c
+                 ../runtime/moecache.c ../io/tier.c)
+add_library(moty_core STATIC ${MOTY_NN_SRCS})
 target_include_directories(moty_core PRIVATE ${ENGDIR})
+target_link_libraries(moty_core PRIVATE moty_hw)
 if(OpenMP_C_FOUND)
   target_link_libraries(moty_core PRIVATE OpenMP::OpenMP_C)
 endif()
 if(MOTY_TEST_MARCH)
-  set_source_files_properties(../nn/alloc.c ../nn/quant.c PROPERTIES COMPILE_OPTIONS "-march=${MOTY_TEST_MARCH}")
+  foreach(src ${MOTY_NN_SRCS})
+    set_source_files_properties(${src} PROPERTIES COMPILE_OPTIONS "-march=${MOTY_TEST_MARCH}")
+  endforeach()
 endif()
 add_library(moty_hw STATIC ../hw/hw.c)
 target_include_directories(moty_hw PRIVATE ${ENGDIR})

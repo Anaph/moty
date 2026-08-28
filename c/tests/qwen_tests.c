@@ -682,7 +682,7 @@ static int qt_run8_micro(const char *dir, int *out) {
     CHECK(m.base.lm_tied && m.base.lm_head.sh != NULL && m.base.lm_head.f == NULL);
     kv_alloc(&m, 16);
     int rc = drive_greedy8(&m, out);
-    g_micro = 0; g_mat_stream_fn = NULL; g_micro_chunk = 4<<20;
+    g_micro = 0; moty_nn_set_stream_fn(NULL); g_micro_chunk = 4<<20;
     return rc;
 }
 

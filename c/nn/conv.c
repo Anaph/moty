@@ -1,40 +1,25 @@
-/* Shared short-conv (depthwise causal conv1d + gating). Include AFTER
- * Layer/Cfg/Model are defined.
- *
- * Conv weight layout: GGUF stores PyTorch Conv1d[D,K] with reversed ggml dims
- * → flat data is [D, K] C-order (channel-major). Access: conv_w[ch*K + t].
- * Conv state: [D, dc] same convention, dc = K-1.
- *
- * UNA regione parallela con barrier: in_proj (VNNI grouped) → conv depthwise
- * (canali partizionati, sequenziale nei token) → out_proj (VNNI grouped).
- * Richiede WF_I4G gs=32 e D%64==0 per il path VNNI; fallback: mat_apply
- * fuori regione (2 fork/join, come prima).
- *
- * Requires Layer fields: in_proj, out_proj (Mat), conv_w (float*), conv_state (float*)
- * Requires Cfg fields: hidden, conv_L
- */
-#ifndef NN_CONV_H
-#define NN_CONV_H
+/* conv.c — M3 libmoty-nn: conv corta causale fusa (da nn_conv.h, 1:1). */
+#include "nn/conv.h"
 
-static void conv_layer(Model *m, Layer *l, float *x, int S, float *out) {
-    Cfg *c = &m->c; int D = c->hidden, K = c->conv_L;
+void moty_nn_conv_layer(const MotyConvView *cv, const float *x, int S, float *out) {
+    int D = cv->hidden, K = cv->conv_L;
     /* P5: arena per-Model, reserve unica per tutti i chunk (path VNNI completo) */
     {
         int ng_ = (D+31)/32;
-        scr_reset(&m->base.scr);
-        scr_reserve(&m->base.scr, scr_al((int64_t)S*3*D*4) + scr_al((int64_t)S*D*4)
+        scr_reset(cv->scr);
+        scr_reserve(cv->scr, scr_al((int64_t)S*3*D*4) + scr_al((int64_t)S*D*4)
                           + 2*scr_al((int64_t)S*D) + 2*scr_al((int64_t)S*ng_*4)
                           + 2*scr_al((int64_t)S*4));
     }
-    float *bcx = scr_take(&m->base.scr, (int64_t)S*3*D*4);
-    float *ybuf = scr_take(&m->base.scr, (int64_t)S*D*4);
-    int8_t *cxi = scr_take(&m->base.scr, scr_al((int64_t)S*D));
-    int32_t *cxg = scr_take(&m->base.scr, scr_al((int64_t)S*((D+31)/32)*4));
-    float   *csx = scr_take(&m->base.scr, scr_al((int64_t)S*4));
-    int8_t *yqi = scr_take(&m->base.scr, scr_al((int64_t)S*D));
-    int32_t *yqg = scr_take(&m->base.scr, scr_al((int64_t)S*((D+31)/32)*4));
-    float   *ysx = scr_take(&m->base.scr, scr_al((int64_t)S*4));
-    Mat *wi = &l->in_proj, *wo = &l->out_proj;
+    float *bcx = scr_take(cv->scr, (int64_t)S*3*D*4);
+    float *ybuf = scr_take(cv->scr, (int64_t)S*D*4);
+    int8_t *cxi = scr_take(cv->scr, scr_al((int64_t)S*D));
+    int32_t *cxg = scr_take(cv->scr, scr_al((int64_t)S*((D+31)/32)*4));
+    float   *csx = scr_take(cv->scr, scr_al((int64_t)S*4));
+    int8_t *yqi = scr_take(cv->scr, scr_al((int64_t)S*D));
+    int32_t *yqg = scr_take(cv->scr, scr_al((int64_t)S*((D+31)/32)*4));
+    float   *ysx = scr_take(cv->scr, scr_al((int64_t)S*4));
+    const Mat *wi = cv->in_proj, *wo = cv->out_proj;
     int gs = wi->gs, ngD = (D+gs-1)/gs;
     int vnni_in  = (wi->fmt == WF_I4G && gs == 32 && (D & 63) == 0);
     int vnni_out = (wo->fmt == WF_I4G && wo->gs == 32 && (D & 63) == 0);
@@ -43,7 +28,7 @@ static void conv_layer(Model *m, Layer *l, float *x, int S, float *out) {
       if (!conv_new) { vnni_in = 0; vnni_out = 0; } }
     if (!vnni_in || !vnni_out) {
         /* path legacy: proiezioni batched via mat_apply (2 fork/join) */
-        mat_apply(bcx, x, &l->in_proj, S);
+        mat_apply(bcx, x, cv->in_proj, S);
         int dc = K - 1;
         for (int s = 0; s < S; s++) {
             float *row = bcx + (int64_t)s*3*D;
@@ -51,17 +36,17 @@ static void conv_layer(Model *m, Layer *l, float *x, int S, float *out) {
             float *ys = ybuf + (int64_t)s*D;
             for (int ch = 0; ch < D; ch++) {
                 float bx = b[ch]*xx[ch], acc = 0;
-                for (int tt = 0; tt < dc; tt++) acc += l->conv_state[ch*dc+tt] * l->conv_w[ch*K+tt];
-                acc += bx * l->conv_w[ch*K+dc];
+                for (int tt = 0; tt < dc; tt++) acc += cv->conv_state[ch*dc+tt] * cv->conv_w[ch*K+tt];
+                acc += bx * cv->conv_w[ch*K+dc];
                 ys[ch] = co[ch] * acc;
             }
             if (dc > 0)
                 for (int ch = 0; ch < D; ch++) {
-                    for (int tt = 0; tt < dc-1; tt++) l->conv_state[ch*dc+tt] = l->conv_state[ch*dc+tt+1];
-                    l->conv_state[ch*dc+dc-1] = b[ch]*xx[ch];
+                    for (int tt = 0; tt < dc-1; tt++) cv->conv_state[ch*dc+tt] = cv->conv_state[ch*dc+tt+1];
+                    cv->conv_state[ch*dc+dc-1] = b[ch]*xx[ch];
                 }
         }
-        mat_apply(out, ybuf, &l->out_proj, S);
+        mat_apply(out, ybuf, cv->out_proj, S);
         return;
     }
     /* quant x per token (seriale: S=1 in decode; ~8us per S=27) */
@@ -96,12 +81,12 @@ static void conv_layer(Model *m, Layer *l, float *x, int S, float *out) {
             float *ys = ybuf + (int64_t)s*D;
             for (int ch = ch0; ch < ch1; ch++) {
                 float bx = b[ch]*xx[ch], acc = 0;
-                for (int tt = 0; tt < dc; tt++) acc += l->conv_state[ch*dc+tt] * l->conv_w[ch*K+tt];
-                acc += bx * l->conv_w[ch*K+dc];
+                for (int tt = 0; tt < dc; tt++) acc += cv->conv_state[ch*dc+tt] * cv->conv_w[ch*K+tt];
+                acc += bx * cv->conv_w[ch*K+dc];
                 ys[ch] = co[ch] * acc;
                 if (dc > 0) {
-                    for (int tt = 0; tt < dc-1; tt++) l->conv_state[ch*dc+tt] = l->conv_state[ch*dc+tt+1];
-                    l->conv_state[ch*dc+dc-1] = bx;
+                    for (int tt = 0; tt < dc-1; tt++) cv->conv_state[ch*dc+tt] = cv->conv_state[ch*dc+tt+1];
+                    cv->conv_state[ch*dc+dc-1] = bx;
                 }
             }
         }
@@ -127,5 +112,3 @@ static void conv_layer(Model *m, Layer *l, float *x, int S, float *out) {
         }
     }
 }
-
-#endif /* NN_CONV_H */
