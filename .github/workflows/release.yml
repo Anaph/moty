@@ -73,6 +73,7 @@ jobs:
 
       - name: Package
         run: |
+          set -o pipefail
           name="moty-${GITHUB_REF_NAME}-${{ matrix.name }}"
           mkdir -p pkg/${name}
           # copia binario-per-binario: su armv7 moty non c'e' (linka glm,
@@ -87,9 +88,10 @@ jobs:
           if [ "${{ matrix.ext }}" = tar.gz ]; then
             tar -C pkg -czf ${name}.tar.gz ${name}
           else
-            cd pkg && zip -r ../${name}.zip ${name}
+            cd pkg && python3 -m zipfile -c ../${name}.zip ${name}   # zip non e' preinstallato
           fi
           sha256sum ${name}.* > ${name}.sha256
+          echo "packaged: $(ls pkg/${name})"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

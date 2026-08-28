@@ -18,7 +18,15 @@ jobs:
           path: c/tests/build/_deps
           key: gtest-v1.14.0
       - name: Build engines
-        run: cd c && make all
+        run: |
+          cd c
+          make all 2>&1 | tee /tmp/build.log | tail -5
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            # stampa le ultime righe come ANNOTAZIONE: leggibile anche via API pubblica
+            tail -c 700 /tmp/build.log | while IFS= read -r line; do echo "::error::${line}"; done
+            exit $rc
+          fi
       - name: Test suite (gtest via CMake + ctest)
         run: cd c && make test
       - name: Test suite (native march)
