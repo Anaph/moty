@@ -87,19 +87,29 @@ Optional macros (define before including `runtime/runtime.h`):
 
 Everything below is paste-in: no intrinsics, no OpenMP management.
 
-- **GQA attention** — `nn/nn_attn.h`: `attention(m, l, li, x, S, pos_base, out)`.
-  Configures via `#define ENGINE_GATED_ATTN` (gated attention) and
-  `ATTN_NORM` (pre-attention norm field name). Fuses q/k/v into one VNNI
-  region when weights are WF_I4G.
-- **Dense FFN / SwiGLU** — `nn/nn_ffn.h`: `dense_ffn(...)`.
-- **Short convolution** (hybrid conv nets) — `nn/nn_conv.h`: `conv_layer(...)`
-  (fused in_proj→depthwise-causal→out_proj, one parallel region).
-- **MoE** — `nn/nn_moe_sigmoid.h`: `moe_decode1` / `moe_batch`. Configure:
-  - `MOE_GATE_SIGMOID` — sigmoid+bias gating (LFM2-style) instead of
-    softmax top-k (Qwen-style)
-  - `MOE_SHARED_EXPERT` — layer has a gated shared expert
-  - `MOE_LOAD_EXPERT` — your expert-bytes loader (from `runtime/moe.h`
-    cache or disk)
+Layers are library calls (M3): the engine fills a small **view struct**
+(weights + config + the per-layer storage from `MotyCommon`) and calls the
+variant it wants — no macros, no paste-in:
+
+- **GQA attention** — `nn/attn.h`: fill a `MotyAttnView`, then
+  `moty_nn_attention(...)` or `moty_nn_attention_gated(...)` (gated =
+  q_proj doubled [q|gate], output *= sigmoid(gate)). Fuses q/k/v into
+  one VNNI region when weights are WF_I4G.
+- **Dense FFN / SwiGLU** — `nn/ffn.h`: `MotyFfnView` →
+  `moty_nn_dense_ffn(...)`.
+- **Short convolution** — `nn/conv.h`: `MotyConvView` →
+  `moty_nn_conv_layer(...)` (fused in_proj→depthwise-causal→out_proj,
+  one parallel region).
+- **MoE** — `nn/moe.h`: `MotyMoeView` (router, expert-bias, expert cache
+  + your `load_expert` hook, shared expert as a flag) → the variant
+  matching your gate: `moty_nn_moe_sigmoid_d1/_batch` (LFM2-style
+  sigmoid+bias) or `moty_nn_moe_topk_d1/_batch` (Qwen-style softmax
+  top-k).
+- **Linear attention** — `nn/nn_deltanet.h` (Gated DeltaNet; still
+  paste-in, engine-local).
+
+See `engines/lfm2.c` for the `att_run`/`conv_run`/`ffn_run`/`moe_run`
+adapter pattern — a ~15-line view fill per layer call.
 - **Linear attention** — `nn/nn_deltanet.h` (Gated DeltaNet, Qwen3.5-style).
 
 If your layer isn't here, extract it first — `docs/supporting-layers.md`.

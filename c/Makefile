@@ -61,14 +61,14 @@ $(warning libomp not found: building single-threaded. For multithreading: brew i
 OMPC    =
 OMPL    =
 endif
-CFLAGS  = -I. -O2 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -I. -O2 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(LTOFLAGS)
 # Opt-in: ARCH=native appends -mcpu=native (arm64 clang uses -mcpu, not -march),
 # which unlocks the i8mm SMMLA int8/int4 dot kernels in glm.c. ARCH unset ->
 # no -mcpu, default build byte-identical. Apple clang knows apple-m4 / native.
 ifneq ($(ARCH),)
 CFLAGS += -mcpu=$(ARCH)
 endif
-LDFLAGS = -lm $(OMPL)
+LDFLAGS = -lm $(OMPL) $(LTOFLAGS)
 EXE     =
 else ifneq ($(IS_WIN),)
 # --- Windows 11 x86-64 (MinGW-w64 / MSYS2) ---
@@ -81,12 +81,12 @@ else ifneq ($(IS_WIN),)
 # a v3 build simply compiles out the VNNI path - safe on any x86-64.
 CC      = gcc
 ARCH   ?= x86-64-v3
-CFLAGS  = -I. -D_FILE_OFFSET_BITS=64 -O2 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -I. -D_FILE_OFFSET_BITS=64 -O2 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(LTOFLAGS)
 # -lpsapi: compat.h calls GetProcessMemoryInfo (rss_gb). It's linked via
 # #pragma comment(lib,"psapi.lib") for MSVC, but MinGW gcc ignores that pragma
 # (warns), so link psapi explicitly or the build fails undefined-reference on
 # modern GCC (e.g. 16.x under UCRT). Harmless where the pragma also resolves it.
-LDFLAGS = -lm -fopenmp -static -lpsapi
+LDFLAGS = -lm -fopenmp -static -lpsapi $(LTOFLAGS)
 EXE     = .exe
 else
 ifneq (,$(PPC64))
@@ -96,8 +96,8 @@ ifneq (,$(PPC64))
 # (validated token-exact vs the transformers oracle on a POWER8 S824).
 CC      = gcc
 ARCH   ?= native
-CFLAGS  = -I. -O2 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm -fopenmp -pthread
+CFLAGS  = -I. -O2 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(LTOFLAGS)
+LDFLAGS = -lm -fopenmp -pthread $(LTOFLAGS)
 EXE     =
 else
 ifneq (,$(ARMV7))
@@ -110,8 +110,8 @@ ifneq (,$(ARMV7))
 CC      = gcc
 ARCH   ?= armv7-a
 FPU    ?= neon-vfpv4
-CFLAGS  = -I. -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -mfpu=$(FPU) -munaligned-access -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm -fopenmp -pthread
+CFLAGS  = -I. -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -mfpu=$(FPU) -munaligned-access -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(LTOFLAGS)
+LDFLAGS = -lm -fopenmp -pthread $(LTOFLAGS)
 EXE     =
 else
 # --- Linux / *BSD x86-64 (percorso originale, invariato) ---
@@ -121,8 +121,8 @@ CC      = gcc
 # ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
 # -pthread: Linux lo tira dentro via -fopenmp, i *BSD no e le pthread_* non risolvono (#219).
 ARCH   ?= native
-CFLAGS  = -I. -O2 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm -fopenmp -pthread
+CFLAGS  = -I. -O2 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(LTOFLAGS)
+LDFLAGS = -lm -fopenmp -pthread $(LTOFLAGS)
 EXE     =
 endif
 endif
@@ -200,6 +200,14 @@ libmoty-hw.a: $(HW_SRCS) $(HW_DEPS)
 	ar rcs $@ hw/hw.o
 
 # ---- source layout (v2): engines/ nn/ hw/ runtime/ io/ tok/ util/ ----
+# LTO (default ON): ri-inline i kernel hw dentro i loop matmul al LINK,
+# recuperando il costo del boundary M1 (chiamate out-of-line ai dot_*).
+# MOTY_LTO=0 per disattivarlo (cross senza plugin lto).
+MOTY_LTO ?= 1
+ifeq ($(MOTY_LTO),1)
+LTOFLAGS = -flto=auto
+endif
+
 # All includes are repo-c-relative ("nn/nn.h", "hw/hw.h", ...), so every
 # compile adds -I. A shared deps list keeps the .o rules honest.
 NN_CORE   = nn/nn.h nn/nn_alloc.h nn/nn_norm.h nn/nn_sample.h nn/nn_gemm.h hw/hw.h

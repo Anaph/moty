@@ -19,6 +19,13 @@ fail() { say "FAIL: $*"; FAILED=1; }
 [ -f "$LFM2_GGUF" ] || { say "SKIP perf: $LFM2_GGUF assente"; PERF=0; }
 [ -f "$QWEN_GGUF" ] || { say "SKIP perf: $QWEN_GGUF assente"; PERF=0; }
 PERF=${PERF:-1}
+# la decisione sulla macchina si prende ORA: le fasi di build che seguono
+# alzano l loadavg da sole e invaliderebbero il check a valle.
+LOAD0=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo 0)
+if [ "$PERF" = 1 ] && ! awk "BEGIN{exit !($LOAD0 < 1.5)}"; then
+  say "SKIP perf: loadavg iniziale=$LOAD0 >= 1.5 (macchina condivisa)"
+  PERF=0
+fi
 
 # ---- 1. correttezza: suite completa portable + native ----
 say "make check (portable + 118 test)..."
@@ -43,7 +50,7 @@ if [ "$PERF" = 1 ]; then
 
   # ---- 3. performance: solo a macchina ferma, mediana di 3 ----
   LOAD=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo 0)
-  if awk "BEGIN{exit !($LOAD < 1.5)}"; then
+  if true; then    # decisione gia' presa a inizio run (LOAD0): il build ha sporco il loadavg
     for M in LFM2 QWEN; do
       eval GGUF="\$${M}_GGUF"; eval BASE="\$${M}_BASE"
       case $M in LFM2) P='epic poem about sea storms';; *) P='essay about navigation history';; esac

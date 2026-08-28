@@ -8,13 +8,13 @@ shared.
 
 Reference examples, in order of increasing complexity:
 
-| Layer | File | What it demonstrates |
+| Layer | File (.h + .c in `libmoty-nn`) | What it demonstrates |
 |---|---|---|
-| Dense FFN | `nn/nn_ffn.h` | minimal: one function, arena scratch, no config |
-| Short conv | `nn/nn_conv.h` | causal state, fused single parallel region + barriers |
-| Attention | `nn/nn_attn.h` | compile-time config macros, fused VNNI path + fallback, KV store f32/int8 |
-| MoE | `nn/nn_moe_sigmoid.h` | router variants behind macros, expert-cache hook, S=1 vs S>1 paths, prof instrumentation |
-| DeltaNet | `nn/nn_deltanet.h` | recurrent (state, not KV), custom kernels behind `hw/` |
+| Dense FFN | `nn/ffn.h` + `ffn.c` | minimal: one function, one view struct, arena scratch |
+| Short conv | `nn/conv.h` + `conv.c` | causal state, fused single parallel region + barriers |
+| Attention | `nn/attn.h` + `attn.c` | named gated/non-gated variants, fused VNNI path + fallback, KV store f32/int8 |
+| MoE | `nn/moe.h` + `moe.c` | gate variants as named functions, expert-cache hook in the view, S=1 vs S>1 paths, prof instrumentation |
+| DeltaNet | `nn/nn_deltanet.h` (still paste-in) | recurrent (state, not KV), custom kernels behind `hw/` |
 
 ## Design rules
 
@@ -37,17 +37,17 @@ float *b = scr_take(&m->scr, scr_al(b_bytes));            // never moves base
    Compute the *total* first, reserve once, then take. No `grow()`, no
    function-local statics — two Models must coexist in one process.
    Serial context only: never inside an OpenMP region.
-4. **Engine variation = preprocessor macros.** The engine defines them
-   before including:
+4. **Engine variation = view structs + named variants.** The engine fills
+   a descriptor and calls the variant it wants (M3 pattern — macro
+   paste-ins are retired):
 
 ```c
-#define ENGINE_GATED_ATTN   /* q_proj doubled [query|gate] */
-#define ATTN_NORM in_ln     /* pre-attention norm field name */
-#include "nn/nn_attn.h"
+MotyAttnView a = { .q=&l->q, ..., .scr=&m->base.scr, .li=li };
+moty_nn_attention_gated(&a, nrm, S, pos_base, tmp);
 ```
 
-   Keep the macro surface minimal (one per real architectural difference,
-   not per engine).
+   One view field per real architectural difference; one named function
+   per behavioral fork (gate kind, routing kind).
 5. **Quantization-aware from day one.** Route matmuls through `mat_apply`
    (`nn/nn_mat.h`) so the layer automatically runs f32 / int8 / int4 /
    grouped-int4 depending on the weights' `Mat.fmt` (`WF_F32/WF_I8/WF_I4/
@@ -65,32 +65,36 @@ float *b = scr_take(&m->scr, scr_al(b_bytes));            // never moves base
 
 ## Template
 
+**Header** (`nn/<layer>.h`) — the view + prototypes:
+
 ```c
-/* nn/nn_<layer>.h — <one-line description>.
- * Include AFTER Layer/Cfg/Model are defined and after nn/nn.h.
- *
- * Config macros (define before including):
- *   <LAYER>_FLAG  — what it changes
- *
- * Requires Layer fields: <...>
- * Requires Cfg fields:   <...>
- * Contract: <batch-invariance / causality / reference guarantees>
- */
-#ifndef NN_<LAYER>_H
-#define NN_<LAYER>_H
+/* nn/<layer>.h — <one-line description>.
+ * Requires view fields: <weights, config, storage>
+ * Contract: <batch-invariance / causality / reference guarantees> */
+#ifndef MOTY_NN_<LAYER>_H
+#define MOTY_NN_<LAYER>_H
+#include "nn/nn_mat.h"
 
-#ifndef <LAYER>_FLAG
-#define <LAYER>_FLAG 0
+typedef struct Moty<Layer>View {
+    /* const Mat *... weights; config ints; Scratch *scr; storage */
+} Moty<Layer>View;
+
+void moty_nn_<layer>(const Moty<Layer>View *v, const float *x, int S, float *out);
+/* + named variants per behavioral fork: moty_nn_<layer>_<variant>(...) */
 #endif
+```
 
-static void <layer>(Model *m, Layer *l, int li, const float *x, int S, float *out) {
-    /* 1. sizes + total scratch, one reserve */
+**Implementation** (`nn/<layer>.c`) — added to `libmoty-nn` (Makefile
+`NN_CORE_SRCS` + tests `MOTY_NN_SRCS` + `c/CMakeLists.txt`):
+
+```c
+#include "nn/<layer>.h"
+void moty_nn_<layer>(const Moty<Layer>View *v, const float *x, int S, float *out) {
+    /* 1. sizes + total scratch, ONE scr_reserve(v->scr, total) */
     /* 2. quantize shared activations once (qrow_i8 + px_sum + px_permute) */
-    /* 3. one parallel region per phase; dots via hw/ kernels */
+    /* 3. one parallel region per phase; dots via hw/ kernels (legacy macros) */
     /* 4. serial tail (weighted sums, gates) */
 }
-
-#endif /* NN_<LAYER>_H */
 ```
 
 ## Tests a layer must ship with

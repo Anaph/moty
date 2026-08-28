@@ -1,5 +1,12 @@
 # Moty modularization plan
 
+> **Status (2026-08):** M0–M3, M5, M6 landed; M4 landed scoped (config/env
+> + KV in `libmoty-runtime`; the ops-vtable half is **M4b**, gated on
+> unifying the common `Cfg` prefix the way M2 did for `MotyCommon` — see
+> the M4 section); M7 (style pass) applied to the touched surface, then
+> ongoing. Baseline numbers below reflect the pre-M1 state; post-M3 the
+> `moty` binary carries ONE copy of every kernel and layer.
+
 Rework the codebase from **paste-in headers** (every engine compiles its own
 copy of everything, textually) into a **layered library model** with real
 link boundaries, one implementation per module, and an ops-table engine

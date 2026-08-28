@@ -38,13 +38,13 @@ Contract notes carried over from `hw/hw.h`: `dot_i8i8` activations in
 | `MOE_SHARED_EXPERT` | `MOTY_MOE_SHARED` flag in `MotyMoeDesc` |
 | `MOE_LOAD_EXPERT` | `load_expert` fn-ptr in `MotyMoeDesc` |
 | `conv_layer`, `dense_ffn` | `moty_nn_conv_layer`, `moty_nn_dense_ffn` |
-| `pick_tok`, `dist_build` (+ `g_temp` globals) | `moty_nn_pick(MotySampler*, …)` state struct |
+| `pick_tok`, `dist_build` (+ `g_temp` globals) | shipped as `moty_pick_tok` etc. with exported state `moty_g_temp/nuc/rng` (M3) |
 
 ## libmoty-runtime (M4) — scaffolding + expert cache
 
 | Current (static hook) | Exported as |
 |---|---|
-| 11 static hooks + `engine_main()` | `MotyEngineOps` vtable + `moty_rt_serve(&ops)` |
-| `g_kv_bits`, `g_qgroup`, `g_prefill_chunk`, … | `MotyConfig` + `moty_rt_config_from_env()` |
-| `ExpertCache` (`runtime/moe.h`) | `moty_rt_expertcache_*` |
-| `load_cfg`/`cfg_common` JSON plumbing | `moty_rt_cfg_common` |
+| runtime knobs `g_gguf`, `g_kv_bits`, `g_qgroup`, `g_micro`, … | `moty_rt_g_*` state + `moty_rt_parse_env` (**shipped, M4**) |
+| `kv_arrays_alloc` / `kv_layer_alloc` | `moty_rt_kv_arrays_alloc` / `moty_rt_kv_layer_alloc` (**shipped, M4**) |
+| `ExpertCache` (`runtime/moe.h`) | `moty_expert_*`, `moe_topk` in `libmoty-nn` (**shipped, M3**) |
+| 11 static hooks + `engine_main()` | `MotyEngineOps` vtable + `moty_rt_serve(&ops)` — **M4b**, needs the common-`Cfg` unification first |

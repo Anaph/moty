@@ -114,7 +114,11 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         LD(gate, "mlp.gate.weight");
         #undef LD
     }
-    m->cache = calloc(c->n_layers, sizeof(ExpertCache));
+    if (c->n_layers < 1 || c->n_layers > 4096) {
+        fprintf(stderr, "config: num_hidden_layers=%d fuori range\n", c->n_layers);
+        exit(1);
+    }
+    m->cache = calloc((size_t)c->n_layers, sizeof(ExpertCache));
     for (int i = 0; i < c->n_layers; i++) expert_cache_init(&m->cache[i], cap, c->n_experts);
     m->dense_load_s = now_s() - t0;
 }
@@ -337,7 +341,9 @@ static int run_ref(Model *m, const char *refpath) {
 int main(int argc, char **argv) { (void)argc; (void)argv;
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
-    int cap  = getenv("EXPERT_CACHE") ? atoi(getenv("EXPERT_CACHE")) : 16;
+    long capl = getenv("EXPERT_CACHE") ? strtol(getenv("EXPERT_CACHE"), NULL, 10) : 16;
+    if (capl < 1) capl = 1; if (capl > 4096) capl = 4096;
+    int cap = (int)capl;
     int bits = getenv("EBITS")        ? atoi(getenv("EBITS"))        : 8;
     if (bits < 2 || bits > 8) {   /* expert storage is int8_t: bits>8 truncates in quantize_rows (#134). f32 mode is not implemented here — int8 is already token-exact vs the oracle. */
         fprintf(stderr, "EBITS deve essere 2..8 (got %d): storage expert int8, niente modo f32\n", bits);

@@ -46,7 +46,7 @@ c/
 | Folder | Key files | Role |
 |---|---|---|
 | `engines/` | `moty.c`, `lfm2.c`, `qwenmoe.c`, `qwen.c`, `gemma.c`, `olmoe.c`, `glm.c` | `moty` dispatches by GGUF arch string to per-family engines; each can also build standalone |
-| `nn/` | `nn.h` (umbrella), `nn_mat.h` (`Mat`, `MODEL_COMMON_FIELDS`, `mat_apply`), `nn_matmul.h`, `nn_attn.h`, `nn_attn_kernels.h`, `nn_conv.h`, `nn_ffn.h`, `nn_moe_sigmoid.h`, `nn_deltanet.h`, `nn_rope.h`, `nn_norm.h`, `nn_sample.h`, `nn_quant.h`, `nn_alloc.h`, `mla.h` | All shared math. `nn_moe_sigmoid.h` is configured via macros (`MOE_GATE_SIGMOID`, `MOE_SHARED_EXPERT`, `MOE_LOAD_EXPERT`); `nn_attn.h` via `ENGINE_GATED_ATTN`, `ATTN_NORM` |
+| `nn/` | `nn.h` (umbrella), `nn_mat.h` (`Mat`, `MotyCommon`, `mat_apply`), `nn_matmul.h`, `nn_attn_kernels.h`, `attn.h` (`MotyAttnView`), `conv.h`, `ffn.h`, `moe.h` (views + variants), `nn_deltanet.h`, `nn_rope.h`, `nn_norm.h`, `nn_sample.h`, `nn_quant.h`, `nn_alloc.h`, `mla.h` | All shared math — **one compiled copy** in `libmoty-nn` (M3). Layers take view structs (weights + config + `MotyCommon` storage); gate/shared-expert variants are named functions, not macros |
 | `hw/` | `hw.h` (single include point), `hw_avx512.h`, `hw_avx2.h`, `hw_neon.h`, `hw_sve2.h`, `hw_vsx.h`, `hw_scalar.h`, `hw_quant.h` (portable fallbacks), `hw_backend.h` (runtime dispatch), stubs for CUDA/Metal/OpenCL/Vulkan/WASM | One compile-time ladder, no runtime CPUID dispatch |
 | `runtime/` | `runtime.h` (hook contract + umbrella), `rt_model_load.h`, `rt_kv_cache.h`, `rt_gen_loop.h`, `rt_env_cfg.h`, `moe.h` (expert cache, LRU/pin), `decode_batch.h` | The engine scaffolding: load a model from GGUF/safetensors, budget RAM, run prefill/decode, env config. Engines implement ~10 hooks |
 | `io/` | `st.h` (safetensors, multi-shard), `gguf.h` (GGUF v2/v3 incl. K-quants), `uring.h` (async expert loads), `tier.h` (LRU scoring) | Everything that reads bytes from disk |
@@ -84,10 +84,10 @@ by expert-cache warmup.
 moty: GGUF arch → engine_main
  └─ runtime gen loop (rt_gen_loop.h): pick_tok (nn_sample.h) → step()
      └─ engine step(): for each layer
-         ├── conv layers:  nn/nn_conv.h   (fused VNNI region, causal state)
-         ├── attn layers:  nn/nn_attn.h   (fused q/k/v VNNI, QK-norm, RoPE,
+         ├── conv layers:  nn/conv.h      (fused VNNI region, causal state)
+         ├── attn layers:  nn/attn.h      (fused q/k/v VNNI, QK-norm, RoPE,
          │                                  KV store f32/int8, scores+accum)
-         └── MoE:          nn/nn_moe_sigmoid.h
+         └── MoE:          nn/moe.h       (sigmoid/topk variants, expert cache)
                            ├── router gate (sigmoid+bias or softmax top-k)
                            ├── 2 fork/join regions: all gate/up rows, then
                            │   all down rows (x quantized once)
