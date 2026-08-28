@@ -24,3 +24,4 @@ c/tests/build-native/
 stats*.txt
 *.log
 c/nn/*.o
+c/build/

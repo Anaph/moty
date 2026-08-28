@@ -34,6 +34,9 @@ set(ENGDIR ${CMAKE_CURRENT_SOURCE_DIR}/..)
 set(MOTY_TEST_MARCH "" CACHE STRING "march per i sorgenti C dei test (es. native)")
 
 
+# M6: se la suite e' costruita dal padre (c/CMakeLists.txt), riusa i target
+# delle librerie; standalone (cmake -S tests) se li costruisce come prima.
+if(NOT TARGET moty_hw)
 # libmoty-runtime (M4)
 add_library(moty_rt STATIC ../runtime/env.c ../runtime/kvcache.c)
 target_include_directories(moty_rt PRIVATE ${ENGDIR})
@@ -75,6 +78,13 @@ if(OpenMP_C_FOUND)
 endif()
 if(MOTY_TEST_MARCH)
   set_source_files_properties(../hw/hw.c PROPERTIES COMPILE_OPTIONS "-march=${MOTY_TEST_MARCH}")
+endif()
+
+endif()   # NOT TARGET moty_hw (M6 standalone-guard)
+
+# dal padre la lib si chiama moty_nn: alias per i link della suite
+if(TARGET moty_nn AND NOT TARGET moty_core)
+  add_library(moty_core ALIAS moty_nn)
 endif()
 
 function(moty_test name)
