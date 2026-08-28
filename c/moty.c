@@ -50,6 +50,53 @@ static const ModelEntry models[] = {
     {NULL, NULL, NULL},
 };
 
+#ifdef MOTY_PLUGINS
+/* ---- M5: motori out-of-tree come .so ----
+ * Un plugin e' una shared library che esporta:
+ *   const char *moty_plugin_arch(void);   stringa arch GGUF servita
+ *   int          moty_plugin_main(int, char**);
+ * Si caricano con MOTY_PLUGIN=percorso/plugin.so (lista separata da ':'), anche
+ * piu' di uno; l'ultimo che dichiara un arch gia' presente VINCE (override).
+ * Build di riferimento: make plugins/sample.so (oppure -fPIC -shared a mano). */
+#include <dlfcn.h>
+#define MOTY_MAX_PLUGINS 16
+static ModelEntry plugin_entries[MOTY_MAX_PLUGINS];
+static void *plugin_handles[MOTY_MAX_PLUGINS];
+static int n_plugins = 0;
+
+static void plugins_load(void) {
+    const char *list = getenv("MOTY_PLUGIN");
+    if (!list) return;
+    char pathbuf[2048];
+    while (*list && n_plugins < MOTY_MAX_PLUGINS) {
+        const char *sep = strchr(list, ':');
+        size_t len = sep ? (size_t)(sep - list) : strlen(list);
+        if (len == 0 || len >= sizeof pathbuf) { if (sep) list = sep + 1; else break; continue; }
+        memcpy(pathbuf, list, len); pathbuf[len] = 0;
+        void *h = dlopen(pathbuf, RTLD_NOW | RTLD_LOCAL);
+        if (!h) { fprintf(stderr, "[plugin] %s: %s\n", pathbuf, dlerror()); if (sep) list = sep + 1; else break; continue; }
+        const char *(*arch_fn)(void) = (const char *(*)(void))dlsym(h, "moty_plugin_arch");
+        int (*main_fn)(int, char**) = (int (*)(int, char**))dlsym(h, "moty_plugin_main");
+        if (!arch_fn || !main_fn) {
+            fprintf(stderr, "[plugin] %s: servono moty_plugin_arch + moty_plugin_main\n", pathbuf);
+            dlclose(h);
+        } else {
+            plugin_handles[n_plugins] = h;
+            plugin_entries[n_plugins] = (ModelEntry){ arch_fn(), main_fn, "plugin" };
+            n_plugins++;
+            fprintf(stderr, "[plugin] %s: arch '%s'\n", pathbuf, arch_fn());
+        }
+        if (sep) list = sep + 1; else break;
+    }
+}
+static const ModelEntry *plugins_find(const char *arch) {
+    for (int i = 0; i < n_plugins; i++)
+        if (plugin_entries[i].arch && !strcmp(plugin_entries[i].arch, arch))
+            return &plugin_entries[i];
+    return NULL;
+}
+#endif /* MOTY_PLUGINS */
+
 /* Minimal GGUF header reader to extract the architecture string without
  * pulling in the full gguf.h (which would conflict with each model's TU). */
 static const char *detect_arch(const char *path, char *buf, int bufsz) {
@@ -115,6 +162,12 @@ int main(int argc, char **argv) {
         return 1;
     }
     fprintf(stderr, "[moty] %s: arch=%s\n", gguf, arch);
+
+#ifdef MOTY_PLUGINS
+    plugins_load();
+    const ModelEntry *plug = plugins_find(arch);
+    if (plug) return plug->fn(argc, argv);   /* override del registry statico */
+#endif
 
     /* dispatch */
     for (const ModelEntry *m = models; m->arch; m++) {

@@ -167,6 +167,22 @@ libmoty-nn.a: $(NN_CORE_SRCS) $(NN_CORE_DEPS) libmoty-hw.a
 	done
 	ar rcs $@ $(NN_CORE_SRCS:.c=.o)
 
+# ---- M5: motori out-of-tree (opt-in) ----
+# make plugins/sample.so && MOTY_PLUGIN=plugins/sample.so ./moty ...
+# Il dispatcher di moty.c supporta i plugin solo se compilato con
+# -DMOTY_PLUGINS (link -ldl); il default resta statico.
+plugins/%.so: plugins/%.c
+	$(CC) $(CFLAGS) -DMOTY_PLUGINS_INSIDE -fPIC -shared $< -o $@
+plugins: plugins/sample.so
+
+moty-plugins: CFLAGS += -DMOTY_PLUGINS
+moty-plugins: LDFLAGS += -ldl
+moty-plugins: clean-engines libmoty-runtime.a libmoty-nn.a libmoty-hw.a $(ENG_OBJS)
+	$(CC) $(CFLAGS) moty.c $(ENG_OBJS) libmoty-runtime.a libmoty-nn.a libmoty-hw.a -o moty$(EXE) $(LDFLAGS) -ldl
+
+clean-engines:
+	rm -f moty lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o
+
 # ---- libmoty-runtime (M4): env/config + KV alloc, una copia ----
 RT_SRCS = runtime/env.c runtime/kvcache.c
 RT_DEPS = runtime/config.h runtime/kvcache.h
@@ -300,5 +316,6 @@ clean:
 	rm -f libmoty-nn.a libmoty-hw.a hw/hw.o nn/*.o runtime/moecache.o io/tier.o runtime/env.o runtime/kvcache.o moty lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o glm glm.exe olmoe olmoe.exe qwen qwen.exe gemma gemma.exe
 	rm -rf $(TESTS_BUILD)
 	rm -rf $(TESTS_BUILD_NATIVE)
+	rm -f plugins/*.so
 
 .PHONY: all glm olmoe qwen qwenmoe gemma portable portable-v4 portable-sve2 test test-native check clean
