@@ -1,4 +1,7 @@
-# binari compilati (si rigenerano con make)
+# binari e artefatti di build (si rigenerano con make/cmake)
+c/*.a
+c/**/*.o
+c/build/
 c/glm
 c/glm.exe
 c/olmoe
