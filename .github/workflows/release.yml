@@ -88,7 +88,7 @@ jobs:
           if [ "${{ matrix.ext }}" = tar.gz ]; then
             tar -C pkg -czf ${name}.tar.gz ${name}
           else
-            cd pkg && python3 -m zipfile -c ../${name}.zip ${name}   # zip non e' preinstallato
+            (cd pkg && python3 -m zipfile -c ../${name}.zip ${name})  # zip non e' preinstallato; subshell: sha256 resta a root
           fi
           sha256sum ${name}.* > ${name}.sha256
           echo "packaged: $(ls pkg/${name})"
