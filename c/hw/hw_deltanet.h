@@ -21,7 +21,7 @@ void moty_hw_dn_row_decay_acc(float *restrict S, float dec, float ki,
         _mm512_storeu_ps(kv + j, kvv);
     }
 #elif defined(__ARM_NEON)
-    float32x4_t decv = vdupq_n_f32(dec), kiv = vdupq_n_f32(dec);
+    float32x4_t decv = vdupq_n_f32(dec), kiv = vdupq_n_f32(ki);
     for (; j + 4 <= dv; j += 4) {
         float32x4_t sv = vld1q_f32(S + j);
         sv = vmulq_f32(sv, decv);

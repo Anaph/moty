@@ -38,8 +38,11 @@ ExpertSlot *moty_expert_pin(ExpertCache *lc, void *ctx, int layer, int eid,
     int64_t ng = (int64_t)inter*hidden, nd = (int64_t)hidden*inter;
     if (!s->g) { s->g = (int8_t *)malloc(ng>0?ng:1); s->u = (int8_t *)malloc(ng>0?ng:1);
                  s->d = (int8_t *)malloc(nd>0?nd:1); s->gs = falloc(inter); s->us = falloc(inter); s->ds = falloc(hidden);
+#ifdef MOTY_MADVISE
                  if (ng > (1<<18)) { madvise(s->g, ng, MADV_HUGEPAGE); madvise(s->u, ng, MADV_HUGEPAGE); }
-                 if (nd > (1<<18)) { madvise(s->d, nd, MADV_HUGEPAGE); } }
+                 if (nd > (1<<18)) { madvise(s->d, nd, MADV_HUGEPAGE); }
+#endif
+    }
     fn(ctx, layer, eid, s, inter, hidden);    /* engine riempie g/u/d + scale */
     s->eid = eid;
     return s;

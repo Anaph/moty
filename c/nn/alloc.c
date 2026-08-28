@@ -7,7 +7,7 @@ void *moty_grow(void **p, int64_t *cap, int64_t need, size_t esz, const char *wh
     if (need <= *cap) return *p;
     *cap = need;
     *p = realloc(*p, (size_t)need * esz);
-    if (!*p) { fprintf(stderr, "OOM %s (%lld x %zu byte)\n", what, (long long)need, esz); exit(1); }
+    if (!*p) { fprintf(stderr, "OOM %s (%lld x %lu byte)\n", what, (long long)need, (unsigned long)esz); exit(1); }
     return *p;
 }
 void *moty_balloc(int64_t n, const char *what) {

@@ -165,7 +165,7 @@ libmoty-nn.a: $(NN_CORE_SRCS) $(NN_CORE_DEPS) libmoty-hw.a
 		obj=$${src%.c}.o; \
 		$(CC) $(CFLAGS) -c $$src -o $$obj || exit 1; \
 	done
-	ar rcs $@ $(NN_CORE_SRCS:.c=.o)
+	$(AR) rcs $@ $(NN_CORE_SRCS:.c=.o)
 
 # ---- M5: motori out-of-tree (opt-in) ----
 # make plugins/sample.so && MOTY_PLUGIN=plugins/sample.so ./moty ...
@@ -177,6 +177,7 @@ plugins: plugins/sample.so
 
 moty-plugins: CFLAGS += -DMOTY_PLUGINS
 moty-plugins: LDFLAGS += -ldl
+ENG_OBJS = lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o
 moty-plugins: clean-engines libmoty-runtime.a libmoty-nn.a libmoty-hw.a $(ENG_OBJS)
 	$(CC) $(CFLAGS) moty.c $(ENG_OBJS) libmoty-runtime.a libmoty-nn.a libmoty-hw.a -o moty$(EXE) $(LDFLAGS) -ldl
 
@@ -189,7 +190,7 @@ RT_DEPS = runtime/config.h runtime/kvcache.h
 libmoty-runtime.a: $(RT_SRCS) $(RT_DEPS) libmoty-nn.a libmoty-hw.a
 	$(CC) $(CFLAGS) -c runtime/env.c -o runtime/env.o
 	$(CC) $(CFLAGS) -c runtime/kvcache.c -o runtime/kvcache.o
-	ar rcs $@ runtime/env.o runtime/kvcache.o
+	$(AR) rcs $@ runtime/env.o runtime/kvcache.o
 
 HW_SRCS = hw/hw.c
 HW_DEPS = hw/hw.h hw/hw_impl.h hw/hw_avx512.h hw/hw_avx2.h hw/hw_neon.h \
@@ -197,7 +198,7 @@ HW_DEPS = hw/hw.h hw/hw_impl.h hw/hw_avx512.h hw/hw_avx2.h hw/hw_neon.h \
           hw/hw_deltanet.h hw/hw_backend.h
 libmoty-hw.a: $(HW_SRCS) $(HW_DEPS)
 	$(CC) $(CFLAGS) -c $(HW_SRCS) -o hw/hw.o
-	ar rcs $@ hw/hw.o
+	$(AR) rcs $@ hw/hw.o
 
 # ---- source layout (v2): engines/ nn/ hw/ runtime/ io/ tok/ util/ ----
 # LTO (default ON): ri-inline i kernel hw dentro i loop matmul al LINK,
@@ -206,6 +207,11 @@ libmoty-hw.a: $(HW_SRCS) $(HW_DEPS)
 MOTY_LTO ?= 1
 ifeq ($(MOTY_LTO),1)
 LTOFLAGS = -flto=auto
+# con LTO gli archivi vanno creati con l'ar del COMPILER (carica il plugin
+# LTO); il binutils nudo puo' buttare il bytecode -> simboli non risolti.
+AR := $(if $(shell command -v $(CC)-ar 2>/dev/null),$(CC)-ar,ar)
+else
+AR := ar
 endif
 
 # All includes are repo-c-relative ("nn/nn.h", "hw/hw.h", ...), so every

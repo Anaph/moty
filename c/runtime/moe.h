@@ -25,7 +25,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
+#if !defined(_WIN32) && defined(MADV_HUGEPAGE)
+#define MOTY_MADVISE 1
 #include <sys/mman.h>        /* madvise(MADV_HUGEPAGE) per i buffer expert (riduce TLB-miss) */
 #endif
 #include "nn/nn.h"            /* falloc per le scale; matmul_q lo usa il chiamante */

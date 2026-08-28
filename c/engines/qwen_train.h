@@ -121,14 +121,14 @@ typedef struct {
 } LStash;
 
 static void lstash_alloc(LStash *st, const Cfg *c, int S) {
-    int D = c->hidden, H = c->n_heads, KV = c->n_kv_heads, hd = c->head_dim, IN = c->inter;
+    int D = c->hidden, H = c->n_heads, KV = c->n_kv_heads, hd = c->head_dim, inter_mm = c->inter;
     st->x_in  = falloc((int64_t)S * D); st->nrm_a = falloc((int64_t)S * D);
     st->x_mid = falloc((int64_t)S * D); st->nrm_m = falloc((int64_t)S * D);
     st->q_pre = falloc((int64_t)S * H * hd); st->q_rot = falloc((int64_t)S * H * hd);
     st->ctx   = falloc((int64_t)S * H * hd);
     st->k_pre = falloc((int64_t)S * KV * hd);
     st->probs = falloc((int64_t)H * S * S);
-    st->g_pre = falloc((int64_t)S * IN); st->u = falloc((int64_t)S * IN);
+    st->g_pre = falloc((int64_t)S * inter_mm); st->u = falloc((int64_t)S * inter_mm);
     st->r_in = falloc(S); st->r_post = falloc(S);
     st->rq = falloc((int64_t)S * H); st->rk = falloc((int64_t)S * KV);
 }
@@ -198,7 +198,7 @@ static void t_attention(Model *m, Layer *l, int layer, int S, LStash *st, float 
 
 /* forward di UN layer con stash; il residuo x [S,D] viene aggiornato in place */
 static void t_layer_forward(Model *m, Layer *l, int layer, float *x, int S, LStash *st) {
-    Cfg *c = &m->c; int D = c->hidden, IN = c->inter;
+    Cfg *c = &m->c; int D = c->hidden, inter_mm = c->inter;
     memcpy(st->x_in, x, (size_t)S * D * sizeof(float));
     for (int s = 0; s < S; s++)
         t_rmsnorm_row(st->nrm_a + (int64_t)s * D, x + (int64_t)s * D, l->in_ln, D, c->eps, &st->r_in[s]);
@@ -215,8 +215,8 @@ static void t_layer_forward(Model *m, Layer *l, int layer, float *x, int S, LSta
         lora_apply(&l->lo->gate, st->g_pre, st->nrm_m, S, l->gate.I, l->gate.O);
         lora_apply(&l->lo->up,   st->u,     st->nrm_m, S, l->up.I,   l->up.O);
     }
-    float *h = falloc((int64_t)S * IN), *d = falloc((int64_t)S * D);
-    for (int64_t i = 0; i < (int64_t)S * IN; i++) {
+    float *h = falloc((int64_t)S * inter_mm), *d = falloc((int64_t)S * D);
+    for (int64_t i = 0; i < (int64_t)S * inter_mm; i++) {
         float gp = st->g_pre[i];
         h[i] = (gp / (1.f + expf(-gp))) * st->u[i];
     }
@@ -256,18 +256,18 @@ static void train_forward(Model *m, const int *ids, int S, LStash *st, int L0, f
  * dx [S,D] in ingresso = dL/dx_out; in uscita = dL/dx_in. g = gradienti degli
  * adattatori del layer (NULL = niente accumulo, solo propagazione). */
 static void t_layer_backward(Model *m, Layer *l, int layer, int S, LStash *st, LoraLayer *g, float *dx) {
-    Cfg *c = &m->c; int D = c->hidden, IN = c->inter;
+    Cfg *c = &m->c; int D = c->hidden, inter_mm = c->inter;
     int H = c->n_heads, KV = c->n_kv_heads, hd = c->head_dim, G = H / KV;
     int64_t qw = (int64_t)H * hd, kw = (int64_t)KV * hd;
     /* --- mlp: x_out = x_mid + down(silu(g_pre)*u) --- */
-    float *h = falloc((int64_t)S * IN), *dh = falloc((int64_t)S * IN);
-    for (int64_t i = 0; i < (int64_t)S * IN; i++) {
+    float *h = falloc((int64_t)S * inter_mm), *dh = falloc((int64_t)S * inter_mm);
+    for (int64_t i = 0; i < (int64_t)S * inter_mm; i++) {
         float gp = st->g_pre[i];
         h[i] = (gp / (1.f + expf(-gp))) * st->u[i];
     }
     bw_lora_mat(&l->down, l->lo ? &l->lo->down : NULL, g ? &g->down : NULL, h, dx, dh, S);
-    float *du = falloc((int64_t)S * IN), *dg = falloc((int64_t)S * IN);
-    for (int64_t i = 0; i < (int64_t)S * IN; i++) {
+    float *du = falloc((int64_t)S * inter_mm), *dg = falloc((int64_t)S * inter_mm);
+    for (int64_t i = 0; i < (int64_t)S * inter_mm; i++) {
         float gp = st->g_pre[i], sg = 1.f / (1.f + expf(-gp));
         du[i] = dh[i] * gp * sg;                           /* d/du: silu(g) */
         dg[i] = dh[i] * st->u[i] * sg * (1.f + gp * (1.f - sg)); /* silu'(g) */

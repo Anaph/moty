@@ -293,7 +293,9 @@ static void banner(Model *m) {
 }
 
 int main(int argc, char **argv) {
-    mallopt(M_MMAP_THRESHOLD, 8*1024*1024);   /* logits 512KB: niente mmap/munmap per token */
+#ifdef M_MMAP_THRESHOLD                    /* glibc: logits 512KB, niente mmap/munmap per token */
+    mallopt(M_MMAP_THRESHOLD, 8*1024*1024);
+#endif
     g_ebits = getenv("EBITS") ? atoi(getenv("EBITS")) : 4;
     setenv("QBITS", "4", 0);   /* int4 dense grouped: 20.7 tok/s @ 11.6 GB */
     setenv("EBITS", "4", 0);   /* int4 experts via VPDPBUSD */

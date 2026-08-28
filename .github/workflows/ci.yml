@@ -90,12 +90,9 @@ jobs:
       - name: Build plugin-enabled moty + sample plugin
         run: |
           cd c
-          make all >/dev/null
+          make clean
+          make moty-plugins          # -DMOTY_PLUGINS + -ldl, stesse LDFLAGS del tree
           make plugins/sample.so
-          gcc -I. -O2 -march=native -fopenmp -pthread -Wall -DMOTY_PLUGINS moty.c \
-            lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o \
-            libmoty-runtime.a libmoty-nn.a libmoty-hw.a \
-            -o /tmp/moty-plugins -lm -fopenmp -pthread -ldl
       - name: "Smoke: plugin dispatch end-to-end"
         run: |
           python3 - <<'PY'
@@ -105,7 +102,7 @@ jobs:
           buf += struct.pack('<Q', len(kv)) + kv + struct.pack('<I',8) + struct.pack('<Q',6) + b'sample'
           open('/tmp/sample.gguf','wb').write(buf)
           PY
-          MOTY_PLUGIN=c/plugins/sample.so GGUF=/tmp/sample.gguf /tmp/moty-plugins | grep -q "sample plugin"
+          MOTY_PLUGIN=c/plugins/sample.so GGUF=/tmp/sample.gguf c/moty | grep -q "sample plugin"
 
   # Dockerfile must keep building (the slim runtime image).
   docker:

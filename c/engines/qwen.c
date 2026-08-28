@@ -326,7 +326,7 @@ static void lora_load(Model *m) {
         used[tal - LS.t] = 1;
     }
     int nt = 0, rload = 0;
-    int D = m->c.hidden, IN = m->c.inter;
+    int D = m->c.hidden, inter = m->c.inter;
     for (int i = 0; i < m->c.n_layers; i++) {
         Layer *l = &m->L[i];
         LoraLayer tmp; memset(&tmp, 0, sizeof(tmp));
@@ -340,9 +340,9 @@ static void lora_load(Model *m) {
         SLOT(k,    "self_attn.k_proj", D, l->k.O);
         SLOT(v,    "self_attn.v_proj", D, l->v.O);
         SLOT(o,    "self_attn.o_proj", l->o.I, D);
-        SLOT(gate, "mlp.gate_proj", D, IN);
-        SLOT(up,   "mlp.up_proj",   D, IN);
-        SLOT(down, "mlp.down_proj", IN, D);
+        SLOT(gate, "mlp.gate_proj", D, inter);
+        SLOT(up,   "mlp.up_proj",   D, inter);
+        SLOT(down, "mlp.down_proj", inter, D);
         #undef SLOT
         if (got) {
             l->lo = calloc(1, sizeof(LoraLayer));

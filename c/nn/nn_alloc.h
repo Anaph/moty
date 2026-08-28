@@ -14,6 +14,7 @@
 #include <time.h>
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
+#define MOTY_HAVE_RUSAGE 1
 #endif
 
 /* OpenMP: header reale se compilato con -fopenmp, altrimenti stub inline a
@@ -30,10 +31,17 @@ static inline int  omp_get_num_procs(void)    { return 1; }
 
 /* ---------- utility pure (restano inline) ---------- */
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
-#if defined(__APPLE__)
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }
+#ifdef MOTY_HAVE_RUSAGE
+  #if defined(__APPLE__)
+  static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }
+  #else
+  static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
+  #endif
 #else
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
+  /* Windows/niente-rusage: picco RSS via compat (GetProcessMemoryInfo) se
+   * disponibile, altrimenti 0 — e' solo reporting, non funzionale */
+  double moty_compat_rss_gb(void);   /* weak: definita da util/compat.h se usato */
+  static double rss_gb(void) { return 0.0; }
 #endif
 
 typedef struct Scratch { char *raw; int off; char *base; int64_t cap, used; } Scratch;

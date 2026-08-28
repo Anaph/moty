@@ -15,6 +15,22 @@
 #ifndef GGUF_H
 #define GGUF_H
 #include "io/st.h"
+#ifdef __MINGW32__
+#include <string.h>   /* MinGW-msvcrt senza strndup: shim se compat.h non e' ancora incluso */
+#ifndef _UCRT
+#include <stdlib.h>
+#ifndef moty_strndup_shim
+#define moty_strndup_shim
+static inline char *strndup(const char *s, size_t n) {
+    size_t l = strnlen(s, n);
+    char *r = (char *)malloc(l + 1);
+    if (!r) return NULL;
+    memcpy(r, s, l); r[l] = 0;
+    return r;
+}
+#endif
+#endif
+#endif
 
 /* ---- tipi dei valori dei metadati (spec GGUF) ---- */
 enum { GG_U8=0, GG_I8=1, GG_U16=2, GG_I16=3, GG_U32=4, GG_I32=5, GG_F32=6,
@@ -357,7 +373,7 @@ static char *gguf_synth_config(GgufMeta *M) {
     /* head_count_kv puo' essere array per-layer (ibridi LFM2: conv=0, attn=8) */
     snprintf(k, sizeof(k), "%s.attention.head_count_kv", a);
     int64_t KV  = gguf_int_arr_max(M, k, H);
-    int64_t IN  = GKI("feed_forward_length", 0);
+    int64_t inter = GKI("feed_forward_length", 0);
     int64_t ctx = GKI("context_length", 32768);
     int64_t hd  = GKI("attention.key_length", 0);
     double th   = GKF("rope.freq_base", 1000000.0);
@@ -367,7 +383,7 @@ static char *gguf_synth_config(GgufMeta *M) {
     int64_t topk   = GKI("expert_used_count", 0);
     int64_t minter = GKI("expert_feed_forward_length", 0);
     int64_t sinter = GKI("expert_shared_feed_forward_length", 0);
-    if (IN == 0 && minter > 0) IN = minter;   /* MoE: nessun dense-inter, usa moe_inter per cfg_common/CKR */
+    if (inter == 0 && minter > 0) inter = minter;   /* MoE: nessun dense-inter, usa moe_inter per cfg_common/CKR */
     int64_t fai    = GKI("full_attention_interval", 0);
     int64_t convk  = GKI("ssm.conv_kernel", 0);
     int64_t statesz= GKI("ssm.state_size", 0);
@@ -384,7 +400,7 @@ static char *gguf_synth_config(GgufMeta *M) {
         "{\"hidden_size\":%lld,\"num_hidden_layers\":%lld,\"num_attention_heads\":%lld,"
         "\"num_key_value_heads\":%lld,\"intermediate_size\":%lld,\"vocab_size\":%lld,"
         "\"max_position_embeddings\":%lld,\"rope_theta\":%.9g,\"rms_norm_eps\":%.9g",
-        (long long)D, (long long)L, (long long)H, (long long)KV, (long long)IN,
+        (long long)D, (long long)L, (long long)H, (long long)KV, (long long)inter,
         (long long)vocab, (long long)ctx, th, eps);
     if (hd > 0)   n += snprintf(buf+n, 4096-n, ",\"head_dim\":%lld", (long long)hd);
     if (eos >= 0) n += snprintf(buf+n, 4096-n, ",\"eos_token_id\":%lld", (long long)eos);
