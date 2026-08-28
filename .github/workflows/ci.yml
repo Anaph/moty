@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch: {}
   pull_request:
     branches: [dev, main]
   push:
@@ -11,7 +12,7 @@ jobs:
     name: Engine (Linux, CPU)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Cache gtest (FetchContent)
         uses: actions/cache@v4
         with:
@@ -40,7 +41,7 @@ jobs:
     name: ARM SIMD tiers (cross + qemu)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install cross toolchains + qemu-user
         run: |
           sudo apt-get update -qq
@@ -75,7 +76,7 @@ jobs:
     name: CMake (portable + native)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Configure + build (portable tier)
         run: |
           cmake -B c/build -S c
@@ -94,7 +95,7 @@ jobs:
     name: Plugin build (moty -DMOTY_PLUGINS)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build plugin-enabled moty + sample plugin
         run: |
           cd c
@@ -117,6 +118,6 @@ jobs:
     name: Docker image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build test image (runs the gtest suite inside the build)
         run: docker build --target test -t moty-ci-test .
