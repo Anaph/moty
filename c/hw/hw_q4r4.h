@@ -101,6 +101,10 @@ static inline void q4r4_gemv(const uint8_t *w, const uint16_t *d, const int8_t *
     const uint8x16_t m4 = vdupq_n_u8(0x0F);
     for (int g = 0; g < nb; g++) {
         __builtin_prefetch(w + Q4R4_PF, 0, 3);
+        /* the f16 scale stream (8 B/group) is a second sequential stream: one
+         * PRFM per 64 B line of it; measured +23%/+9%/+13% weight GB/s at
+         * 1/2/4 threads on the A53 (bench_a53 "pf w+d") */
+        if ((g & 7) == 0) __builtin_prefetch(d + Q4R4_PF / 2, 0, 3);
         int8x16_t x0 = vld1q_s8(xq), x1 = vld1q_s8(xq + 16); xq += 32;
         uint8x16_t b0 = vld1q_u8(w), b1 = vld1q_u8(w+16), b2 = vld1q_u8(w+32), b3 = vld1q_u8(w+48); w += 64;
         int8x16_t l, h; int16x8_t p0, p1, p2, p3;
