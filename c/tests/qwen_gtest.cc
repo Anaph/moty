@@ -4,6 +4,7 @@
 extern "C" {
 int qt_rope(void);
 int qt_llama_no_qknorm(void);
+int qt_llama_fused_bitexact(void);
 int qt_gqa(void);
 int qt_quant(void);
 int qt_quant_batch(void);
@@ -99,3 +100,4 @@ C_TEST(QwenTta,      LoraZeroBNoop,       qt_tta_lora_off_noop)
 C_TEST(QwenTta,      LoraDirection,       qt_tta_lora_direction)
 C_TEST(QwenTta,      LoraReset,           qt_tta_lora_reset)
 C_TEST(QwenLlama,    NoQkNormVsRef,       qt_llama_no_qknorm)
+C_TEST(QwenLlama,    FusedProjectionsBitExact, qt_llama_fused_bitexact)

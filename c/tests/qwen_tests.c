@@ -1570,3 +1570,56 @@ int qt_llama_no_qknorm(void) {
     free(ref);
     return 0;
 }
+
+/* fused q/k/v and gate/up (qwen_fuse) on a Q4R4 Llama-shaped model
+ * (q-dim 64 != hidden 32, GQA 4:1): bit-identical to the separate path */
+static void qt_write_llama32_dir(const char *dir) {
+    tst_write_text(dir, "config.json",
+        "{\"architectures\":[\"LlamaForCausalLM\"],\"model_type\":\"llama\","
+        "\"hidden_size\":32,\"num_hidden_layers\":2,\"num_attention_heads\":4,"
+        "\"num_key_value_heads\":1,\"head_dim\":16,\"intermediate_size\":64,"
+        "\"vocab_size\":36,\"rope_theta\":5000000,\"rms_norm_eps\":1e-06,"
+        "\"tie_word_embeddings\":false,\"eos_token_id\":1,\"max_position_embeddings\":128}");
+    tst_reset(29);
+    tst_add("model.embed_tokens.weight", "[36,32]", 36*32, 1.0f, 0);
+    tst_add("lm_head.weight", "[36,32]", 36*32, 1.0f, 0);
+    tst_add("model.norm.weight", "[32]", 32, 0, 1);
+    char nm[128];
+    for (int i = 0; i < 2; i++) {
+        #define AT(suffix, shape, numel, sc, ones) \
+            do { snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); tst_add(nm,shape,numel,sc,ones); } while(0)
+        AT("input_layernorm.weight", "[32]", 32, 0, 1);
+        AT("post_attention_layernorm.weight", "[32]", 32, 0, 1);
+        AT("self_attn.q_proj.weight", "[64,32]", 64*32, 0.5f, 0);
+        AT("self_attn.k_proj.weight", "[16,32]", 16*32, 0.5f, 0);
+        AT("self_attn.v_proj.weight", "[16,32]", 16*32, 0.5f, 0);
+        AT("self_attn.o_proj.weight", "[32,64]", 32*64, 0.5f, 0);
+        AT("mlp.gate_proj.weight", "[64,32]", 64*32, 0.5f, 0);
+        AT("mlp.up_proj.weight",   "[64,32]", 64*32, 0.5f, 0);
+        AT("mlp.down_proj.weight", "[32,64]", 32*64, 0.5f, 0);
+        #undef AT
+    }
+    tst_write(dir);
+}
+
+int qt_llama_fused_bitexact(void) {
+    const char *dir = tst_dir("qwen_tiny_llama32");
+    qt_write_llama32_dir(dir);
+    int save = g_q4fmt; g_q4fmt = 1;
+    Model a, b; model_init(&a, dir, 4); model_init(&b, dir, 4);
+    CHECK(a.L[0].q.fmt == WF_Q4R4 && a.L[0].down.fmt == WF_Q4R4);
+    qwen_fuse(&b);
+    CHECK(b.L[0].qkv.q4 != NULL && b.L[0].qkv.O == 64 + 2*16 && b.L[1].gate_up.O == 2*64);
+    static const int ids[7] = {3, 7, 11, 2, 35, 19, 4};
+    kv_alloc(&a, 16); kv_alloc(&b, 16);
+    float *la = step(&a, ids, 3, 0), *lb = step(&b, ids, 3, 0);
+    CHECK(!memcmp(la, lb, 36*sizeof(float)));
+    free(la); free(lb);
+    for (int t = 3; t < 7; t++) {
+        la = step(&a, &ids[t], 1, t); lb = step(&b, &ids[t], 1, t);
+        CHECK(!memcmp(la, lb, 36*sizeof(float)));
+        free(la); free(lb);
+    }
+    g_q4fmt = save;
+    return 0;
+}

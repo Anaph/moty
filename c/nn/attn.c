@@ -85,7 +85,17 @@ void moty_nn_attention(const MotyAttnView *a, const float *x, int S, int pos_bas
         int64_t nk = (int64_t)S*kw;
         int64_t tot = (int64_t)S*qw + 2*nk;
         int gs = a->q->gs, ng = (D+gs-1)/gs, rb = (D+1)/2;
-        if (vnni_all) {
+        if (a->qkv) {                  /* fused rows [q|k|v]: one GEMV, then split per token */
+            float *qkvb = falloc((int64_t)S*(qw + 2*kw));
+            mat_apply(qkvb, x, a->qkv, S);
+            for (int s = 0; s < S; s++) {
+                const float *r = qkvb + (int64_t)s*(qw + 2*kw);
+                memcpy(q + (int64_t)s*qw, r, qw*sizeof(float));
+                memcpy(k + (int64_t)s*kw, r + qw, kw*sizeof(float));
+                memcpy(vv + (int64_t)s*kw, r + qw + kw, kw*sizeof(float));
+            }
+            free(qkvb);
+        } else if (vnni_all) {
             int8_t *axi = scr_take(a->scr, scr_al((int64_t)S*D));
             int32_t *axg = scr_take(a->scr, scr_al((int64_t)S*ng*4));
             float   *asx = scr_take(a->scr, scr_al((int64_t)S*4));

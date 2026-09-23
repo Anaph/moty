@@ -6,6 +6,7 @@
 
 typedef struct MotyFfnView {
     const Mat *gate, *up, *down;   /* [I,D], [I,D], [D,I] */
+    const Mat *gate_up;            /* optional fused [gate|up] [2I,D] (moty_mat_fuse_rows) */
     int inter;                     /* I */
     Scratch *scr;
 } MotyFfnView;

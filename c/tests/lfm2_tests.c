@@ -244,3 +244,23 @@ int lt_kv8_alloc(void) {
     g_kv_bits = save;
     return 0;
 }
+
+/* fused q/k/v and gate/up (lfm2_fuse, Q4R4): bit-identical to the separate
+ * projections — same activation quantization, same per-block kernel */
+int lt_fused_bitexact(void) {
+    const char *dir = tst_dir("lfm2_tiny_hf");
+    lt_write_dir(dir);
+    int save = g_q4fmt; g_q4fmt = 1;
+    Model a, b; model_init(&a, dir, 4); model_init(&b, dir, 4);
+    lfm2_fuse(&b);
+    CHECK(b.L[1].qkv.q4 != NULL && b.L[1].qkv.O == (LH + 2*LKV)*LHD && b.L[0].gate_up.O == 2*LI_EFF);
+    CHECK(a.L[1].qkv.q4 == NULL && b.L[0].qkv.q4 == NULL);      /* conv layer: no qkv */
+    int T = 8;
+    float *la = calloc((size_t)T*LV, sizeof(float)), *lb = calloc((size_t)T*LV, sizeof(float));
+    kv_alloc(&a, 16); kv_alloc(&b, 16);
+    lt_engine_logits(&a, 3, T, la); lt_engine_logits(&b, 3, T, lb);
+    CHECK(!memcmp(la + 2*LV, lb + 2*LV, (size_t)(T-2)*LV*sizeof(float)));
+    g_q4fmt = save;
+    free(la); free(lb);
+    return 0;
+}

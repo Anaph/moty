@@ -26,6 +26,11 @@ typedef void (*MotyMatStreamFn)(float *y, const float *x, const struct Mat *w, i
 void  moty_nn_set_stream_fn(MotyMatStreamFn fn);   /* MEM_GB: hook dello streamer */
 void  moty_mat_apply(float *y, const float *x, const Mat *w, int S);
 void  moty_kv_store_row(int8_t *dst, float *scale_slot, const float *src, int hd);
+/* concatenate the rows of n WF_Q4R4 matrices (same I, O%4==0) into dst: one
+ * GEMV/GEMM, one activation quantization, one parallel region instead of n.
+ * The sources become zero-copy views into dst's buffers. Returns 0 (and
+ * leaves everything untouched) when the formats do not qualify. */
+int   moty_mat_fuse_rows(Mat *dst, Mat *const *src, int n);
 #ifndef MOTY_CORE_NO_LEGACY
 #define mat_apply     moty_mat_apply
 #define kv_store_row  moty_kv_store_row

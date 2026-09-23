@@ -79,6 +79,7 @@ typedef struct {
     float *Sstate;                         /* [lin_hv * lin_dk * lin_dv] persistente */
     /* mlp (comune) */
     Mat gate, up, down;
+    Mat qkv, gate_up;                      /* fused views (Q4R4, resident, no LoRA): qwen_fuse */
     LoraLayer *lo;                         /* adattatori LoRA (NULL = spenti) */
 } Layer;
 
@@ -88,6 +89,7 @@ typedef struct {
 } Model;
 
 #include "nn/nn_deltanet.h"
+#include "nn/ffn.h"
 
 /* --- TTA sperimentale: adattamento lento a runtime (docs/online-learning.md).
  * TTA=cache -> neural cache (senza gradienti); TTA=bias -> bias sui logit con
@@ -97,7 +99,8 @@ static void tta_observe(Model *m, int tok);
 static void lora_load(Model *m);
 #define ENGINE_LOGITS_HOOK(m, lo) tta_adjust((m), (lo))
 #define ENGINE_OBSERVE(m, tok)    tta_observe((m), (tok))
-#define ENGINE_POST_INIT(m)       lora_load(m)
+static void qwen_fuse(Model *m);
+#define ENGINE_POST_INIT(m)       do { lora_load(m); qwen_fuse(m); } while (0)
 #define ENGINE_MICRO 1            /* step() sa girare con embed NULL (gather per riga) */
 
 #include "runtime/runtime.h"
@@ -366,6 +369,18 @@ static void lora_load(Model *m) {
     fprintf(stderr, "\n");
 }
 
+/* q/k/v and gate/up of resident Q4R4 layers -> one matrix each (see
+ * moty_mat_fuse_rows). Layers with LoRA adapters keep separate projections
+ * (the adapters are applied per matrix); gated attention keeps its split. */
+static void qwen_fuse(Model *m) {
+    for (int i = 0; i < m->c.n_layers && i < m->base.n_resident && !g_micro; i++) {
+        Layer *l = &m->L[i];
+        if (l->lo) continue;
+        if (l->type == LT_FULL && !l->gated) { Mat *s3[3] = { &l->q, &l->k, &l->v }; moty_mat_fuse_rows(&l->qkv, s3, 3); }
+        Mat *s2[2] = { &l->gate, &l->up }; moty_mat_fuse_rows(&l->gate_up, s2, 2);
+    }
+}
+
 /* ---------- caricamento config ---------- */
 static void load_cfg(Cfg *c, const char *snap) {
     jval *root; char *buf;
@@ -518,12 +533,24 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         free(qg);
     } else {
         q = falloc(S*qw);
-        mat_apply(q, x, &l->q, S);
+        if (!l->qkv.q4) mat_apply(q, x, &l->q, S);
         if (l->lo) lora_apply(&l->lo->q, q, x, S, l->q.I, l->q.O);
     }
     float *k = falloc(S*kw), *vv = falloc(S*kw);
-    mat_apply(k,  x, &l->k, S);
-    mat_apply(vv, x, &l->v, S);
+    if (l->qkv.q4) {                        /* fused [q|k|v] (qwen_fuse): one GEMV, split per token */
+        float *qkvb = falloc((int64_t)S*(qw + 2*kw));
+        mat_apply(qkvb, x, &l->qkv, S);
+        for (int s = 0; s < S; s++) {
+            const float *r = qkvb + (int64_t)s*(qw + 2*kw);
+            memcpy(q + (int64_t)s*qw, r, qw*sizeof(float));
+            memcpy(k + (int64_t)s*kw, r + qw, kw*sizeof(float));
+            memcpy(vv + (int64_t)s*kw, r + qw + kw, kw*sizeof(float));
+        }
+        free(qkvb);
+    } else {
+        mat_apply(k,  x, &l->k, S);
+        mat_apply(vv, x, &l->v, S);
+    }
     if (l->lo) {
         lora_apply(&l->lo->k, k,  x, S, l->k.I, l->k.O);
         lora_apply(&l->lo->v, vv, x, S, l->v.I, l->v.O);
@@ -607,6 +634,12 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
  * token: ogni riga di peso viene letta una volta sola per l'intero batch */
 static void mlp(Model *m, Layer *l, float *x, int S, float *out) {
     Cfg *c = &m->c; int I = c->inter;
+    if (l->gate_up.q4) {                    /* fused [gate|up] -> shared dense FFN layer */
+        MotyFfnView f = { .gate=&l->gate, .up=&l->up, .down=&l->down, .gate_up=&l->gate_up,
+                          .inter=I, .scr=&m->base.scr };
+        moty_nn_dense_ffn(&f, x, S, out);
+        return;
+    }
     float *g = falloc((int64_t)S*I), *u = falloc((int64_t)S*I);
     OP_T(t0);
     mat_apply(g, x, &l->gate, S);

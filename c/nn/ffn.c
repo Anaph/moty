@@ -16,6 +16,21 @@ static void silu_rows(float *out, const float *g, const float *u, int S, int I, 
 
 void moty_nn_dense_ffn(const MotyFfnView *f, const float *x, int S, float *out) {
     int I = f->inter;
+    if (f->gate_up) {
+        scr_reset(f->scr);
+        scr_reserve(f->scr, scr_al((int64_t)S*2*I*4) + scr_al((int64_t)S*I*4));
+        float *gu = scr_take(f->scr, (int64_t)S*2*I*4), *hb = scr_take(f->scr, (int64_t)S*I*4);
+        OP_T(t0);
+        mat_apply(gu, x, f->gate_up, S);
+        OP_ACC(OP_FFN_GATE_UP, t0);
+        OP_T(t1);
+        silu_rows(hb, gu, gu + I, S, I, 2*(int64_t)I, 2*(int64_t)I);
+        OP_ACC(OP_FFN_SILU, t1);
+        OP_T(t2);
+        mat_apply(out, hb, f->down, S);
+        OP_ACC(OP_FFN_DOWN, t2);
+        return;
+    }
     scr_reset(f->scr);
     scr_reserve(f->scr, 2*scr_al((int64_t)S*I*4));
     float *gb = scr_take(f->scr, (int64_t)S*I*4), *ub = scr_take(f->scr, (int64_t)S*I*4);

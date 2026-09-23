@@ -50,13 +50,16 @@ typedef struct {
     Mat router;
     float *expert_bias;
     Mat gate, up, down;
+    Mat qkv, gate_up;          /* fused views (Q4R4, resident layers): lfm2_fuse */
     ExpertCache *ec;
 } Layer;
 
 typedef struct { MODEL_COMMON_FIELDS; } Model;
 
 static void ldm_layer_load_expert(void *ctx, int layer, int eid, ExpertSlot *s, int inter, int hidden);
+static void lfm2_fuse(Model *m);
 #define ENGINE_POST_INIT(m) do { \
+    lfm2_fuse(m); \
     Cfg *_c = &(m)->c; \
     _Pragma("omp parallel for collapse(2) schedule(dynamic)") \
     for (int _i = 0; _i < _c->n_layers; _i++) \
@@ -195,6 +198,17 @@ static void ldm_layer_load_expert(void *ctx, int layer, int eid, ExpertSlot *s, 
     free(tmp);
 }
 
+/* q/k/v and gate/up of resident Q4R4 layers -> one matrix each (one GEMV,
+ * one activation quantization, one parallel region). Streamed layers
+ * (MEM_GB) and other formats keep the separate path. */
+static void lfm2_fuse(Model *m) {
+    for (int i = 0; i < m->c.n_layers && i < m->base.n_resident && !g_micro; i++) {
+        Layer *l = &m->L[i];
+        if (l->is_full) { Mat *s3[3] = { &l->q, &l->k, &l->v }; moty_mat_fuse_rows(&l->qkv, s3, 3); }
+        if (!l->is_moe) { Mat *s2[2] = { &l->gate, &l->up }; moty_mat_fuse_rows(&l->gate_up, s2, 2); }
+    }
+}
+
 /* ---------- shared layer compute (M3: view → libmoty-nn) ---------- */
 #include "nn/attn.h"
 #include "nn/conv.h"
@@ -204,6 +218,7 @@ static void ldm_layer_load_expert(void *ctx, int layer, int eid, ExpertSlot *s, 
 static void att_run(Model *m, Layer *l, int li, const float *x, int S, int pos_base, float *out) {
     Cfg *c = &m->c;
     MotyAttnView a = { .q=&l->q, .k=&l->k, .v=&l->v, .o=&l->o, .qn=l->qn, .kn=l->kn,
+        .qkv = l->qkv.q4 ? &l->qkv : NULL,
         .n_heads=c->n_heads, .n_kv_heads=c->n_kv_heads, .head_dim=c->head_dim,
         .theta=c->theta, .eps=c->eps, .rot=c->rot,
         .K=m->base.K, .V=m->base.V, .K8=m->base.K8, .V8=m->base.V8,
@@ -219,6 +234,7 @@ static void conv_run(Model *m, Layer *l, const float *x, int S, float *out) {
 }
 static void ffn_run(Model *m, Layer *l, const float *x, int S, float *out) {
     MotyFfnView f = { .gate=&l->gate, .up=&l->up, .down=&l->down,
+        .gate_up = l->gate_up.q4 ? &l->gate_up : NULL,
         .inter=m->c.inter, .scr=&m->base.scr };
     moty_nn_dense_ffn(&f, x, S, out);
 }
