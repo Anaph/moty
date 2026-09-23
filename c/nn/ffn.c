@@ -4,7 +4,9 @@
 #include <string.h>
 
 /* silu(g)*u over S token rows: g/u rows have strides gs/us, out is [S][I].
- * Prefill: tokens split across the team (NEON row kernel per token). */
+ * Prefill: tokens split across the team (NEON row kernel per token). Decode
+ * stays serial: one row is ~35 us on an A53, less than what a parallel
+ * region costs on average when a core is shared with another process. */
 static void silu_rows(float *out, const float *g, const float *u, int S, int I, int64_t gs, int64_t us) {
     #pragma omp parallel for schedule(static) if (S >= 4)
     for (int s = 0; s < S; s++) {

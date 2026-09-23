@@ -80,8 +80,23 @@ void moty_hw_rmsnorm(float *out, const float *x, const float *w, int n, float ep
     for (; i + 4 <= n; i += 4) vst1q_f32(out+i, vmulq_f32(vmulq_n_f32(vld1q_f32(x+i), r), vld1q_f32(w+i)));
     for (; i < n; i++) out[i] = x[i] * r * w[i];
 }
+/* silu(g)*u: four independent vectors per iteration. One exp polynomial is
+ * a chain of six dependent FMLAs; the in-order A53 only overlaps chains that
+ * sit in the same loop body (80 -> 35 us for 4608 elements). Per element the
+ * operations are unchanged, so the result is bit-identical. */
+static inline float32x4_t hw_silu_q(float32x4_t v) {
+    return vdivq_f32(v, vaddq_f32(vdupq_n_f32(1.f), hw_expq(vnegq_f32(v))));
+}
 void moty_hw_silu_mul(float *g, const float *u, int64_t n) {
     int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        float32x4_t v0 = vld1q_f32(g+i), v1 = vld1q_f32(g+i+4), v2 = vld1q_f32(g+i+8), v3 = vld1q_f32(g+i+12);
+        v0 = hw_silu_q(v0); v1 = hw_silu_q(v1); v2 = hw_silu_q(v2); v3 = hw_silu_q(v3);
+        vst1q_f32(g+i,    vmulq_f32(v0, vld1q_f32(u+i)));
+        vst1q_f32(g+i+4,  vmulq_f32(v1, vld1q_f32(u+i+4)));
+        vst1q_f32(g+i+8,  vmulq_f32(v2, vld1q_f32(u+i+8)));
+        vst1q_f32(g+i+12, vmulq_f32(v3, vld1q_f32(u+i+12)));
+    }
     for (; i + 4 <= n; i += 4) {
         float32x4_t v = vld1q_f32(g+i);
         float32x4_t s = vdivq_f32(v, vaddq_f32(vdupq_n_f32(1.f), hw_expq(vnegq_f32(v))));
@@ -95,6 +110,14 @@ void moty_hw_softmax(float *x, int n) {
     float m = vmaxvq_f32(mv); for (; i < n; i++) if (x[i] > m) m = x[i];
     float32x4_t sv = vdupq_n_f32(0), mm = vdupq_n_f32(m);
     i = 0;
+    float32x4_t sv1 = sv, sv2 = sv, sv3 = sv;         /* 4 exp chains per iteration, as in silu */
+    for (; i + 16 <= n; i += 16) {
+        float32x4_t e0 = hw_expq(vsubq_f32(vld1q_f32(x+i), mm)), e1 = hw_expq(vsubq_f32(vld1q_f32(x+i+4), mm));
+        float32x4_t e2 = hw_expq(vsubq_f32(vld1q_f32(x+i+8), mm)), e3 = hw_expq(vsubq_f32(vld1q_f32(x+i+12), mm));
+        vst1q_f32(x+i, e0); vst1q_f32(x+i+4, e1); vst1q_f32(x+i+8, e2); vst1q_f32(x+i+12, e3);
+        sv = vaddq_f32(sv, e0); sv1 = vaddq_f32(sv1, e1); sv2 = vaddq_f32(sv2, e2); sv3 = vaddq_f32(sv3, e3);
+    }
+    sv = vaddq_f32(vaddq_f32(sv, sv1), vaddq_f32(sv2, sv3));
     for (; i + 4 <= n; i += 4) { float32x4_t e = hw_expq(vsubq_f32(vld1q_f32(x+i), mm)); vst1q_f32(x+i, e); sv = vaddq_f32(sv, e); }
     float s = vaddvq_f32(sv); for (; i < n; i++) { x[i] = expf(x[i]-m); s += x[i]; }
     float inv = 1.f / s; i = 0;
