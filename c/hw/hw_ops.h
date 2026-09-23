@@ -47,6 +47,17 @@ void moty_hw_shortconv_step_ref(float *y, const float *b, const float *c, const 
     }
 }
 
+/* attention rows: sc[t] = scale * <q, K[t]> for t < n (rows hd floats apart),
+ * and cx = Σ_t sc[t] * V[t]. The references are the per-row loops over
+ * dot_f32 / axpy that nn/attn_kernels.c used. */
+void moty_hw_attn_scores_ref(float *sc, const float *q, const float *K, int n, int hd, float scale) {
+    for (int t = 0; t < n; t++) sc[t] = moty_hw_dot_f32(q, K + (int64_t)t*hd, hd) * scale;
+}
+void moty_hw_attn_accum_ref(float *cx, const float *sc, const float *V, int n, int hd) {
+    for (int d = 0; d < hd; d++) cx[d] = 0;
+    for (int t = 0; t < n; t++) moty_hw_axpy(cx, sc[t], V + (int64_t)t*hd, hd);
+}
+
 #if defined(__aarch64__) && defined(__ARM_NEON)
 /* exp for f32x4: x = n*ln2 + r, |r| <= ln2/2, 2^n via the exponent field,
  * degree-6 polynomial on r (Taylor-exact coefficients) */
@@ -137,6 +148,44 @@ void moty_hw_add(float *y, const float *x, int64_t n) {
     for (; i + 4 <= n; i += 4) vst1q_f32(y+i, vaddq_f32(vld1q_f32(y+i), vld1q_f32(x+i)));
     for (; i < n; i++) y[i] += x[i];
 }
+/* hd == 64 (LFM2, Qwen3-0.6B, ...): q (scores) or the 64 accumulators
+ * (accum) live in 16 registers for the whole row sweep. The per-row dot_f32
+ * call + horizontal reduction cost ~140 cycles per row, the axpy version
+ * reloaded and stored the accumulators every row (~240 cycles); these run
+ * two rows per iteration. Other hd: the references. */
+void moty_hw_attn_scores(float *sc, const float *q, const float *K, int n, int hd, float scale) {
+    if (hd != 64) { moty_hw_attn_scores_ref(sc, q, K, n, hd, scale); return; }
+    float32x4_t qv[16];
+    _Pragma("GCC unroll 16") for (int i = 0; i < 16; i++) qv[i] = vld1q_f32(q + 4*i);
+    int t = 0;
+    for (; t + 2 <= n; t += 2) {
+        const float *k0 = K + (int64_t)t*64, *k1 = k0 + 64;
+        float32x4_t a0 = vmulq_f32(qv[0], vld1q_f32(k0)), a1 = vmulq_f32(qv[1], vld1q_f32(k0+4));
+        float32x4_t b0 = vmulq_f32(qv[0], vld1q_f32(k1)), b1 = vmulq_f32(qv[1], vld1q_f32(k1+4));
+        _Pragma("GCC unroll 8") for (int i = 2; i < 16; i += 2) {
+            a0 = vfmaq_f32(a0, qv[i], vld1q_f32(k0+4*i)); a1 = vfmaq_f32(a1, qv[i+1], vld1q_f32(k0+4*i+4));
+            b0 = vfmaq_f32(b0, qv[i], vld1q_f32(k1+4*i)); b1 = vfmaq_f32(b1, qv[i+1], vld1q_f32(k1+4*i+4));
+        }
+        sc[t] = vaddvq_f32(vaddq_f32(a0, a1)) * scale;
+        sc[t+1] = vaddvq_f32(vaddq_f32(b0, b1)) * scale;
+    }
+    if (t < n) moty_hw_attn_scores_ref(sc + t, q, K + (int64_t)t*64, n - t, 64, scale);
+}
+void moty_hw_attn_accum(float *cx, const float *sc, const float *V, int n, int hd) {
+    if (hd != 64) { moty_hw_attn_accum_ref(cx, sc, V, n, hd); return; }
+    float32x4_t a[16];
+    _Pragma("GCC unroll 16") for (int i = 0; i < 16; i++) a[i] = vdupq_n_f32(0);
+    int t = 0;
+    for (; t + 2 <= n; t += 2) {
+        const float *v0 = V + (int64_t)t*64, *v1 = v0 + 64; float s0 = sc[t], s1 = sc[t+1];
+        _Pragma("GCC unroll 16") for (int i = 0; i < 16; i++) a[i] = vfmaq_n_f32(a[i], vld1q_f32(v0 + 4*i), s0);
+        _Pragma("GCC unroll 16") for (int i = 0; i < 16; i++) a[i] = vfmaq_n_f32(a[i], vld1q_f32(v1 + 4*i), s1);
+    }
+    for (; t < n; t++) { const float *v0 = V + (int64_t)t*64; float s0 = sc[t];
+        _Pragma("GCC unroll 16") for (int i = 0; i < 16; i++) a[i] = vfmaq_n_f32(a[i], vld1q_f32(v0 + 4*i), s0); }
+    _Pragma("GCC unroll 16") for (int i = 0; i < 16; i++) vst1q_f32(cx + 4*i, a[i]);
+}
+
 void moty_hw_shortconv_step(float *y, const float *b, const float *c, const float *x,
                             const float *w, float *state, int K, int c0, int c1) {
     int ch = c0;
@@ -164,6 +213,12 @@ void moty_hw_add(float *y, const float *x, int64_t n) { moty_hw_add_ref(y, x, n)
 void moty_hw_shortconv_step(float *y, const float *b, const float *c, const float *x,
                             const float *w, float *state, int K, int c0, int c1) {
     moty_hw_shortconv_step_ref(y, b, c, x, w, state, K, c0, c1);
+}
+void moty_hw_attn_scores(float *sc, const float *q, const float *K, int n, int hd, float scale) {
+    moty_hw_attn_scores_ref(sc, q, K, n, hd, scale);
+}
+void moty_hw_attn_accum(float *cx, const float *sc, const float *V, int n, int hd) {
+    moty_hw_attn_accum_ref(cx, sc, V, n, hd);
 }
 #endif
 

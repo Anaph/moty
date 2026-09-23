@@ -108,11 +108,32 @@ int op_rope_table(void) {
     return 0;
 }
 
+/* attention rows: register-resident hd=64 kernels (and the generic hd path)
+ * vs the per-row dot/axpy loops; odd row counts exercise the 2-row tails */
+int op_attn_rows(void) {
+    static const int hds[2] = {64, 48}, ns[3] = {1, 7, 130};
+    for (int a = 0; a < 2; a++) for (int b = 0; b < 3; b++) {
+        int hd = hds[a], n = ns[b];
+        float *K = malloc(sizeof(float)*n*hd), *V = malloc(sizeof(float)*n*hd), q[64], s0[130], s1[130], c0[64], c1[64];
+        for (int i = 0; i < n*hd; i++) { K[i] = op_frnd(); V[i] = op_frnd() * 2.f; }
+        for (int i = 0; i < hd; i++) q[i] = op_frnd() * 3.f;
+        moty_hw_attn_scores(s0, q, K, n, hd, 0.125f); moty_hw_attn_scores_ref(s1, q, K, n, hd, 0.125f);
+        double m = 0; for (int t = 0; t < n; t++) m = fmax(m, fabs(s0[t] - s1[t]));
+        CHECK(m < 1e-5);
+        moty_hw_attn_accum(c0, s1, V, n, hd); moty_hw_attn_accum_ref(c1, s1, V, n, hd);
+        m = 0; for (int d = 0; d < hd; d++) m = fmax(m, fabs(c0[d] - c1[d]));
+        CHECK(m < 1e-4);
+        free(K); free(V);
+    }
+    return 0;
+}
+
 #ifdef OPS_TEST_MAIN
 int main(void) {
     struct { const char *n; int (*f)(void); } T[] = {
         {"rmsnorm", op_rmsnorm}, {"silu_mul", op_silu_mul}, {"softmax", op_softmax},
-        {"axpy_add", op_axpy_add}, {"shortconv", op_shortconv}, {"rope_table", op_rope_table} };
+        {"axpy_add", op_axpy_add}, {"shortconv", op_shortconv}, {"rope_table", op_rope_table},
+        {"attn_rows", op_attn_rows} };
     int bad = 0;
     for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) { int r = T[i].f(); bad |= r; printf("[%s] %s\n", r ? "FAIL" : " OK ", T[i].n); }
     printf("tier: %s\n", HW_IDOT_KERNEL);

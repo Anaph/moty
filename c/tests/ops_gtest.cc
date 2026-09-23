@@ -8,6 +8,7 @@ int op_softmax(void);
 int op_axpy_add(void);
 int op_shortconv(void);
 int op_rope_table(void);
+int op_attn_rows(void);
 }
 
 TEST(HwOps, RmsNorm)     { EXPECT_EQ(op_rmsnorm(), 0); }
@@ -16,3 +17,4 @@ TEST(HwOps, Softmax)     { EXPECT_EQ(op_softmax(), 0); }
 TEST(HwOps, AxpyAdd)     { EXPECT_EQ(op_axpy_add(), 0); }
 TEST(HwOps, ShortConv)   { EXPECT_EQ(op_shortconv(), 0); }
 TEST(HwOps, RopeTable)   { EXPECT_EQ(op_rope_table(), 0); }
+TEST(HwOps, AttnRows)    { EXPECT_EQ(op_attn_rows(), 0); }

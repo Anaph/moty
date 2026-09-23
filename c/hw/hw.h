@@ -96,6 +96,11 @@ void    moty_hw_axpy_ref(float *y, float a, const float *x, int n);
 void    moty_hw_add_ref(float *y, const float *x, int64_t n);
 void    moty_hw_shortconv_step_ref(float *y, const float *b, const float *c, const float *x,
                                    const float *w, float *state, int K, int c0, int c1);
+/* attention rows (n rows hd floats apart): sc[t] = scale*<q,K[t]>, cx = Σ sc[t]*V[t] */
+void    moty_hw_attn_scores(float *sc, const float *q, const float *K, int n, int hd, float scale);
+void    moty_hw_attn_accum(float *cx, const float *sc, const float *V, int n, int hd);
+void    moty_hw_attn_scores_ref(float *sc, const float *q, const float *K, int n, int hd, float scale);
+void    moty_hw_attn_accum_ref(float *cx, const float *sc, const float *V, int n, int hd);
 
 /* Legacy spellings: engines/nn headers keep calling dot_i8i8(...) —
  * rewritten to the exported symbol. Delete when M3/M4 migrate callers
