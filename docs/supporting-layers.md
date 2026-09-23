@@ -24,7 +24,11 @@ Reference examples, in order of increasing complexity:
 2. **Hardware access only through `hw/`.** If the layer needs a new
    primitive (e.g. a new dot variant), add it to `hw/hw.h`'s contract with
    an AVX512 implementation plus a portable fallback in `hw/hw_quant.h`
-   (see `dot_i4g8p` for the pattern). Never let intrinsics leak into `nn/`.
+   (see `dot_i4g8p` for the pattern). A primitive that only has a fast
+   path on one target (the ARMv8.0 Q4R4 kernels, the NEON row ops) ships a
+   `*_ref` scalar reference that doubles as the portable kernel and that
+   the tests compare against (`hw/hw_q4r4.h`, `hw/hw_ops.h`). Never let
+   intrinsics leak into `nn/`.
 3. **Scratch via the Model arena, reserve-before-take.**
 
 ```c
@@ -50,8 +54,8 @@ moty_nn_attention_gated(&a, nrm, S, pos_base, tmp);
    per behavioral fork (gate kind, routing kind).
 5. **Quantization-aware from day one.** Route matmuls through `mat_apply`
    (`nn/nn_mat.h`) so the layer automatically runs f32 / int8 / int4 /
-   grouped-int4 depending on the weights' `Mat.fmt` (`WF_F32/WF_I8/WF_I4/
-   WF_I4G/WF_I2`). If you hand-roll a dot loop (like the fused paths do),
+   grouped-int4 / Q4R4 depending on the weights' `Mat.fmt` (`WF_F32/WF_I8/
+   WF_I4/WF_I4G/WF_I2/WF_Q4R4`). If you hand-roll a dot loop (like the fused paths do),
    provide both the VNNI fast path and a `mat_apply`-equivalent fallback —
    and make the fallback the reference for tests.
 6. **Parallel regions: one per phase, not one per row.** Fork/join
@@ -127,5 +131,7 @@ Register: `moty_test(test_<layer> <layer>_tests.c <layer>_gtest.cc)` in
     (or hw/hw_quant.h portable fallback, guarded by __AVX512VNNI__ etc.)
 [ ] tests: exactness vs dequant reference, edge sizes (non-multiples of
     the vector width), bit-exactness where order-independent
+[ ] aarch64-only kernels: a standalone runner (see -DQ4R4_TEST_MAIN in
+    tests/q4r4_tests.c) run on the target or under qemu (CI arm-simd job)
 [ ] make check (portable) AND make test-native both green
 ```

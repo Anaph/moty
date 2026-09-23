@@ -147,3 +147,138 @@ layers; activation stash ≈ 124 MB per trained layer at S=512 (dominated by
 the H×S×S attention probabilities). Adapter/optimizer state is megabytes.
 Practical guidance: keep `TRAIN_CTX` moderate (256–512), raise
 `TRAIN_CE_CHUNK` if RAM allows, and prefer few high-layers over many.
+
+## 5. Small ARM boards: int4 on Cortex-A53
+
+Target: **Rockchip RV1126B, 4× Cortex-A53 @ 1.6 GHz (ARMv8.0: NEON, no
+dotprod, no fp16 arithmetic), ~1 GB RAM**, static aarch64 binaries
+(`ARCH=armv8-a`). The boards ran their own vision workload during every
+measurement (≈20–25 % CPU plus ISP memory traffic), so absolute numbers
+carry that load; all comparisons below are interleaved runs on the same
+board, and two boards with different background load are reported
+separately (A: heavier, B: lighter). Prompt 66 tokens, 64 generated
+tokens with `IGNORE_EOS=1`, median of 3 interleaved repetitions, peak RSS
+from `ru_maxrss` (`tools/a53/rssrun.c`), load time from the engine banner.
+
+### 5.1 Machine limits (`c/tests/bench_a53.c`)
+
+| | board A | board B |
+|---|---|---|
+| read bandwidth, 4 threads, `PRFM` 1–2 KB ahead (median) | 3.1–3.3 GB/s | 4.3–4.8 GB/s |
+| int8 `SMLAL` peak, 4 threads | 36.7 GMAC/s (7.2 MAC/cycle/core) | — |
+
+Decode is bandwidth-bound (§1): the ceiling is bandwidth ÷ weight bytes
+per token. Prefill is bound by the kernel: per group the GEMM spends ~16
+cycles in `SMLAL` and ~18 in the horizontal reduction and scaling
+(`ADDP`/`SADDLP`/`SCVTF`/`FMLA`); an inline-asm body without register
+spills was bit-identical but slower, so the intrinsics stay.
+
+### 5.2 Throughput
+
+**LFM2.5-350M** (board A, int4 loaded from the bf16 snapshot):
+
+| engine | format | threads | prefill tok/s | decode tok/s | peak RSS | load |
+|---|---|---|---|---|---|---|
+| moty | int8 (`QBITS=8`) | 1 / 2 / 4 | 8.0 / 15.1 / 21.0 | 3.24 / 5.34 / 5.58 | 385 MB | 10–16 s |
+| moty | **int4 Q4R4** (`QBITS=4`) | 1 / 2 / 4 | **11.8 / 23.6 / 34.1** | **6.05 / 10.56 / 10.21** | 300 MB | 13–23 s |
+| llama.cpp | Q4_0 | 1 / 2 / 4 | 5.35 / 10.57 / 16.58 | 3.45 / 6.22 / 6.88 | 242 MB | — |
+
+On board B the same int4 binary from a `SAVE_PACKED` container: 40.6
+prefill / 14.65 decode tok/s at 4 threads, load 3.1–3.7 s.
+
+**MiniCPM5-1B** (board B, int4 from a `SAVE_PACKED` container with
+`EMBED=disk`):
+
+| engine | format | threads | prefill tok/s | decode tok/s | peak RSS | load |
+|---|---|---|---|---|---|---|
+| moty | **int4 Q4R4** | 1 / 2 / 4 | **4.9 / 10.0 / 16.8** | **2.78 / 4.76 / 6.20** | 556 MB | 3.9–4.6 s |
+| moty | int4 Q4R4, packed at load from bf16 | 4 | 18.0 | 6.72 | 555 MB | 23.9 s |
+| llama.cpp | Q4_0 | 1 / 2 / 4 | 2.14 / 4.21 / 7.29 | 1.45 / 2.74 / 4.05 | 686 MB | — |
+
+The int8 path does not fit: its resident peak is 930 MB (measured on
+x86 with `EMBED=disk`) on a ~1 GB board. Run through the `MEM_GB`
+streamer instead it re-reads and re-quantizes bf16 layers from eMMC every
+token (0.05–0.08 tok/s) — int4 is what makes a 1B model usable here.
+With the int8 embedding table resident (`EMBED=ram`) the int4 run peaks
+at 751 MB, too close to the limit on a board that also runs its own
+workload; `EMBED=disk` saves the 200 MB table.
+
+### 5.3 Against the ceilings
+
+| board | model | format | bytes/token | decode ceiling | measured (best) | share |
+|---|---|---|---|---|---|---|
+| A | LFM2.5-350M | moty int4 | 199 MB | 15.6–16.6 | 10.56 | 64–68 % |
+| A | LFM2.5-350M | llama.cpp Q4_0 | 217 MB | 14.3–15.2 | 6.88 | 45–48 % |
+| A | LFM2.5-350M | moty int8 | 354 MB | 8.7–9.3 | 5.58 | 60–64 % |
+| B | LFM2.5-350M | moty int4 | 199 MB | 21.6–24.1 | 14.65 | 61–68 % |
+| B | MiniCPM5-1B | moty int4 | 495 MB | 8.7–9.7 | 6.20 | 64–71 % |
+| B | MiniCPM5-1B | llama.cpp Q4_0 | 660 MB | 6.5–7.3 | 4.05 | 56–62 % |
+
+Prefill reaches 27–32 % of the `SMLAL` peak (LFM2.5 287 M MAC/token ×
+34.1–40.6 tok/s; MiniCPM5 680 M × 16.8). Against llama.cpp at 4 threads:
+prefill ×2.1 (LFM2.5) / ×2.3 (MiniCPM5), decode ×1.5 on both.
+
+### 5.4 What moved the numbers (interleaved A/B on the board)
+
+- **Kernel choice** (`bench_a53 gemv`, 45 MB of int4 weights, cold): the
+  4-row Q4R4 block with 1 KB `PRFM PLDL1KEEP` streamed 2.28 GB/s of
+  weights at 4 threads vs 1.65 for the existing row-major int4 kernel
+  (hot cache: 11.6 vs 7.4 G weights/s).
+- **Row ops in NEON** (`hw/hw_ops.h`) + RoPE table, LFM2.5 prefill
+  ms/token: SiLU·up 7.1 → 2.0 (scalar `expf` was the third-largest item),
+  conv depthwise 1.5 → 0.3, QK-norm + RoPE 1.3 → 0.1, attention core
+  1.3 → 0.5, RMSNorm 1.1 → 0.3.
+- **Fused q/k/v and gate/up** (one GEMV and one parallel region instead of
+  three / two): prefill 31.2 → 33.5, decode 9.3 → 9.6 tok/s.
+- **Prefetching the f16 scale stream** too: decode 9.0 → 10.3 tok/s.
+- **Pre-packed container** (`SAVE_PACKED`): load 23.9 → 4.6 s for
+  MiniCPM5-1B on the board (x86: 13.1 → 1.9 s; LFM2.5 3.5 → 0.5 s),
+  bit-identical output.
+- Tried and rejected: group size 64 (fewer non-MAC instructions per
+  weight, but LFM2.5 KL 0.75 → 1.00), an inline-asm GEMM body (slower),
+  a single interleaved weight+scale stream (no faster than two prefetched
+  streams, needs a format change). OpenMP hot-thread tuning was neutral
+  on this board.
+
+### 5.5 Quality
+
+Teacher-forced over 2047 tokens of mixed text (prose, Python, Russian,
+Markdown; `tools/ref/ppl_text_long.txt`, `PPL=` / `hf_ppl.py`), on x86. Top-1 is agreement of the
+argmax with HF transformers f32 at every position.
+
+| model | path | PPL | top-1 vs f32 |
+|---|---|---|---|
+| LFM2.5-350M | HF f32 | 245.4 | — |
+| LFM2.5-350M | moty int8 (`QBITS=8`) | 230.3 | 83.9 % |
+| LFM2.5-350M | **moty int4 Q4R4** | **343.2** | **61.5 %** |
+| MiniCPM5-1B | HF f32 | 24.45 | — |
+| MiniCPM5-1B | moty int8 | 24.90 | 90.3 % |
+| MiniCPM5-1B | **moty int4 Q4R4** | **30.10** | **71.6 %** |
+
+At f32 both engines match transformers: 32/32 greedy tokens on four
+prompts (English, code, Russian, arithmetic) and max |Δlogit| ≤ 5e-5. The
+board (NEON) and x86 (scalar reference) int4 paths agree: LFM2.5 PPL on
+a 290-token text 175.3 vs 176.6, argmax equal at 281 of 290 positions.
+
+**Be aware of the int4 loss on LFM2.5-350M.** A 350M model loses a lot at
+4 bits: perplexity +40 % and the int4 argmax differs from f32 at almost 4
+positions in 10. This is the weight quantization itself, not the kernels
+or the int8 activations: HF fake-quant of the weights alone with the
+same rule gives PPL 319 / 62.4 % top-1 (`tools/ref/hf_qsim.py`), and the
+no-clip scale rule is already the best of the group-32 rules tried
+(the Q4_0 rule 60.4 %, symmetric amax/7 56.9 %, same fake-quant). The
+llama.cpp Q4_0 file uses the Q4_0 rule, so it should land in the same
+place; its perplexity was not measured here. For LFM2.5-350M prefer int8 where memory allows (it is ~2×
+slower on decode); MiniCPM5-1B tolerates int4 much better. Better int4
+quality would need calibration-based methods (e.g. AWQ/GPTQ-style scale
+search on activations), which this loader does not do.
+
+### 5.6 llama.cpp reference build
+
+llama.cpp at commit 42916d8, models converted with its
+`convert_hf_to_gguf.py` and `llama-quantize Q4_0` (LFM2.5 207 MiB,
+MiniCPM5 629 MiB, 4.9 bits/weight). Built statically for aarch64 with
+`-mcpu=cortex-a53` (no OpenMP, its own thread pool); the binary contains
+no `sdot`/`udot`/`smmla` and no fp16 vector arithmetic, i.e. the same
+instruction class as moty's kernels. Numbers from `llama-bench -p 66 -n 64`
+with `-t 1/2/4`, interleaved with the moty runs.

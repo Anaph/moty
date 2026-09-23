@@ -9,7 +9,8 @@ Standalone engines, one per architecture:
 | Engine | Model family | Notes |
 |---|---|---|
 | `olmoe` | OLMoE | Reference GQA-MoE engine |
-| `qwen` | Qwen3 dense / Qwen3.5 hybrid | GQA + QK-norm; Gated DeltaNet + Gated Attention |
+| `qwen` | Qwen3 dense / Qwen3.5 hybrid / Llama-family dense (e.g. MiniCPM5-1B) | GQA + optional QK-norm; Gated DeltaNet + Gated Attention |
+| `lfm2` | LFM2 / LFM2.5 dense (e.g. LFM2.5-350M) and LFM2-MoE | short-conv + GQA hybrid; HF snapshot or GGUF |
 | `gemma` | Gemma 4 (e.g. 12B-it, text-only) | Sliding/global hybrid, p-RoPE, GeGLU, SP tokenizer |
 
 ## Build
@@ -95,6 +96,18 @@ their startup banner (`idot ... | f32 ...`).
 `make test-native` builds and runs the test suite with `-march=native`, so
 the reference-based tests exercise the SIMD kernels your CPU actually has.
 
+**ARMv8.0 without dotprod (Cortex-A53 class).** On aarch64 `QBITS=4` uses
+the **Q4R4** layout (`Q4FMT=r4`, the default there): 4-row blocks,
+group-32 f16 scales, int8 group-32 activations, NEON GEMV for decode and a
+4×4 register-tiled GEMM for prefill built from `SMULL`/`SMLAL` only (no
+`SDOT`, no fp16 arithmetic). The non-matmul row ops (RMSNorm, SiLU·up,
+softmax, short conv, residual adds) have NEON versions with scalar
+references (`hw/hw_ops.h`). On other targets `QBITS=4` keeps the grouped
+int4 (`Q4FMT=g`, VNNI fused paths on AVX512); `Q4FMT=r4` runs the portable
+scalar Q4R4 kernels, which is how x86 tests them. Details:
+[docs/architecture.md](docs/architecture.md#int4-q4r4-and-the-armv80-neon-kernels),
+numbers: [docs/performance.md](docs/performance.md#5-small-arm-boards-int4-on-cortex-a53).
+
 ## Run
 
 Each engine is driven by environment variables and reads a HuggingFace
@@ -119,8 +132,11 @@ Common environment variables (qwen engine):
 | `TEMP` / `NUCLEUS` / `SEED` | 0.7 / 0.95 | sampling (TEMP=0 → greedy) |
 | `CHAT_TEMPLATE` | 1 | wrap prompt in the model's chat format |
 | `THINK` | 0 | Qwen3 thinking mode (0 pre-closes the think block) |
-| `QBITS` | 0 | 8 → int8-quantize weights **and embeddings** at load (~4× less RAM); 4 → int4 layer weights with group-wise scales (~8× on layers; embeddings and lm_head stay int8 for quality) |
-| `QGROUP` | 32 | int4 scale group size (multiple of 16; 0 → one scale per row). 32 matches the GGUF Q4_0 block |
+| `QBITS` | 0 | 8 → int8-quantize weights **and embeddings** at load (~4× less RAM); 4 → int4 layer weights with group-wise scales (~8× on layers; embeddings stay int8; the lm_head stays int8 except with Q4R4, where a tied head is packed to Q4R4 from the original rows) |
+| `QGROUP` | 32 | int4 scale group size (multiple of 16; 0 → one scale per row). 32 matches the GGUF Q4_0 block. Q4R4 always uses 32 |
+| `Q4FMT` | `r4` on aarch64, else `g` | `QBITS=4` layout: `r4` = Q4R4 (ARMv8.0 NEON kernels, 4.5 bits/weight), `g` = legacy grouped int4 |
+| `EMBED` | `ram` | `disk` → no resident embedding table: the row of each input token is read from the snapshot (bf16/f32, no int8 rounding). With a tied lm_head it requires `QBITS=4 Q4FMT=r4` (the head is packed separately). Saves vocab×hidden bytes — 200 MB on MiniCPM5-1B |
+| `SAVE_PACKED` | — | `<dir>`: load with `QBITS=4 Q4FMT=r4`, write a pre-packed Q4R4 container (`<dir>/model.safetensors` + config/tokenizer files) and exit. Loading `SNAP=<dir>` with `QBITS=4` then skips bf16 reading and packing |
 | `THREADS` | — | cap the OpenMP team; overrides `OMP_NUM_THREADS`; applied before load |
 | `MEM_GB` | — | RAM budget in GiB: layers beyond the budget stream from disk each step |
 | `MEM_FRAC` | — | same budget as a fraction (0..1) of total physical RAM; `MEM_GB` wins |
@@ -130,6 +146,10 @@ Common environment variables (qwen engine):
 | `PREFILL_CHUNK` | 0 | feed the prompt to the model in blocks of ≤N tokens: caps prefill activation peaks (≈1.6 GB at S=4096 on 4B → tens of MB at N=256), **bit-identical** output. Off by default: with `MEM_GB` each block re-reads the streamed layers from disk |
 | `GGUF` | — | single-file GGUF model instead of `SNAP` (qwen): weights, config and tokenizer all come from the file; see below |
 | `REF` | — | ref.json with prompt_ids/full_ids for greedy validation |
+| `REF_LOGITS` | — | with `REF`: write the raw f32 logits of the last prompt position to this file (compare with `tools/ref/cmp_logits.py`) |
+| `PPL` | — | `{"ids":[...]}` JSON: teacher-forced perplexity over the ids (decode path, one token per step) instead of generating |
+| `PPL_OUT` / `PPL_N` | — | with `PPL`: write the per-position argmax ids (for top-1 agreement vs a reference, `tools/ref/cmp_ppl.py`); cap the token count |
+| `IGNORE_EOS` | 0 | 1 → keep generating past end-of-turn tokens (fixed-length benchmark runs) |
 | `TOKENS` | 0 | 1 → dump generated token ids to stderr |
 | `TTA` | off | **experimental** test-time adaptation: `cache` (neural cache), `bias` (online logit bias) or `lora` (online low-rank lm_head adapter); see [docs/online-learning.md](docs/online-learning.md) |
 | `TTA_N` / `TTA_LAMBDA` / `TTA_THETA` / `TTA_LR` | 2048 / 0.1 / 1.0 / 0.1 | cache size, mix weight (capped at 0.5), similarity temperature, bias/lora learning rate (lora defaults to 1e-3) |
@@ -140,6 +160,15 @@ Common environment variables (qwen engine):
 | `TRAIN_LR` / `TRAIN_WD` / `TRAIN_CE_CHUNK` | 1e-4 / 0 / 32 | AdamW learning rate, weight decay, CE chunk size |
 | `LORA_RANK` / `LORA_ALPHA` / `LORA_LAYERS` / `LORA_HEAD` | 8 / 2·rank / 4 / 0 | adapter rank, scale, how many top layers to adapt, train an lm_head adapter too |
 | `LORA_OUT` | lora.safetensors | where the trainer saves the adapters |
+
+Validation and measurement tooling lives in `tools/ref/` (HF transformers
+reference ids, logits, perplexity and fake-quant scripts) and `tools/a53/`
+(bandwidth/kernel benchmark and run-matrix helpers for small ARM boards).
+Building the libraries and an engine with `-DMOTY_PROF` adds a
+per-operation table (`[prof-op]`, ms and ms/token for every phase: norms,
+projections, RoPE, attention, conv, FFN, lm_head, ...) after each prefill
+and each decode turn. The layer timers live in `libmoty-nn`, so rebuild
+everything: `make clean && make lfm2 CFLAGS="-I. -O2 -march=native -fopenmp -pthread -DMOTY_PROF"`.
 
 `TTA` (qwen only, default off — zero cost when unset) adapts predictions to
 the text being generated: the neural cache mixes in a distribution over
@@ -261,6 +290,27 @@ out = model.generate(ids, max_new_tokens=24, do_sample=False, num_beams=1)
 json.dump({"prompt_ids": ids[0].tolist(), "full_ids": out[0].tolist()}, open("ref.json","w"))
 ```
 
+### Small ARM boards (int4 on Cortex-A53)
+
+The end-to-end recipe used for LFM2.5-350M and MiniCPM5-1B on a
+4× Cortex-A53 board (details and numbers in
+[docs/performance.md](docs/performance.md#5-small-arm-boards-int4-on-cortex-a53)):
+
+```bash
+# host: cross-build static binaries for ARMv8.0
+make -C c lfm2 qwen CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar ARCH=armv8-a \
+     LDFLAGS="-lm -fopenmp -pthread -static"
+# host (any arch): pack once into a Q4R4 container (loads ~5x faster on the board)
+SNAP=/models/LFM2.5-350M QBITS=4 Q4FMT=r4 SAVE_PACKED=/models/LFM2.5-350M-q4r4 ./c/lfm2
+# board
+SNAP=LFM2.5-350M-q4r4 QBITS=4 THREADS=4 PROMPT="..." ./lfm2
+SNAP=MiniCPM5-1B-q4r4 QBITS=4 EMBED=disk THREADS=4 PROMPT="..." ./qwen
+```
+
+`EMBED=disk` keeps the 1B model's embedding table out of RAM (it is the
+largest single tensor); peak RSS is then ~560 MB for MiniCPM5-1B and
+~300 MB for LFM2.5-350M.
+
 ### Tokenizer parity (tok_oracle)
 
 The test build also produces `c/tests/build/tok_oracle` — a corpus-scale
@@ -295,6 +345,13 @@ Documentation:
 - [docs/modularization-plan.md](docs/modularization-plan.md) — phased plan:
   paste-in headers → layered libraries (hw/nn/runtime), ops-table engines,
   explicit layer variants, unified build
+- [docs/performance.md](docs/performance.md) — memory-bandwidth model,
+  measured optimizations, int4 on Cortex-A53 (speed, quality, llama.cpp
+  comparison)
+- [tools/ref/README.md](tools/ref/README.md) — HF transformers reference
+  scripts (greedy ids, logits, perplexity, int4 fake-quant)
+- [tools/a53/README.md](tools/a53/README.md) — measurement helpers for
+  small ARM boards
 - [docs/gemma-plan.md](docs/gemma-plan.md) — engine review + the gemma
   improvement plan (bring-up on a real model, shared-attention migration,
   arena, VNNI int4, sliding-window KV)

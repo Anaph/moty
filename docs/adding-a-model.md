@@ -4,8 +4,9 @@ How to support a new architecture end-to-end: GGUF in, tokens out. Budget
 1–3 days for a transformer variant that reuses existing layers; the shared
 kernels and runtime do the heavy lifting.
 
-Worked reference: `engines/lfm2.c` (~280 lines — the smallest complete
-engine) and `engines/qwenmoe.c` (~730 lines — MoE with shared expert).
+Worked reference: `engines/lfm2.c` (~380 lines — the smallest complete
+engine, dense and MoE, GGUF and HF names) and `engines/qwenmoe.c` (~750
+lines — MoE with shared expert).
 Read this alongside `docs/architecture.md` for the layering.
 
 ## 0. What you need before starting
@@ -18,6 +19,29 @@ Read this alongside `docs/architecture.md` for the layering.
   pass ground truth.
 
 ## 1. Choose the integration level
+
+First check whether an existing engine already covers the model with a
+config switch — that is often a few dozen lines, not an engine:
+
+- **LFM2.5 dense (LFM2.5-350M)** went into `lfm2`: a table maps the HF
+  transformers tensor names (`model.layers.N.conv.in_proj.weight`, ...) to
+  the GGUF-style names the engine used (the source is detected once from
+  the final-norm name); the dense config keys (`norm_eps`,
+  `rope_parameters`, `tie_embedding`, `block_auto_adjust_ff_dim`) are read
+  next to the MoE ones.
+- **Llama-family dense (MiniCPM5-1B, arch `llama`)** went into `qwen`:
+  the only structural difference from Qwen3 is the absence of per-head
+  QK-norm, so `q_norm`/`k_norm` became optional (NULL → skipped in
+  `nn/attn.c`) and `moty.c` maps `llama` to `qwen_main`. Check for hidden
+  multipliers (μP-style embedding/residual/logit scales) in the modeling
+  file and in `config.json` — a logit-level comparison (below) exposes
+  them immediately.
+- **Tokenizer quirks** belong in `tok/tok.h`, detected from
+  `tokenizer.json`, never keyed on a model name. Example: MiniCPM5 splits
+  digit runs of ≤3 first (`Split` pre-tokenizer with `\p{N}{1,3}`,
+  `Isolated`), which changes how whitespace next to digits groups; the
+  tokenizer enables `digit_presplit` when it sees that exact sequence. A
+  post-processor that prepends BOS is read the same way.
 
 | Situation | Approach |
 |---|---|
@@ -158,8 +182,33 @@ json.dump({"prompt_ids": ids[0].tolist(), "full_ids": out[0].tolist()},
    `QBITS=0`, `IDOT=0` for exactness).
 3. **Smoke quality** — a couple of greedy completions you can eyeball
    (`The capital of France is` → ` Paris.`).
-4. **Throughput** — ≥384-token generations with `MOTY_NO_OMP_TUNE=1`;
-   short runs are dominated by expert-cache warmup and lie.
+4. **Logits and quality** — greedy ids can match while the logits are off
+   by a missing scale. `tools/ref/` has the scripts: `hf_ref.py` writes
+   reference ids *and* last-position logits (`REF_LOGITS=<file>` makes the
+   engine dump its own; `cmp_logits.py` reports max |Δ| and top-10
+   agreement — expect ~1e-5 at f32), `hf_ppl.py` + `PPL=` / `PPL_OUT=` give
+   teacher-forced perplexity and top-1 agreement for the quantized paths.
+5. **Throughput** — ≥384-token generations with `MOTY_NO_OMP_TUNE=1`;
+   short runs are dominated by expert-cache warmup and lie. For small
+   dense models on ARM boards use `IGNORE_EOS=1` for fixed-length runs and
+   the `-DMOTY_PROF` per-operation table to see where time goes.
+
+### int4 on ARM (Q4R4)
+
+Nothing engine-specific is required: `load_mat_bits` packs every matrix
+listed by `layer_matrefs` into Q4R4 under `QBITS=4` (aarch64 default) and
+`mat_apply` dispatches it, and `SAVE_PACKED` writes whatever
+`layer_matrefs` lists. Two optional steps pay off on in-order cores:
+
+- **Fuse projections** in `ENGINE_POST_INIT`: `moty_mat_fuse_rows`
+  concatenates q/k/v (and gate/up) of a resident Q4R4 layer into one
+  matrix; point the layer's `.qkv` / `.gate_up` view at it and split the
+  output rows (see `lfm2_fuse` / `qwen_fuse` and the attention/FFN
+  `qkv` / `gate_up` view fields). Add a bit-exactness test against the
+  unfused path (`lt_fused_bitexact`).
+- **Use the `hw/hw_ops.h` row ops** (`moty_hw_rmsnorm`, `_silu_mul`,
+  `_add`, ...) instead of scalar loops in `step()`; they are NEON on
+  aarch64 and the original loops elsewhere.
 
 ## 7. Tests
 
@@ -186,5 +235,6 @@ Register in `tests/CMakeLists.txt`: `moty_test(test_<name> <name>_tests.c
 [ ] REF greedy full match (f32)
 [ ] smoke: sensible greedy completions
 [ ] tests/<name>_tests.c registered in CMakeLists; make check green
+[ ] REF_LOGITS max |Δlogit| at f32 ~1e-5; PPL / top-1 of QBITS=8/4
 [ ] perf: ≥384-tok run, no warmup distortion
 ```
