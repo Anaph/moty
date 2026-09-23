@@ -90,8 +90,7 @@ static const char *HFN(char *b, int sz, int i, const char *s) { snprintf(b,sz,"m
 static void load_small(Model *m) {
     Cfg *c = &m->c;
     int D = c->hidden, L = c->n_layers, convK = c->conv_L;
-    int KV = c->n_kv_heads, hd = c->head_dim;
-    int64_t kw = (int64_t)KV*hd;
+    int hd = c->head_dim;
     m->L = calloc(L, sizeof(Layer));
     char nm[128]; int cap = getenv("EXPERT_CACHE") ? atoi(getenv("EXPERT_CACHE")) : 0;
     if (cap < 1) cap = c->n_experts;
@@ -104,30 +103,21 @@ static void load_small(Model *m) {
         c->ltype[i] = l->type;
         l->is_moe = (i >= c->n_dense_layers);
         if (l->is_full) {
-            load_mat(m, &l->q, HFN(nm,sizeof(nm),i,"self_attn.q_proj.weight"), D, D);
-            load_mat(m, &l->k, HFN(nm,sizeof(nm),i,"self_attn.k_proj.weight"), kw, D);
-            load_mat(m, &l->v, HFN(nm,sizeof(nm),i,"self_attn.v_proj.weight"), kw, D);
-            load_mat(m, &l->o, HFN(nm,sizeof(nm),i,"self_attn.o_proj.weight"), D, D);
             l->qn = load_t(m, HFN(nm,sizeof(nm),i,"self_attn.q_norm.weight"), hd);
             l->kn = load_t(m, HFN(nm,sizeof(nm),i,"self_attn.k_norm.weight"), hd);
         } else {
-            load_mat(m, &l->in_proj,  LN(nm,sizeof(nm),i,"shortconv.in_proj.weight"),  3*D, D);
-            load_mat(m, &l->out_proj, LN(nm,sizeof(nm),i,"shortconv.out_proj.weight"), D, D);
             l->conv_w = load_t(m, LN(nm,sizeof(nm),i,"shortconv.conv.weight"), (int64_t)convK*D);
             l->conv_state = falloc((int64_t)(convK-1)*D);
         }
         if (l->is_moe && c->n_experts > 0) {
-            load_mat(m, &l->router, LN(nm,sizeof(nm),i,"ffn_gate_inp.weight"), c->n_experts, D);
             snprintf(nm,sizeof(nm),"blk.%d.exp_probs_b.bias",i);
             if (st_find(&m->S, nm)) l->expert_bias = load_t(m, nm, c->n_experts);
             else { l->expert_bias = falloc(c->n_experts); memset(l->expert_bias, 0, c->n_experts*sizeof(float)); }
             l->ec = (ExpertCache*)malloc(sizeof(ExpertCache));
             expert_cache_init(l->ec, cap, c->n_experts);
-        } else {
-            load_mat(m, &l->gate, HFN(nm,sizeof(nm),i,"mlp.gate_proj.weight"), c->inter, D);
-            load_mat(m, &l->up,   HFN(nm,sizeof(nm),i,"mlp.up_proj.weight"),   c->inter, D);
-            load_mat(m, &l->down, HFN(nm,sizeof(nm),i,"mlp.down_proj.weight"), D, c->inter);
         }
+        /* the layer Mats (q/k/v/o, conv in/out, router, gate/up/down) are loaded by
+         * the runtime from layer_matrefs: loading them here too leaked a full copy */
     }
     m->base.final_norm = load_t(m, "token_embd_norm.weight", D);
 }
@@ -240,7 +230,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
 
 static void kv_alloc(Model *m, int max_t) {
     Cfg *c = &m->c; kv_arrays_alloc(m, max_t);
-    for (int i = 0; i < c->n_layers; i++) if (c->ltype[i] == LT_FULL) kv_layer_alloc(m, i, c->n_kv_heads, max_t, c->head_dim);
+    for (int i = 0; i < c->n_layers; i++) if (c->ltype[i] == LT_FULL) kv_layer_alloc(m, i, c->n_kv_heads, c->head_dim, max_t);
     state_reset(m);
 }
 static void state_reset(Model *m) {

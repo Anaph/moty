@@ -20,7 +20,7 @@ void moty_nn_conv_layer(const MotyConvView *cv, const float *x, int S, float *ou
     int32_t *yqg = scr_take(cv->scr, scr_al((int64_t)S*((D+31)/32)*4));
     float   *ysx = scr_take(cv->scr, scr_al((int64_t)S*4));
     const Mat *wi = cv->in_proj, *wo = cv->out_proj;
-    int gs = wi->gs, ngD = (D+gs-1)/gs;
+    int gs = wi->gs, ngD = gs > 0 ? (D+gs-1)/gs : 0;   /* gs=0 for f32/int8 weights */
     int vnni_in  = (wi->fmt == WF_I4G && gs == 32 && (D & 63) == 0);
     int vnni_out = (wo->fmt == WF_I4G && wo->gs == 32 && (D & 63) == 0);
     { static int conv_new = -1;
