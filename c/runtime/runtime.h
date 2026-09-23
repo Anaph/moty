@@ -152,7 +152,9 @@ static int engine_main(int argc, char **argv) {
     if (prompt) {                                   /* one-shot */
         int bl = templ ? build_turn(buf, 1<<16, prompt)
                        : snprintf(buf, 1<<16, "%s", prompt);
-        int k = tok_encode(&T, buf, bl, hist, maxctx - 2);
+        int k = 0;
+        if (T.bos_id >= 0) hist[k++] = T.bos_id;    /* HF add_special_tokens=True */
+        k += tok_encode(&T, buf, bl, hist + k, maxctx - 2 - k);
         int cur = ngen; if (k + cur + 1 > maxctx) cur = maxctx - k - 1;
         int stopped;
         gen_turn(&m, &T, hist, 0, k, cur, 1, &stopped);
@@ -172,11 +174,15 @@ static int engine_main(int argc, char **argv) {
         if (!nr) continue;
         int bl = templ ? build_turn(buf, 1<<16, line)
                        : snprintf(buf, 1<<16, "%s", line);
-        int k = tok_encode(&T, buf, bl, hist + len, maxctx - len - 2);
+        int k = 0;
+        if (len == 0 && T.bos_id >= 0) hist[k++] = T.bos_id;   /* BOS once per conversation */
+        k += tok_encode(&T, buf, bl, hist + len + k, maxctx - len - 2 - k);
         if (len + k + 8 >= maxctx) {                /* contesto pieno: reset conversazione */
             fprintf(stderr, "[" ENGINE_TAG "] contesto pieno, reset della conversazione\n");
             len = 0; m.base.kv_len = 0; state_reset(&m);  /* lo stato ricorrente non e' troncabile */
-            k = tok_encode(&T, buf, bl, hist, maxctx - 2);
+            k = 0;
+            if (T.bos_id >= 0) hist[k++] = T.bos_id;
+            k += tok_encode(&T, buf, bl, hist + k, maxctx - 2 - k);
         }
         int cur = ngen; if (len + k + cur + 1 > maxctx) cur = maxctx - len - k - 1;
         int stopped;

@@ -254,6 +254,43 @@ static int tok_run_fixture(const char *name, const char *body) {
 int ht_tok_pairs(void)   { return tok_run_fixture("pairs",   TOK_FIX_PAIRS); }
 int ht_tok_strings(void) { return tok_run_fixture("strings", TOK_FIX_STRINGS); }
 
+/* MiniCPM5-style pre_tokenizer: Split(\p{N}{1,3}, Isolated) BEFORE the
+ * cl100k regex -> whitespace next to a digit is cut off from it ("x  5" ->
+ * "x","  ","5"); without it cl100k gives "x"," "," ","5". The TemplateProcessing
+ * post-processor's leading special token is the BOS (HF add_special_tokens). */
+static const char *TOK_FIX_DIGITS =
+  "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"x\":0,\"5\":1,\"\\u0120\":2,\"\\u0120\\u0120\":3,\"55\":5,\"555\":6},"
+  "\"merges\":[\"\\u0120 \\u0120\",\"5 5\",\"55 5\"]},"
+  "\"pre_tokenizer\":{\"type\":\"Sequence\",\"pretokenizers\":["
+  "{\"type\":\"Split\",\"pattern\":{\"Regex\":\"\\\\p{N}{1,3}\"},\"behavior\":\"Isolated\",\"invert\":false},"
+  "{\"type\":\"ByteLevel\",\"add_prefix_space\":false}]},"
+  "\"post_processor\":{\"type\":\"TemplateProcessing\",\"single\":[{\"SpecialToken\":{\"id\":\"<s>\",\"type_id\":0}},"
+  "{\"Sequence\":{\"id\":\"A\",\"type_id\":0}}]},"
+  "\"added_tokens\":[{\"id\":4,\"content\":\"<s>\"}]}";
+static const char *TOK_FIX_NODIGITS =
+  "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"x\":0,\"5\":1,\"\\u0120\":2,\"\\u0120\\u0120\":3,\"55\":5,\"555\":6},"
+  "\"merges\":[\"\\u0120 \\u0120\",\"5 5\",\"55 5\"]},"
+  "\"added_tokens\":[{\"id\":4,\"content\":\"<s>\"}]}";
+
+int ht_tok_digit_presplit(void) {
+    char path[512]; int ids[16], n;
+    CHECK(tok_write_tmp("digits", TOK_FIX_DIGITS, path, sizeof(path)) == 0);
+    Tok T; tok_load(&T, path);
+    CHECK(T.digit_presplit == 1 && T.bos_id == 4);
+    n = tok_encode(&T, "x  5", 4, ids, 16);
+    CHECK(n == 3 && ids[0] == 0 && ids[1] == 3 && ids[2] == 1);
+    n = tok_encode(&T, "5555", 4, ids, 16);         /* groups of <=3 digits */
+    CHECK(n == 2 && ids[0] == 6 && ids[1] == 1);
+    remove(path);
+    CHECK(tok_write_tmp("nodigits", TOK_FIX_NODIGITS, path, sizeof(path)) == 0);
+    Tok U; tok_load(&U, path);
+    CHECK(U.digit_presplit == 0 && U.bos_id == -1);
+    n = tok_encode(&U, "x  5", 4, ids, 16);
+    CHECK(n == 4 && ids[0] == 0 && ids[1] == 2 && ids[2] == 2 && ids[3] == 1);
+    remove(path);
+    return 0;
+}
+
 /* tokenizer dai metadati GGUF == tokenizer.json equivalente (stessi id) */
 int ht_tok_gguf(void) {
     char gpath[512]; ht_gguf_tmp("tok", gpath, sizeof(gpath));

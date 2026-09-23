@@ -15,6 +15,7 @@ int ht_tok_arena(void);
 int ht_tok_gguf(void);
 int ht_tok_sp(void);
 int ht_tok_sp_detect(void);
+int ht_tok_digit_presplit(void);
 int ht_tier(void);
 int ht_grammar(void);
 int ht_schema_gbnf(void);
@@ -38,6 +39,7 @@ C_TEST(Tok,         StringPool,     ht_tok_arena)
 C_TEST(Tok,         FromGguf,       ht_tok_gguf)
 C_TEST(Tok,         SentencePiece,  ht_tok_sp)
 C_TEST(Tok,         SpDetection,    ht_tok_sp_detect)
+C_TEST(Tok,         DigitPresplitBos, ht_tok_digit_presplit)
 C_TEST(Tier,        SwapDecayLfru,  ht_tier)
 C_TEST(Grammar,     Pda,            ht_grammar)
 C_TEST(SchemaGbnf,  Compile,        ht_schema_gbnf)

@@ -50,6 +50,15 @@ typedef struct {
      * Rilevata da model.byte_fallback==true nel tokenizer.json. */
     int mode;                 /* 0 = byte-level (GPT-2/cl100k), 1 = sentencepiece */
     int add_dummy_prefix;     /* normalizer Prepend "▁": prefissa il testo */
+    /* pre_tokenizer Sequence[Split(\p{N}{1,3}, Isolated), Split(regex), ...]
+     * (MiniCPM5): digit groups of <=3 are cut out BEFORE the main regex runs,
+     * so whitespace next to a digit never sees it (e.g. "x  5" -> "  ","5",
+     * while cl100k alone gives " "," ","5"). Detected from tokenizer.json. */
+    int digit_presplit;
+    /* post_processor TemplateProcessing "single" starting with a special
+     * token (LFM2 <|startoftext|>, MiniCPM5 <s>): HF prepends it when
+     * add_special_tokens=True. -1 = none (Qwen: ByteLevel only). */
+    int bos_id;
     int byte_tok[256];        /* id di "<0xXX>" oppure -1 */
     int16_t *id2byte;         /* [n_ids] inverso di byte_tok (-1 = non byte-token) */
     /* pool di stringhe: UNA malloc per tutte le chiavi vocab/merges e i
@@ -116,6 +125,7 @@ static void tk_byte_tables(Tok *T){
     }
 }
 
+static int tok_id_of(Tok *T, const char *content);
 static void tok_load(Tok *T, const char *path){
     memset(T,0,sizeof(*T));
     tk_build_bytemap(T);
@@ -144,6 +154,17 @@ static void tok_load(Tok *T, const char *path){
             }
     }
     if(T->mode) fprintf(stderr,"[tok] modalita' sentencepiece (byte_fallback), dummy_prefix=%d\n",T->add_dummy_prefix);
+    T->digit_presplit = 0;
+    jval *pre=json_get(root,"pre_tokenizer");
+    jval *pseq = pre && pre->t==J_OBJ ? json_get(pre,"pretokenizers") : NULL;
+    if(pseq && pseq->t==J_ARR && pseq->len > 1){
+        jval *p0=pseq->kids[0], *ty=json_get(p0,"type"), *pat=json_get(p0,"pattern");
+        jval *rx = pat && pat->t==J_OBJ ? json_get(pat,"Regex") : NULL;
+        jval *bh=json_get(p0,"behavior");
+        if(ty && ty->t==J_STR && !strcmp(ty->str,"Split") && rx && rx->t==J_STR &&
+           !strcmp(rx->str,"\\p{N}{1,3}") && bh && bh->t==J_STR && !strcmp(bh->str,"Isolated"))
+            T->digit_presplit = 1;
+    }
 
     /* id massimo per dimensionare id2str */
     int maxid=0;
@@ -212,6 +233,22 @@ static void tok_load(Tok *T, const char *path){
             T->id2str[id]=content; T->id_added[id]=1;
         }
         qsort(T->sp,T->nsp,sizeof(Special),cmp_sp_len);   /* match piu' lungo per primo */
+    T->bos_id = -1;
+    jval *pp=json_get(root,"post_processor");
+    if(pp && pp->t==J_OBJ){
+        jval *tp=NULL, *pty=json_get(pp,"type");
+        if(pty && pty->t==J_STR && !strcmp(pty->str,"TemplateProcessing")) tp=pp;
+        jval *procs=json_get(pp,"processors");
+        if(!tp && procs && procs->t==J_ARR)
+            for(int i=0;i<procs->len;i++){
+                jval *ty=json_get(procs->kids[i],"type");
+                if(ty && ty->t==J_STR && !strcmp(ty->str,"TemplateProcessing")) tp=procs->kids[i];
+            }
+        jval *single = tp ? json_get(tp,"single") : NULL;
+        jval *st0 = single && single->t==J_ARR && single->len>0 ? json_get(single->kids[0],"SpecialToken") : NULL;
+        jval *sid = st0 ? json_get(st0,"id") : NULL;
+        if(sid && sid->t==J_STR) T->bos_id = tok_id_of(T, sid->str);
+    }
     }
     tk_byte_tables(T);      /* <0xXX> (solo modalita' sp; -1 se il vocab non li ha) */
     /* tutte le stringhe vive stanno nel pool: il parse JSON (~450k malloc su
@@ -233,6 +270,9 @@ static void tok_free(Tok *T){
  * In GGUF l'id di un token E' il suo indice nell'array tokens. */
 static void tok_load_gguf(Tok *T, GgufMeta *M) {
     memset(T, 0, sizeof(*T));
+    /* llama.cpp convention: add_bos_token (bool) + bos_token_id */
+    T->bos_id = gguf_int(M, "tokenizer.ggml.add_bos_token", 0)
+              ? (int)gguf_int(M, "tokenizer.ggml.bos_token_id", -1) : -1;
     tk_build_bytemap(T);
     int64_t ml; const char *mdl = gguf_str(M, "tokenizer.ggml.model", &ml);
     if (!mdl || ml != 4 || memcmp(mdl, "gpt2", 4)) {
@@ -419,6 +459,25 @@ static void pretok_chunk(Tok *T, const unsigned char *p, int a, int b, int *out,
     free(cp); free(off);
 }
 
+/* digit_presplit: cut [a,b) into maximal runs of <=3 \p{N} codepoints and
+ * the non-digit text between them; each segment goes through the main regex
+ * on its own (tokenizers applies a Sequence of Splits segment by segment). */
+static void pretok_digit_segments(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
+    int seg=a, i=a, nd=0;
+    while(i<b){
+        uint32_t c; int k=u8_next(p,b,i,&c);
+        if(is_N(c)){
+            if(nd==0 && i>seg){ pretok_chunk(T,p,seg,i,out,no,max); seg=i; }
+            nd++; i+=k;
+            if(nd==3){ pretok_chunk(T,p,seg,i,out,no,max); seg=i; nd=0; }
+        } else {
+            if(nd>0){ pretok_chunk(T,p,seg,i,out,no,max); seg=i; nd=0; }
+            i+=k;
+        }
+    }
+    if(b>seg) pretok_chunk(T,p,seg,b,out,no,max);
+}
+
 /* ---------- encode: testo -> id (split sugli added token, poi pretok+BPE) ---------- */
 static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
     const unsigned char *p=(const unsigned char*)text; int no=0; int i=0;
@@ -434,6 +493,7 @@ static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
         int chunk_end = (hitpos<0) ? len : hitpos;
         if(chunk_end>i){
             if(T->mode==1) sp_piece(T,p,i,chunk_end,i==0,out,&no,max);
+            else if(T->digit_presplit) pretok_digit_segments(T,p,i,chunk_end,out,&no,max);
             else pretok_chunk(T,p,i,chunk_end,out,&no,max);
         }
         if(hitpos<0) break;
