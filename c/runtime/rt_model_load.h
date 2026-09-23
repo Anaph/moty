@@ -28,10 +28,43 @@ static void load_mat_q4_0(Model *m, Mat *w, const char *name, int O, int I) {
     w->gs = 32; w->fmt = WF_I4G;
 }
 
+/* QBITS=4 + Q4FMT=r4: rows read from disk in ~4 MB chunks (never the whole
+ * f32 matrix — the lm_head of a 130k-vocab model would be 800 MB) and
+ * packed into Q4R4 4-row blocks in parallel (nn/quant.c, hw/hw_q4r4.h). */
+static void load_mat_q4r4(Model *m, Mat *w, const char *name, int O, int I) {
+    st_expect(&m->S, name, (int64_t)O*I);
+    int nb = I / 32, O4 = (O + 3) / 4;
+    w->q4 = balloc((int64_t)O4*nb*64, name);
+    w->s16 = balloc((int64_t)O4*nb*4*sizeof(uint16_t), name);
+    int rows = (int)(((4 << 20) / ((int64_t)I*4)) & ~3); if (rows < 4) rows = 4;
+    float *chunk = falloc((int64_t)rows*I);
+    for (int o0 = 0; o0 < O; o0 += rows) {
+        int rr = O - o0 < rows ? O - o0 : rows;
+        st_read_slice_f32(&m->S, name, (int64_t)o0*I, (int64_t)rr*I, chunk, 0);
+        #pragma omp parallel for schedule(static)
+        for (int b = 0; b < (rr + 3) / 4; b++) {
+            int nr = rr - b*4 < 4 ? rr - b*4 : 4, ob = o0/4 + b;
+            moty_pack_q4r4_block(chunk + (int64_t)b*4*I, nr, I, w->q4 + (int64_t)ob*nb*64, w->s16 + (int64_t)ob*nb*4);
+        }
+    }
+    free(chunk);
+    w->O = O; w->I = I; w->fmt = WF_Q4R4;
+}
+
+static void quantize_from_disk(Model *m, const char *name, int8_t *q, float *qs, int64_t N, int I, int rows);
+
 static void load_mat_bits(Model *m, Mat *w, const char *name, int O, int I, int bits) {
     mat_reset_storage(w);            /* fmt = WF_F32 di default */
     mat_reset_storage(w);
     w->O = O; w->I = I;
+    if (bits == 4 && g_q4fmt && I % 32 == 0) { load_mat_q4r4(m, w, name, O, I); return; }
+    if (bits == 8) {             /* row chunks: bit-identical to quantize_rows on the whole matrix */
+        st_expect(&m->S, name, (int64_t)O*I);
+        w->q = balloc((int64_t)O*I, name); w->qs = falloc(O);
+        quantize_from_disk(m, name, w->q, w->qs, O, I, 0);
+        w->fmt = WF_I8;
+        return;
+    }
     if (bits == 4 && g_qgroup == 32 && I % 32 == 0 && st_dtype(&m->S, name) == ST_Q4_0) {
         load_mat_q4_0(m, w, name, O, I);
         return;
@@ -293,12 +326,24 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
     /* QBITS!=0 copre anche l'embed, ma SEMPRE a int8 (anche con QBITS=4):
      * l'lm_head e' il GEMV piu' sensibile alla quantizzazione e l'int4 li'
      * risparmierebbe poco rispetto alle matrici dei layer */
-    if (m->base.qbits > 0 || getenv("EMBED_Q8")) load_embed_q8(m);  /* qbits=-1 (native): f32 embed */
+    /* EMBED=disk: no resident table, embed_row gathers the row from the file
+     * (the micro-RSS branch). Only valid when nothing else reads the table:
+     * a tied lm_head must then be packed separately (QBITS=4 Q4R4). */
+    int head_q4r4 = m->base.lm_tied && m->base.qbits == 4 && g_q4fmt && D % 32 == 0;
+    if (g_embed_disk && m->base.lm_tied && !head_q4r4) {
+        fprintf(stderr, "[" ENGINE_TAG "] EMBED=disk con lm_head legato richiede QBITS=4 Q4FMT=r4\n"); exit(1);
+    }
+    if (g_embed_disk) st_expect(&m->S, "model.embed_tokens.weight", (int64_t)c->vocab*D);
+    else if (m->base.qbits > 0 || getenv("EMBED_Q8")) load_embed_q8(m);  /* qbits=-1 (native): f32 embed */
     else m->base.embed = load_t(m, "model.embed_tokens.weight", (int64_t)c->vocab*D);
     if (m->base.lm_tied) {
         mat_reset_storage(&m->base.lm_head);
         m->base.lm_head.O = c->vocab; m->base.lm_head.I = D;
-        if (m->base.qbits == 4 && m->base.embed_q && D <= 2048) {
+        if (head_q4r4) {
+            /* tied head in Q4R4 packed from the original rows (not from the
+             * int8 table: no double quantization) */
+            load_mat_q4r4(m, &m->base.lm_head, "model.embed_tokens.weight", c->vocab, D);
+        } else if (m->base.qbits == 4 && m->base.embed_q && D <= 2048) {
             /* lm_head separato in INT4: il GEMV del logit e' ~43% del traffico
              * per-token in decode (262MB→131). Lookup embed resta int8. */
             int64_t V = c->vocab, rb = (D+1)/2;

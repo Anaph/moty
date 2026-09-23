@@ -50,7 +50,7 @@
  *  The tier strings below must be compiled with the SAME       *
  *  -march as hw.c (both come from the same CFLAGS).            *
  * ============================================================ */
-enum { WF_F32=0, WF_I8=1, WF_I4=2, WF_I2=3, WF_I4G=4, WF_Q4K=5, WF_Q6K=6 };
+enum { WF_F32=0, WF_I8=1, WF_I4=2, WF_I2=3, WF_I4G=4, WF_Q4K=5, WF_Q6K=6, WF_Q4R4=7 };
 
 #include <stdint.h>
 #include <math.h>
@@ -70,6 +70,17 @@ void    moty_hw_dn_row_decay_acc(float *restrict S, float dec, float ki,
 void    moty_hw_dn_row_update_dot(float *restrict S, float ki,
                                   const float *restrict delta, float qi,
                                   float *restrict oh, int dv);
+/* int4 Q4R4 (hw/hw_q4r4.h): 4-row blocks, groups of 32, f16 scales;
+ * activations int8 per group of 32 (+ f32 scale, int32 group sum).
+ * gemm: one 4-row block x ns tokens -> y[t*ys + r]; ns=1 is the decode GEMV. */
+void    moty_hw_quant_g32(const float *x, int I, int8_t *xq, float *xs, int32_t *xsum);
+void    moty_hw_q4r4_gemm(const uint8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
+                          const int32_t *xsum, int nb, int ns, float *y, int ys);
+/* scalar references of the two above (always compiled: tests compare) */
+void    moty_hw_quant_g32_ref(const float *x, int I, int8_t *xq, float *xs, int32_t *xsum);
+void    moty_hw_q4r4_gemm_ref(const uint8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
+                              const int32_t *xsum, int nb, int ns, float *y, int ys);
+float   moty_hw_f16_to_f32(uint16_t h);
 
 /* Legacy spellings: engines/nn headers keep calling dot_i8i8(...) —
  * rewritten to the exported symbol. Delete when M3/M4 migrate callers

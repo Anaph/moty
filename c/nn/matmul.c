@@ -309,3 +309,40 @@ void moty_matmul_q6k_native(float *y, const float *x, const uint8_t *raw,
     }
 }
 
+
+/* Q4R4 (hw/hw_q4r4.h). Activations quantized per group of 32 once per call.
+ * S=1 (decode): 4-row blocks split dynamically across the team (a core busy
+ * with another process does not stall a static partition).
+ * S>1 (prefill): tiles of Q4R4_TT tokens (their int8 activations stay in L2);
+ * inside a tile every block is unpacked once per 4 tokens by the GEMM kernel.
+ * Serial calling contract (static scratch), like matmul_q_s. */
+#define Q4R4_TT 32
+void moty_matmul_q4r4_s(float *y, const float *x, const uint8_t *q4, const uint16_t *s16,
+                        int S, int I, int O) {
+    static int8_t *xq = NULL; static float *xs = NULL; static int32_t *xsum = NULL;
+    static int64_t c1 = 0, c2 = 0, c3 = 0;
+    int nb = I / 32, O4 = (O + 3) / 4, full = O / 4;
+    grow((void **)&xq, &c1, (int64_t)S*I, 1, "q4r4 xq");
+    grow((void **)&xs, &c2, (int64_t)S*nb, sizeof(float), "q4r4 xs");
+    grow((void **)&xsum, &c3, (int64_t)S*nb, sizeof(int32_t), "q4r4 xsum");
+    if (S >= 8) {
+        #pragma omp parallel for schedule(static)
+        for (int s = 0; s < S; s++) moty_hw_quant_g32(x + (int64_t)s*I, I, xq + (int64_t)s*I, xs + (int64_t)s*nb, xsum + (int64_t)s*nb);
+    } else
+        for (int s = 0; s < S; s++) moty_hw_quant_g32(x + (int64_t)s*I, I, xq + (int64_t)s*I, xs + (int64_t)s*nb, xsum + (int64_t)s*nb);
+    size_t bw = (size_t)nb * 64, bd = (size_t)nb * 4;
+    for (int t0 = 0; t0 < S; t0 += Q4R4_TT) {
+        int ns = S - t0 < Q4R4_TT ? S - t0 : Q4R4_TT;
+        const int8_t *xq_t = xq + (int64_t)t0*I;
+        const float *xs_t = xs + (int64_t)t0*nb; const int32_t *xm_t = xsum + (int64_t)t0*nb;
+        float *y_t = y + (int64_t)t0*O;
+        #pragma omp parallel for schedule(dynamic, 8)
+        for (int ob = 0; ob < full; ob++)
+            moty_hw_q4r4_gemm(q4 + ob*bw, s16 + ob*bd, xq_t, xs_t, xm_t, nb, ns, y_t + ob*4, O);
+        if (full < O4) {                              /* ragged last block: rows O%4 */
+            float tmp[4 * Q4R4_TT];
+            moty_hw_q4r4_gemm(q4 + full*bw, s16 + full*bd, xq_t, xs_t, xm_t, nb, ns, tmp, 4);
+            for (int t = 0; t < ns; t++) for (int r = 0; r < O - full*4; r++) y_t[(int64_t)t*O + full*4 + r] = tmp[t*4 + r];
+        }
+    }
+}

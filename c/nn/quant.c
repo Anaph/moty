@@ -1,6 +1,8 @@
 /* quant.c — unica implementazione della quantizzazione (M2, libmoty-nn).
  * Firme moty_*; nn/nn_quant.h dichiara i prototipi + le macro legacy. */
 #include "nn/nn_quant.h"
+#include <string.h>
+#include "hw/hw.h"
 
 void moty_quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, int bits) {
     int qmax = (1 << (bits - 1)) - 1;
@@ -77,4 +79,54 @@ void moty_pack_int2(const float *w, uint8_t *q2, float *scale, int O, int I, int
             qr[i>>2] = byte;
         }
     }
+}
+
+/* f32 -> IEEE half, round to nearest even (normal, subnormal, inf/nan) */
+uint16_t moty_f32_to_f16(float f) {
+    uint32_t x; memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000, e = (x >> 23) & 0xff, m = x & 0x7fffff;
+    if (e == 0xff) return (uint16_t)(sign | 0x7c00 | (m ? 0x200 : 0));
+    int ne = (int)e - 127 + 15;
+    if (ne >= 31) return (uint16_t)(sign | 0x7c00);
+    if (ne <= 0) {                                      /* subnormal half */
+        if (ne < -10) return (uint16_t)sign;
+        m |= 0x800000; int sh = 14 - ne;
+        uint32_t h = m >> sh, rem = m & ((1u << sh) - 1), half = 1u << (sh - 1);
+        if (rem > half || (rem == half && (h & 1))) h++;
+        return (uint16_t)(sign | h);
+    }
+    uint32_t h = ((uint32_t)ne << 10) | (m >> 13), rem = m & 0x1fff;
+    if (rem > 0x1000 || (rem == 0x1000 && (h & 1))) h++;   /* may carry into the exponent: correct */
+    return (uint16_t)(sign | h);
+}
+
+/* Scale rule "no-clip Q4_0": the group's largest |w| (mx) maps to level -8
+ * (finest step that keeps it), but the step never clips the opposite sign:
+ * d = -sign(mx) * max(|mx|/8, opp/7), opp = largest |w| of the other sign.
+ * Chosen by HF fake-quant on 2048 tokens (tools/ref/hf_qsim.py, KL vs f32 /
+ * top-1): LFM2.5-350M amax/7 1.056/56.9%, Q4_0 0.844/60.4%, no-clip
+ * 0.747/62.4%; MiniCPM5-1B 0.312/72.2%, 0.267/74.6%, 0.271/73.8%. A squared-
+ * error scale search was worse still (it clips the group outliers). */
+void moty_pack_q4r4_block(const float *w, int nr, int I, uint8_t *blk, uint16_t *d) {
+    int nb = I / 32;
+    for (int g = 0; g < nb; g++)
+        for (int r = 0; r < 4; r++) {
+            uint8_t *dst = blk + (size_t)g*64 + r*16;
+            if (r >= nr) { memset(dst, 0x88, 16); d[(size_t)g*4 + r] = 0; continue; }
+            const float *wg = w + (size_t)r*I + g*32;
+            float mx = 0;
+            for (int j = 0; j < 32; j++) if (fabsf(wg[j]) > fabsf(mx)) mx = wg[j];
+            float opp = 0;
+            for (int j = 0; j < 32; j++) if ((wg[j] > 0) != (mx > 0) && fabsf(wg[j]) > opp) opp = fabsf(wg[j]);
+            float dm = fmaxf(fabsf(mx) / 8.f, opp / 7.f);
+            uint16_t h = moty_f32_to_f16(mx > 0 ? -dm : dm);
+            float dd = moty_hw_f16_to_f32(h), inv = dd != 0.f ? 1.f / dd : 0.f;
+            uint8_t q[32];
+            for (int j = 0; j < 32; j++) {
+                int v = (int)lrintf(wg[j] * inv); if (v < -8) v = -8; if (v > 7) v = 7;
+                q[j] = (uint8_t)(v + 8);
+            }
+            d[(size_t)g*4 + r] = h;
+            for (int j = 0; j < 16; j++) dst[j] = (uint8_t)(q[j] | (q[j+16] << 4));
+        }
 }

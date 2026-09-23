@@ -1,0 +1,171 @@
+/* hw_q4r4.h — int4 "Q4R4" kernels (libmoty-hw, included by hw_impl.h).
+ *
+ * Format (built by moty_pack_q4r4, nn/quant.c): rows in blocks of 4, the
+ * row dimension I in groups of 32. Per (block, group):
+ *   w: 64 bytes = 4 rows x 16 bytes, row r byte j = q[r][j] | q[r][j+16] << 4
+ *      (q in [0,15], value = (q-8)*d) — low/high nibble split so that the
+ *      unpack is AND 0x0F / USHR 4 with no zip;
+ *   d: 4 x f16 scales (one per row), in a separate stream [block][group][4].
+ * Activations: int8 per group of 32 with an f32 scale xs[g] and the group
+ * sum xsum[g] (so Σ(q-8)x = Σq·x - 8·Σx and q stays unsigned in SMULL).
+ *
+ *   y[t*ys + r] = Σ_g f16(d[g][r]) * xs[t][g] * (Σ_j q[r][g,j]·x[t][g,j] - 8·xsum[t][g])
+ *
+ * The integer group sums are exact (|q|<=15, |x|<=127: 16 products per
+ * int16 lane <= 30480), so NEON and the scalar reference agree bit for
+ * bit on them; the f32 accumulation order is the same per row (group by
+ * group), only FMA contraction may differ. */
+#ifndef HW_Q4R4_H
+#define HW_Q4R4_H
+#include <string.h>
+
+float moty_hw_f16_to_f32(uint16_t h) {
+    uint32_t s = (uint32_t)(h & 0x8000) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff, u;
+    if (e == 0) {
+        if (m == 0) u = s;
+        else {                                     /* subnormal: normalize */
+            e = 1; while (!(m & 0x400)) { m <<= 1; e--; }
+            m &= 0x3ff; u = s | ((e + 112) << 23) | (m << 13);
+        }
+    } else if (e == 31) u = s | 0x7f800000u | (m << 13);
+    else u = s | ((e + 112) << 23) | (m << 13);
+    float f; memcpy(&f, &u, 4); return f;
+}
+
+/* ---------------- scalar references (always compiled) ---------------- */
+void moty_hw_quant_g32_ref(const float *x, int I, int8_t *xq, float *xs, int32_t *xsum) {
+    for (int g = 0; g < I / 32; g++) {
+        const float *xg = x + g*32;
+        float amax = 0; for (int j = 0; j < 32; j++) { float a = fabsf(xg[j]); if (a > amax) amax = a; }
+        float s = amax / 127.f; if (s < 1e-30f) s = 1e-30f;
+        float inv = 1.f / s; int32_t sm = 0;
+        for (int j = 0; j < 32; j++) { int q = (int)lrintf(xg[j] * inv); xq[g*32+j] = (int8_t)q; sm += q; }
+        xs[g] = s; xsum[g] = sm;
+    }
+}
+
+void moty_hw_q4r4_gemm_ref(const uint8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
+                           const int32_t *xsum, int nb, int ns, float *y, int ys) {
+    int I = nb * 32;
+    for (int t = 0; t < ns; t++)
+        for (int r = 0; r < 4; r++) {
+            float acc = 0;
+            for (int g = 0; g < nb; g++) {
+                const uint8_t *wb = w + (size_t)g*64 + r*16;
+                const int8_t *xg = xq + (size_t)t*I + g*32;
+                int32_t s = 0;
+                for (int j = 0; j < 16; j++) s += (int32_t)(wb[j] & 0xF) * xg[j] + (int32_t)(wb[j] >> 4) * xg[j+16];
+                s -= 8 * xsum[(size_t)t*nb + g];
+                acc += (float)s * (moty_hw_f16_to_f32(d[(size_t)g*4 + r]) * xs[(size_t)t*nb + g]);
+            }
+            y[(size_t)t*ys + r] = acc;
+        }
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+/* ---------------- NEON (ARMv8.0: SMULL/SMLAL2, no SDOT) ---------------- */
+void moty_hw_quant_g32(const float *x, int I, int8_t *xq, float *xs, int32_t *xsum) {
+    for (int g = 0; g < I / 32; g++) {
+        const float *xg = x + g*32;
+        float32x4_t v[8];
+        for (int k = 0; k < 8; k++) v[k] = vld1q_f32(xg + 4*k);
+        float32x4_t m = vmaxq_f32(vmaxq_f32(vmaxq_f32(vabsq_f32(v[0]), vabsq_f32(v[1])), vmaxq_f32(vabsq_f32(v[2]), vabsq_f32(v[3]))),
+                                  vmaxq_f32(vmaxq_f32(vabsq_f32(v[4]), vabsq_f32(v[5])), vmaxq_f32(vabsq_f32(v[6]), vabsq_f32(v[7]))));
+        float amax = vmaxvq_f32(m);
+        float s = amax / 127.f; if (s < 1e-30f) s = 1e-30f;
+        float inv = 1.f / s;
+        int32x4_t q[8];
+        for (int k = 0; k < 8; k++) q[k] = vcvtnq_s32_f32(vmulq_n_f32(v[k], inv));   /* = lrintf (nearest-even) */
+        int16x8_t h0 = vcombine_s16(vmovn_s32(q[0]), vmovn_s32(q[1])), h1 = vcombine_s16(vmovn_s32(q[2]), vmovn_s32(q[3]));
+        int16x8_t h2 = vcombine_s16(vmovn_s32(q[4]), vmovn_s32(q[5])), h3 = vcombine_s16(vmovn_s32(q[6]), vmovn_s32(q[7]));
+        vst1q_s8(xq + g*32,      vcombine_s8(vmovn_s16(h0), vmovn_s16(h1)));
+        vst1q_s8(xq + g*32 + 16, vcombine_s8(vmovn_s16(h2), vmovn_s16(h3)));
+        xsum[g] = vaddlvq_s16(vaddq_s16(vaddq_s16(h0, h1), vaddq_s16(h2, h3)));
+        xs[g] = s;
+    }
+}
+
+/* prefetch distance for the weight stream (bytes ahead): measured on a
+ * Cortex-A53 (tests/bench_a53.c), 1024 B with PLDL1KEEP beat none/256/512/2048 */
+#define Q4R4_PF 1024
+
+/* products of one 4-row group with one token's 32 activations -> int32x4
+ * [row0..row3] (exact) */
+#define Q4R4_ROW(l, h, x0, x1, p) \
+    p = vmull_s8(vget_low_s8(l), vget_low_s8(x0)); p = vmlal_high_s8(p, l, x0); \
+    p = vmlal_s8(p, vget_low_s8(h), vget_low_s8(x1)); p = vmlal_high_s8(p, h, x1);
+
+static inline void q4r4_gemv(const uint8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
+                             const int32_t *xsum, int nb, float *y) {
+    float32x4_t acc = vdupq_n_f32(0);
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    for (int g = 0; g < nb; g++) {
+        __builtin_prefetch(w + Q4R4_PF, 0, 3);
+        int8x16_t x0 = vld1q_s8(xq), x1 = vld1q_s8(xq + 16); xq += 32;
+        uint8x16_t b0 = vld1q_u8(w), b1 = vld1q_u8(w+16), b2 = vld1q_u8(w+32), b3 = vld1q_u8(w+48); w += 64;
+        int8x16_t l, h; int16x8_t p0, p1, p2, p3;
+        l = vreinterpretq_s8_u8(vandq_u8(b0, m4)); h = vreinterpretq_s8_u8(vshrq_n_u8(b0, 4)); Q4R4_ROW(l, h, x0, x1, p0)
+        l = vreinterpretq_s8_u8(vandq_u8(b1, m4)); h = vreinterpretq_s8_u8(vshrq_n_u8(b1, 4)); Q4R4_ROW(l, h, x0, x1, p1)
+        l = vreinterpretq_s8_u8(vandq_u8(b2, m4)); h = vreinterpretq_s8_u8(vshrq_n_u8(b2, 4)); Q4R4_ROW(l, h, x0, x1, p2)
+        l = vreinterpretq_s8_u8(vandq_u8(b3, m4)); h = vreinterpretq_s8_u8(vshrq_n_u8(b3, 4)); Q4R4_ROW(l, h, x0, x1, p3)
+        /* lanes hold 4 products (<=7620); two pairwise adds keep 16 (<=30480) */
+        int32x4_t s = vpaddlq_s16(vpaddq_s16(vpaddq_s16(p0, p1), vpaddq_s16(p2, p3)));
+        s = vsubq_s32(s, vdupq_n_s32(8 * xsum[g]));
+        float32x4_t sc = vmulq_n_f32(vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(d))), xs[g]); d += 4;
+        acc = vfmaq_f32(acc, vcvtq_f32_s32(s), sc);
+    }
+    vst1q_f32(y, acc);
+}
+
+/* prefill: 4 rows x 4 tokens; every group is unpacked once and reused for
+ * the 4 tokens (the weight stream is read once per token block) */
+static inline void q4r4_gemm4(const uint8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
+                              const int32_t *xsum, int nb, float *y, int ys) {
+    int I = nb * 32;
+    float32x4_t a0 = vdupq_n_f32(0), a1 = a0, a2 = a0, a3 = a0;
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    const int8_t *x0p = xq, *x1p = xq + I, *x2p = xq + 2*I, *x3p = xq + 3*I;
+    for (int g = 0; g < nb; g++) {
+        uint8x16_t b0 = vld1q_u8(w), b1 = vld1q_u8(w+16), b2 = vld1q_u8(w+32), b3 = vld1q_u8(w+48); w += 64;
+        int8x16_t l0 = vreinterpretq_s8_u8(vandq_u8(b0, m4)), h0 = vreinterpretq_s8_u8(vshrq_n_u8(b0, 4));
+        int8x16_t l1 = vreinterpretq_s8_u8(vandq_u8(b1, m4)), h1 = vreinterpretq_s8_u8(vshrq_n_u8(b1, 4));
+        int8x16_t l2 = vreinterpretq_s8_u8(vandq_u8(b2, m4)), h2 = vreinterpretq_s8_u8(vshrq_n_u8(b2, 4));
+        int8x16_t l3 = vreinterpretq_s8_u8(vandq_u8(b3, m4)), h3 = vreinterpretq_s8_u8(vshrq_n_u8(b3, 4));
+        float32x4_t dv = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(d))); d += 4;
+        #define Q4R4_TOK(xp, t, acc) { \
+            int8x16_t x0 = vld1q_s8(xp + g*32), x1 = vld1q_s8(xp + g*32 + 16); int16x8_t p0, p1, p2, p3; \
+            Q4R4_ROW(l0, h0, x0, x1, p0) Q4R4_ROW(l1, h1, x0, x1, p1) \
+            Q4R4_ROW(l2, h2, x0, x1, p2) Q4R4_ROW(l3, h3, x0, x1, p3) \
+            int32x4_t s = vpaddlq_s16(vpaddq_s16(vpaddq_s16(p0, p1), vpaddq_s16(p2, p3))); \
+            s = vsubq_s32(s, vdupq_n_s32(8 * xsum[(size_t)(t)*nb + g])); \
+            acc = vfmaq_f32(acc, vcvtq_f32_s32(s), vmulq_n_f32(dv, xs[(size_t)(t)*nb + g])); }
+        Q4R4_TOK(x0p, 0, a0) Q4R4_TOK(x1p, 1, a1) Q4R4_TOK(x2p, 2, a2) Q4R4_TOK(x3p, 3, a3)
+        #undef Q4R4_TOK
+    }
+    vst1q_f32(y, a0); vst1q_f32(y + ys, a1); vst1q_f32(y + 2*ys, a2); vst1q_f32(y + 3*ys, a3);
+}
+
+void moty_hw_q4r4_gemm(const uint8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
+                       const int32_t *xsum, int nb, int ns, float *y, int ys) {
+    int I = nb * 32, t = 0;
+    for (; t + 4 <= ns; t += 4)
+        q4r4_gemm4(w, d, xq + (size_t)t*I, xs + (size_t)t*nb, xsum + (size_t)t*nb, nb, y + (size_t)t*ys, ys);
+    for (; t < ns; t++) {
+        float tmp[4];
+        q4r4_gemv(w, d, xq + (size_t)t*I, xs + (size_t)t*nb, xsum + (size_t)t*nb, nb, tmp);
+        memcpy(y + (size_t)t*ys, tmp, sizeof tmp);
+    }
+}
+#undef Q4R4_ROW
+#else
+/* ---------------- portable: the reference is the kernel ---------------- */
+void moty_hw_quant_g32(const float *x, int I, int8_t *xq, float *xs, int32_t *xsum) {
+    moty_hw_quant_g32_ref(x, I, xq, xs, xsum);
+}
+void moty_hw_q4r4_gemm(const uint8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
+                       const int32_t *xsum, int nb, int ns, float *y, int ys) {
+    moty_hw_q4r4_gemm_ref(w, d, xq, xs, xsum, nb, ns, y, ys);
+}
+#endif
+
+#endif /* HW_Q4R4_H */

@@ -15,9 +15,10 @@
 
 #include <stdint.h>
 
-typedef struct Mat { int fmt;             /* WF_F32/WF_I8/WF_I4/WF_I4G/WF_I2 */
+typedef struct Mat { int fmt;             /* WF_F32/WF_I8/WF_I4/WF_I4G/WF_I2/WF_Q4R4 */
                      float *f; int8_t *q; float *qs; int O, I;
                      uint8_t *q4; int gs;
+                     uint16_t *s16;       /* WF_Q4R4: f16 group scales [O/4][I/32][4] */
                      const void *sh; const char *sname; } Mat;
 
 /* M3: implementazioni in nn/mat.c (libmoty-nn) */
@@ -58,7 +59,7 @@ typedef struct MotyCommon {
 static inline void mat_reset_storage(Mat *w) {
     w->fmt = WF_F32;
     w->f = NULL; w->q = NULL; w->qs = NULL;
-    w->q4 = NULL; w->gs = 0;
+    w->q4 = NULL; w->gs = 0; w->s16 = NULL;
     w->sh = NULL; w->sname = NULL;
 }
 

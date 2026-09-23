@@ -13,6 +13,7 @@ void moty_kv_store_row(int8_t *dst, float *scale_slot, const float *src, int hd)
 void moty_mat_apply(float *y, const float *x, const Mat *w, int S) {
     if (g_stream && w->sh) { g_stream(y, x, w, S); return; }
     switch (w->fmt) {
+        case WF_Q4R4: moty_matmul_q4r4_s(y, x, w->q4, w->s16, S, w->I, w->O); return;
         case WF_I4G: matmul_i4_grouped_s(y, x, w->q4, w->qs, S, w->I, w->O, w->gs); return;
         case WF_I4:  matmul_i4_s(y, x, w->q4, w->qs, S, w->I, w->O); return;
         case WF_I8:  matmul_q_s(y, x, w->q, w->qs, S, w->I, w->O); return;

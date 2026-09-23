@@ -10,6 +10,7 @@ consume the outputs through `REF=`, `REF_LOGITS=`, `PPL=` / `PPL_OUT=`
 | `hf_ppl.py <snap> <out.json> [text] [max_tokens]` | ids of the text (default `ppl_text.txt`), per-position argmax, perplexity (f32) | `PPL=<out.json>`, `cmp_ppl.py` |
 | `cmp_logits.py <ref.json> <case> <REF_LOGITS file>` | max \|dlogit\|, top-1 / top-10 agreement | |
 | `cmp_ppl.py <ppl.json> <PPL_OUT file>` | top-1 agreement vs f32 HF | |
+| `hf_qsim.py <snap> <schemes> [text]` | HF fake-quant of every Linear with int4 group-32 scale rules (`amax7`, `q40`, `noclip`, `@64` = group 64): PPL, KL vs f32, top-1 | choosing the Q4R4 scale rule |
 | `tok_cases.py <tokenizer.json> [files...]` | `TEXT\tIDS` corpus (edge cases + slices of the files) | `tests/build/tok_oracle` |
 
 Texts: `ppl_text.txt` (~290 tokens: prose, a story, Python, Russian) for

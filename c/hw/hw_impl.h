@@ -127,6 +127,7 @@
  * ============================================================ */
 #include "hw_quant.h"       /* qrow_i8 (portable) */
 #include "hw_deltanet.h"    /* dn_row_decay_acc, dn_row_update_dot */
+#include "hw_q4r4.h"       /* int4 Q4R4 GEMV/GEMM + group-32 activation quant */
 
 /* ============================================================ *
  *  Section 3: Runtime dispatch (optional).                     *

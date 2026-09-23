@@ -22,6 +22,8 @@ extern int moty_rt_g_kv_bits;               /* KV_BITS: 0 f32, 8 int8 */
 extern int moty_rt_g_micro;                 /* MICRO=1 */
 extern int moty_rt_g_micro_drop;            /* MICRO_DROP=0 */
 extern int moty_rt_g_tokens_dump;           /* TOKENS=1 */
+extern int moty_rt_g_q4fmt;                 /* Q4FMT: 1 Q4R4, 0 legacy grouped int4 */
+extern int moty_rt_g_embed_disk;            /* EMBED=disk */
 
 int      moty_rt_parse_env(MotyRunConfig *e);   /* 0 = valore invalido (msg stampato) */
 void     moty_rt_omp_hot_tune(char **argv);     /* re-exec una volta sola; MOTY_NO_OMP_TUNE spegne */
@@ -36,5 +38,7 @@ int64_t  moty_rt_budget_from_env(const char *gb, const char *frac, int64_t total
 #define g_micro         moty_rt_g_micro
 #define g_micro_drop    moty_rt_g_micro_drop
 #define g_tokens_dump   moty_rt_g_tokens_dump
+#define g_q4fmt         moty_rt_g_q4fmt
+#define g_embed_disk    moty_rt_g_embed_disk
 #endif
 #endif /* MOTY_RT_CONFIG_H */

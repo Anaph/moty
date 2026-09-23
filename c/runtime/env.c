@@ -11,6 +11,15 @@
 
 const char *moty_rt_g_gguf = NULL;
 int moty_rt_g_qgroup = 32;
+/* QBITS=4 weight layout: 1 = Q4R4 (4-row NEON blocks, f16 group-32 scales,
+ * hw/hw_q4r4.h), 0 = legacy WF_I4G (VNNI fused paths on AVX512). Default:
+ * Q4R4 where its NEON kernels exist. Q4FMT=r4|g overrides. */
+#if defined(__aarch64__) && defined(__ARM_NEON)
+int moty_rt_g_q4fmt = 1;
+#else
+int moty_rt_g_q4fmt = 0;
+#endif
+int moty_rt_g_embed_disk = 0;               /* EMBED=disk: no resident table */
 int moty_rt_g_prefill_chunk = 0;
 int moty_rt_g_kv_bits = 0;
 int moty_rt_g_micro = 0;
@@ -53,6 +62,18 @@ int moty_rt_parse_env(MotyRunConfig *e) {
         moty_rt_g_qgroup = atoi(getenv("QGROUP"));
         if (moty_rt_g_qgroup < 0 || (moty_rt_g_qgroup > 0 && moty_rt_g_qgroup % 16)) {
             fprintf(stderr, "QGROUP deve essere 0 (scala per riga) o un multiplo di 16\n"); return 0; }
+    }
+    if (getenv("Q4FMT")) {
+        const char *f = getenv("Q4FMT");
+        if (!strcmp(f, "r4")) moty_rt_g_q4fmt = 1;
+        else if (!strcmp(f, "g")) moty_rt_g_q4fmt = 0;
+        else { fprintf(stderr, "Q4FMT deve essere r4 (Q4R4) o g (int4 a gruppi legacy)\n"); return 0; }
+    }
+    if (getenv("EMBED")) {
+        const char *f = getenv("EMBED");
+        if (!strcmp(f, "disk")) moty_rt_g_embed_disk = 1;
+        else if (!strcmp(f, "ram")) moty_rt_g_embed_disk = 0;
+        else { fprintf(stderr, "EMBED deve essere ram o disk\n"); return 0; }
     }
     e->ngen = getenv("NGEN") ? atoi(getenv("NGEN")) : 256;
     if (getenv("PREFILL_CHUNK")) moty_rt_g_prefill_chunk = atoi(getenv("PREFILL_CHUNK"));
