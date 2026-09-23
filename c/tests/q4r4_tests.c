@@ -82,17 +82,25 @@ int q4_pack_noclip(void) {
     return 0;
 }
 
-/* integer sums exact: scales 1, so the float result equals Σ(q-8)x exactly */
+/* integer sums exact: scales 1, so the float result equals Σ(q-8)x exactly.
+ * NS=6 covers the 4-token GEMM and the GEMV tail, NB=7 an odd group count;
+ * row 1 at codes 15 against x = ±127 is the int16 lane worst case. */
 int q4_gemm_int_exact(void) {
     enum { NB = 7, I = NB*32, NS = 6 };
     uint8_t w[NB*64]; uint16_t d[NB*4];
     for (int i = 0; i < NB*64; i++) w[i] = (uint8_t)(q4_frnd() * 512);
     for (int i = 0; i < NB*4; i++) d[i] = 0x3c00;             /* 1.0 */
     w[0] = 0xff; w[1] = 0x00;                                  /* extreme codes */
+    for (int g = 0; g < NB; g++) memset(w + g*64 + 16, 0xff, 16);   /* row 1: all codes 15 */
     int8_t xq[NS*I]; float xs[NS*NB]; int32_t xm[NS*NB];
     for (int t = 0; t < NS; t++) for (int g = 0; g < NB; g++) {
         int32_t s = 0;
-        for (int j = 0; j < 32; j++) { int v = (int)(q4_frnd() * 254); if (t == 0) v = (j & 1) ? 127 : -127; xq[t*I+g*32+j] = (int8_t)v; s += v; }
+        for (int j = 0; j < 32; j++) {
+            int v = (int)(q4_frnd() * 254);
+            if (t == 0) v = (j & 1) ? 127 : -127;
+            if (t == 1 || t == 5) v = 127;                     /* int16 lane limit: 16 x 15 x 127 */
+            if (t == 2) v = -127;
+            xq[t*I+g*32+j] = (int8_t)v; s += v; }
         xs[t*NB+g] = 1.f; xm[t*NB+g] = s;
     }
     float y[NS*4], yr[NS*4];

@@ -13,8 +13,8 @@
  *
  * The integer group sums are exact (|q|<=15, |x|<=127: 16 products per
  * int16 lane <= 30480), so NEON and the scalar reference agree bit for
- * bit on them; the f32 accumulation order is the same per row (group by
- * group), only FMA contraction may differ. */
+ * bit on them; the f32 accumulation may differ in order (the decode GEMV
+ * keeps even and odd groups in two accumulators) and FMA contraction. */
 #ifndef HW_Q4R4_H
 #define HW_Q4R4_H
 #include <string.h>
@@ -95,30 +95,53 @@ void moty_hw_quant_g32(const float *x, int I, int8_t *xq, float *xs, int32_t *xs
     p = vmull_s8(vget_low_s8(l), vget_low_s8(x0)); p = vmlal_high_s8(p, l, x0); \
     p = vmlal_s8(p, vget_low_s8(h), vget_low_s8(x1)); p = vmlal_high_s8(p, h, x1);
 
+/* one group of one 4-row block against one token's 32 activations ->
+ * int32x4 [row0..row3] (exact; the offset -8*xsum is applied by the caller).
+ * 16 products per int16 lane (<= 30480) before widening. */
+#define Q4R4_GROUP(w, x0, x1, s) { \
+    uint8x16_t b0_ = vld1q_u8(w), b1_ = vld1q_u8((w)+16), b2_ = vld1q_u8((w)+32), b3_ = vld1q_u8((w)+48); \
+    int8x16_t l_, h_; int16x8_t p0_, p1_, p2_, p3_; \
+    l_ = vreinterpretq_s8_u8(vandq_u8(b0_, m4)); h_ = vreinterpretq_s8_u8(vshrq_n_u8(b0_, 4)); Q4R4_ROW(l_, h_, x0, x1, p0_) \
+    l_ = vreinterpretq_s8_u8(vandq_u8(b1_, m4)); h_ = vreinterpretq_s8_u8(vshrq_n_u8(b1_, 4)); Q4R4_ROW(l_, h_, x0, x1, p1_) \
+    l_ = vreinterpretq_s8_u8(vandq_u8(b2_, m4)); h_ = vreinterpretq_s8_u8(vshrq_n_u8(b2_, 4)); Q4R4_ROW(l_, h_, x0, x1, p2_) \
+    l_ = vreinterpretq_s8_u8(vandq_u8(b3_, m4)); h_ = vreinterpretq_s8_u8(vshrq_n_u8(b3_, 4)); Q4R4_ROW(l_, h_, x0, x1, p3_) \
+    s = vpaddlq_s16(vpaddq_s16(vpaddq_s16(p0_, p1_), vpaddq_s16(p2_, p3_))); }
+
+/* decode: two groups per iteration with two f32 accumulators. The in-order
+ * A53 cannot overlap the per-group reduction chain (ADDP..SCVTF..FMLA) of one
+ * group with the next; interleaving two independent groups in one body lets
+ * the compiler do it: 68 -> 56 cycles per group with hot caches, +18 %
+ * weight GB/s on one core (tests/bench_a53.c "gemv"). */
 static inline void q4r4_gemv(const uint8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
                              const int32_t *xsum, int nb, float *y) {
-    float32x4_t acc = vdupq_n_f32(0);
+    float32x4_t a0 = vdupq_n_f32(0), a1 = a0;
     const uint8x16_t m4 = vdupq_n_u8(0x0F);
-    for (int g = 0; g < nb; g++) {
+    int g = 0;
+    for (; g + 2 <= nb; g += 2) {
         __builtin_prefetch(w + Q4R4_PF, 0, 3);
+        __builtin_prefetch(w + Q4R4_PF + 64, 0, 3);
         /* the f16 scale stream (8 B/group) is a second sequential stream: one
          * PRFM per 64 B line of it; measured +23%/+9%/+13% weight GB/s at
          * 1/2/4 threads on the A53 (bench_a53 "pf w+d") */
         if ((g & 7) == 0) __builtin_prefetch(d + Q4R4_PF / 2, 0, 3);
-        int8x16_t x0 = vld1q_s8(xq), x1 = vld1q_s8(xq + 16); xq += 32;
-        uint8x16_t b0 = vld1q_u8(w), b1 = vld1q_u8(w+16), b2 = vld1q_u8(w+32), b3 = vld1q_u8(w+48); w += 64;
-        int8x16_t l, h; int16x8_t p0, p1, p2, p3;
-        l = vreinterpretq_s8_u8(vandq_u8(b0, m4)); h = vreinterpretq_s8_u8(vshrq_n_u8(b0, 4)); Q4R4_ROW(l, h, x0, x1, p0)
-        l = vreinterpretq_s8_u8(vandq_u8(b1, m4)); h = vreinterpretq_s8_u8(vshrq_n_u8(b1, 4)); Q4R4_ROW(l, h, x0, x1, p1)
-        l = vreinterpretq_s8_u8(vandq_u8(b2, m4)); h = vreinterpretq_s8_u8(vshrq_n_u8(b2, 4)); Q4R4_ROW(l, h, x0, x1, p2)
-        l = vreinterpretq_s8_u8(vandq_u8(b3, m4)); h = vreinterpretq_s8_u8(vshrq_n_u8(b3, 4)); Q4R4_ROW(l, h, x0, x1, p3)
-        /* lanes hold 4 products (<=7620); two pairwise adds keep 16 (<=30480) */
-        int32x4_t s = vpaddlq_s16(vpaddq_s16(vpaddq_s16(p0, p1), vpaddq_s16(p2, p3)));
-        s = vsubq_s32(s, vdupq_n_s32(8 * xsum[g]));
-        float32x4_t sc = vmulq_n_f32(vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(d))), xs[g]); d += 4;
-        acc = vfmaq_f32(acc, vcvtq_f32_s32(s), sc);
+        int8x16_t x0 = vld1q_s8(xq), x1 = vld1q_s8(xq + 16), x2 = vld1q_s8(xq + 32), x3 = vld1q_s8(xq + 48); xq += 64;
+        int32x4_t s0, s1;
+        Q4R4_GROUP(w, x0, x1, s0)
+        Q4R4_GROUP(w + 64, x2, x3, s1)
+        w += 128;
+        s0 = vsubq_s32(s0, vdupq_n_s32(8 * xsum[g])); s1 = vsubq_s32(s1, vdupq_n_s32(8 * xsum[g+1]));
+        float16x8_t dh = vreinterpretq_f16_u16(vld1q_u16(d)); d += 8;
+        a0 = vfmaq_f32(a0, vcvtq_f32_s32(s0), vmulq_n_f32(vcvt_f32_f16(vget_low_f16(dh)), xs[g]));
+        a1 = vfmaq_f32(a1, vcvtq_f32_s32(s1), vmulq_n_f32(vcvt_high_f32_f16(dh), xs[g+1]));
     }
-    vst1q_f32(y, acc);
+    if (g < nb) {                                      /* odd group count */
+        int8x16_t x0 = vld1q_s8(xq), x1 = vld1q_s8(xq + 16);
+        int32x4_t s0;
+        Q4R4_GROUP(w, x0, x1, s0)
+        s0 = vsubq_s32(s0, vdupq_n_s32(8 * xsum[g]));
+        a0 = vfmaq_f32(a0, vcvtq_f32_s32(s0), vmulq_n_f32(vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(d))), xs[g]));
+    }
+    vst1q_f32(y, vaddq_f32(a0, a1));
 }
 
 /* prefill: 4 rows x 4 tokens; every group is unpacked once and reused for
@@ -161,6 +184,7 @@ void moty_hw_q4r4_gemm(const uint8_t *w, const uint16_t *d, const int8_t *xq, co
     }
 }
 #undef Q4R4_ROW
+#undef Q4R4_GROUP
 #else
 /* ---------------- portable: the reference is the kernel ---------------- */
 void moty_hw_quant_g32(const float *x, int I, int8_t *xq, float *xs, int32_t *xsum) {
