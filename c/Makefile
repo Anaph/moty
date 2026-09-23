@@ -217,7 +217,7 @@ endif
 # All includes are repo-c-relative ("nn/nn.h", "hw/hw.h", ...), so every
 # compile adds -I. A shared deps list keeps the .o rules honest.
 NN_CORE   = nn/nn.h nn/nn_alloc.h nn/nn_norm.h nn/nn_sample.h nn/nn_gemm.h hw/hw.h
-RUNTIME_H = runtime/runtime.h runtime/rt_model_load.h runtime/rt_kv_cache.h runtime/rt_gen_loop.h runtime/rt_env_cfg.h
+RUNTIME_H = runtime/runtime.h runtime/rt_model_load.h runtime/rt_kv_cache.h runtime/rt_gen_loop.h runtime/rt_env_cfg.h runtime/config.h
 IO_H      = io/st.h io/gguf.h io/tier.h
 TOK_H     = tok/tok.h tok/tok_unicode.h
 UTIL_H    = util/json.h util/compat.h util/prof.h
@@ -228,13 +228,13 @@ glm$(EXE): libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/glm.c io/st.h io/
 olmoe$(EXE): libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/olmoe.c $(NN_CORE) runtime/moe.h $(IO_H) $(TOK_H) $(UTIL_H)
 	$(CC) $(CFLAGS) engines/olmoe.c -o olmoe$(EXE) libmoty-runtime.a libmoty-nn.a libmoty-hw.a $(LDFLAGS)
 
-qwen$(EXE): libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/qwen.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/runtime.h $(IO_H) util/stw.h engines/qwen_train.h $(UTIL_H)
+qwen$(EXE): libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/qwen.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h $(RUNTIME_H) $(IO_H) util/stw.h engines/qwen_train.h $(UTIL_H)
 	$(CC) $(CFLAGS) engines/qwen.c -o qwen$(EXE) libmoty-runtime.a libmoty-nn.a libmoty-hw.a $(LDFLAGS)
 
-qwenmoe$(EXE): libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/qwenmoe.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/moe.h runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+qwenmoe$(EXE): libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/qwenmoe.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/moe.h $(RUNTIME_H) $(IO_H) $(TOK_H) $(UTIL_H)
 	$(CC) $(CFLAGS) engines/qwenmoe.c -o qwenmoe$(EXE) libmoty-runtime.a libmoty-nn.a libmoty-hw.a $(LDFLAGS)
 
-lfm2$(EXE): libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/lfm2.c $(NN_CORE) nn/nn_rope.h nn/attn.h nn/conv.h nn/ffn.h nn/moe.h runtime/moe.h runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+lfm2$(EXE): libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/lfm2.c $(NN_CORE) nn/nn_rope.h nn/attn.h nn/conv.h nn/ffn.h nn/moe.h runtime/moe.h $(RUNTIME_H) $(IO_H) $(TOK_H) $(UTIL_H)
 	$(CC) $(CFLAGS) engines/lfm2.c -o lfm2$(EXE) libmoty-runtime.a libmoty-nn.a libmoty-hw.a $(LDFLAGS)
 
 # ---- Unified multi-model binary ----
@@ -245,19 +245,19 @@ lfm2$(EXE): libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/lfm2.c $(NN_CORE
 #   3. Add {"arch", model_X_main} to the models[] table in moty.c
 # See docs/adding-a-model.md for the full recipe (config, hooks, layers, tests).
 
-lfm2.o: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/lfm2.c $(NN_CORE) nn/nn_rope.h nn/attn.h nn/conv.h nn/ffn.h nn/moe.h runtime/moe.h runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+lfm2.o: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/lfm2.c $(NN_CORE) nn/nn_rope.h nn/attn.h nn/conv.h nn/ffn.h nn/moe.h runtime/moe.h $(RUNTIME_H) $(IO_H) $(TOK_H) $(UTIL_H)
 	$(CC) $(CFLAGS) -Dmain=lfm2_main -c engines/lfm2.c -o lfm2.o
 
-qwenmoe.o: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/qwenmoe.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/moe.h runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+qwenmoe.o: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/qwenmoe.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/moe.h $(RUNTIME_H) $(IO_H) $(TOK_H) $(UTIL_H)
 	$(CC) $(CFLAGS) -Dmain=qwenmoe_main -c engines/qwenmoe.c -o qwenmoe.o
 
-gemma.o: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/gemma.c $(NN_CORE) runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+gemma.o: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/gemma.c $(NN_CORE) $(RUNTIME_H) $(IO_H) $(TOK_H) $(UTIL_H)
 	$(CC) $(CFLAGS) -Dmain=gemma_main -c engines/gemma.c -o gemma.o
 
 olmoe.o: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/olmoe.c $(NN_CORE) runtime/moe.h $(IO_H) $(TOK_H) $(UTIL_H)
 	$(CC) $(CFLAGS) -Dmain=olmoe_main -c engines/olmoe.c -o olmoe.o
 
-qwen.o: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/qwen.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/runtime.h $(IO_H) util/stw.h engines/qwen_train.h $(UTIL_H)
+qwen.o: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/qwen.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h $(RUNTIME_H) $(IO_H) util/stw.h engines/qwen_train.h $(UTIL_H)
 	$(CC) $(CFLAGS) -Dmain=qwen_main -c engines/qwen.c -o qwen.o
 
 glm.o: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/glm.c io/st.h io/uring.h util/json.h $(TOK_H) util/compat.h util/grammar.h
@@ -266,7 +266,7 @@ glm.o: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/glm.c io/st.h io/urin
 moty$(EXE): libmoty-runtime.a libmoty-nn.a libmoty-hw.a moty.c lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o
 	$(CC) $(CFLAGS) moty.c lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o -o moty$(EXE) libmoty-runtime.a libmoty-nn.a libmoty-hw.a $(LDFLAGS)
 
-gemma$(EXE): libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/gemma.c $(NN_CORE) runtime/runtime.h $(IO_H) $(TOK_H) $(UTIL_H)
+gemma$(EXE): libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/gemma.c $(NN_CORE) $(RUNTIME_H) $(IO_H) $(TOK_H) $(UTIL_H)
 	$(CC) $(CFLAGS) engines/gemma.c -o gemma$(EXE) libmoty-runtime.a libmoty-nn.a libmoty-hw.a $(LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a
