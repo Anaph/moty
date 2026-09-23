@@ -97,13 +97,22 @@ costs quality (LFM2.5 KL 0.747 → 1.004), so it stays 32.
 - *Decode GEMV* (one token, 4 rows): per group 16 `SMULL/SMLAL(2)` (4
   rows × 32 products into int16 lanes, at most 16 products per lane, so
   no overflow), `ADDP` tree + `SADDLP` to int32, `FCVTL` of the 4 f16
-  scales, one `FMLA`. `PRFM PLDL1KEEP` 1 KB ahead on the weight stream
+  scales, one `FMLA`. Two groups per loop iteration with two f32
+  accumulators: the in-order A53 only overlaps one group's reduction
+  chain with the next group's multiplies inside one loop body (68 → 56
+  cycles per group). `PRFM PLDL1KEEP` 1 KB ahead on the weight stream
   **and** on the scale stream: on the A53, prefetching 256–512 bytes
   ahead hurt and 1–2 KB helped (`tests/bench_a53.c bw`); the scale-stream
   prefetch alone gave +9–23 % weight bandwidth.
-- *Prefill GEMM*: register tile of 4 rows × 4 tokens, so each unpacked
-  group is reused for 4 tokens; tokens beyond a multiple of 4 go through
-  the GEMV. `moty_hw_q4r4_gemm(…, ns, …)` is the one entry point for both.
+- *Prefill GEMM* (`moty_hw_q4r4_gemm4t`): register tile of 4 rows × 4
+  tokens, so each unpacked group is reused for 4 tokens. The driver lays
+  out the 4 tokens' per-group scales as vectors once per tile
+  (`moty_hw_q4r4_tile_scales`: `xs` and the offset term `8·xsum·xs`), so
+  the kernel applies them with FMUL/FMLS by lane instead of per-token
+  scalar loads, broadcasts and an int32 offset subtraction (156 → ~124
+  instructions per group, 64 of them multiplies; ~3 MAC/cycle per core).
+  Tokens beyond a multiple of 4 go through the GEMV;
+  `moty_hw_q4r4_gemm(…, ns, …)` remains the generic entry point.
 - *Driver* (`moty_matmul_q4r4_s`, `nn/matmul.c`): quantizes the S
   activation rows once, walks tokens in tiles of 32 (their int8
   activations stay in L2 while the weights stream), splits 4-row blocks
@@ -139,6 +148,23 @@ tensors are copied unchanged, the tied head is written as
 it. `load_mat_q4r4` reads such pairs raw (size-checked) instead of
 reading bf16 and packing. Output is bit-identical to loading the original
 snapshot.
+
+**Attention rows** (`moty_hw_attn_scores` / `moty_hw_attn_accum`): for
+head_dim 64 the query (scores) or the 64 output accumulators (value
+pass) stay in 16 NEON registers across all cached positions, two rows per
+iteration; the previous per-row `dot_f32` / `axpy` loops are the
+references (and the kernels for other head sizes and non-NEON builds).
+
+**Two-stage lm_head** (`HEAD_TOPK=K`, `nn/head.c`, opt-in): at load a
+1-bit copy of a Q4R4 head is built from the packed codes (sign bits,
+per-row mean |w| and popcount; V·D/8 bytes). Per decode step the
+activation is quantized to 3 bits, stage 1 scores every row with
+bit-plane popcounts (`moty_hw_popc4x3`: AND/CNT/ADD into 12 register
+accumulators), the K best rows are selected (a strided-sample threshold,
+then an exact select among the survivors), and stage 2 computes exact
+Q4R4 logits for their 4-row blocks; all other logits are -1e30. Greedy
+decoding and sampling therefore see a top-K-truncated distribution;
+REF and PPL always use the full head.
 
 **EMBED=disk** reuses the micro-RSS row gather: the embedding table is
 not resident, each input token's row is read from the snapshot. A tied

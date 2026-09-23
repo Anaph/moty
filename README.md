@@ -150,6 +150,8 @@ Common environment variables (qwen engine):
 | `PPL` | — | `{"ids":[...]}` JSON: teacher-forced perplexity over the ids (decode path, one token per step) instead of generating |
 | `PPL_OUT` / `PPL_N` | — | with `PPL`: write the per-position argmax ids (for top-1 agreement vs a reference, `tools/ref/cmp_ppl.py`); cap the token count |
 | `IGNORE_EOS` | 0 | 1 → keep generating past end-of-turn tokens (fixed-length benchmark runs) |
+| `THREADS_DECODE` | = `THREADS` | team size for the single-token decode steps only (prefill keeps `THREADS`). On a board whose cores also run another process one fewer thread than cores decodes faster: every decode matmul ends in a barrier that waits for a preempted thread |
+| `HEAD_TOPK` | 0 | K > 0 → two-stage lm_head for Q4R4 heads: a 1-bit copy of the head picks K candidate rows, exact int4 logits only for them, the rest -1e30 (top-K-truncated distribution). ~2× cheaper head; the argmax equals the full int4 head's at 99.76 % of positions for K=512 on LFM2.5-350M. Ignored by `REF`/`PPL` |
 | `TOKENS` | 0 | 1 → dump generated token ids to stderr |
 | `TTA` | off | **experimental** test-time adaptation: `cache` (neural cache), `bias` (online logit bias) or `lora` (online low-rank lm_head adapter); see [docs/online-learning.md](docs/online-learning.md) |
 | `TTA_N` / `TTA_LAMBDA` / `TTA_THETA` / `TTA_LR` | 2048 / 0.1 / 1.0 / 0.1 | cache size, mix weight (capped at 0.5), similarity temperature, bias/lora learning rate (lora defaults to 1e-3) |
@@ -304,6 +306,8 @@ make -C c lfm2 qwen CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar ARCH=armv8-
 SNAP=/models/LFM2.5-350M QBITS=4 Q4FMT=r4 SAVE_PACKED=/models/LFM2.5-350M-q4r4 ./c/lfm2
 # board
 SNAP=LFM2.5-350M-q4r4 QBITS=4 THREADS=4 PROMPT="..." ./lfm2
+# fastest decode on a board shared with another workload (see docs/performance.md §5.7)
+SNAP=LFM2.5-350M-q4r4 QBITS=4 THREADS=4 THREADS_DECODE=3 HEAD_TOPK=512 PROMPT="..." ./lfm2
 SNAP=MiniCPM5-1B-q4r4 QBITS=4 EMBED=disk THREADS=4 PROMPT="..." ./qwen
 ```
 

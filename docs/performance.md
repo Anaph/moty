@@ -282,3 +282,92 @@ MiniCPM5 629 MiB, 4.9 bits/weight). Built statically for aarch64 with
 no `sdot`/`udot`/`smmla` and no fp16 vector arithmetic, i.e. the same
 instruction class as moty's kernels. Numbers from `llama-bench -p 66 -n 64`
 with `-t 1/2/4`, interleaved with the moty runs.
+
+### 5.7 Second speed pass (LFM2.5-350M, board B)
+
+Same method (board B, its vision workload running, container load,
+prompt 66 / 64 generated tokens, `IGNORE_EOS=1`, medians of 3 interleaved
+repetitions; peak RSS 300 MB in every row, 309 MB with `HEAD_TOPK`):
+
+| threads | build | prefill tok/s | decode tok/s |
+|---|---|---|---|
+| 1 | before | 12.7 | 7.28 |
+| 1 | after | **14.1** | **8.36** |
+| 2 | before | 24.9 | 12.55 |
+| 2 | after | **27.9** | **14.12** |
+| 4 | before | 43.1 | 14.65 |
+| 4 | after | **48.0** | 14.92 |
+| 4 | after, `THREADS_DECODE=3` | 47.7 | 15.35 |
+| 4 | after, `THREADS_DECODE=3 HEAD_TOPK=512` | 44.6 | **17.24** |
+
+(Prefill in the last row: one run hit a background burst, 46.0/44.6/35.6;
+the knobs do not touch prefill.)
+
+Per-op decode profile, ms/token (`-DMOTY_PROF` builds, median of 4; the
+"before" runs caught more background load, 67–81 ms in other rounds):
+
+| op | before | after (`THREADS_DECODE=3 HEAD_TOPK=512`) |
+|---|---|---|
+| ffn gate+up / down | 27.7 / 18.0 | 24.5 / 12.8 |
+| conv in / out | 8.5 / 3.7 | 5.6 / 2.1 |
+| qkv / o | 3.9 / 1.7 | 2.3 / 1.2 |
+| lm_head | 11.1 | 6.1 |
+| attention core | 2.1 | 1.2 |
+| silu·up | 2.1 | 1.2 |
+| total | 80.8 | 58.2 |
+
+Prefill profile: 23.1 → 21.2 ms/token (gate+up 10.6 → 9.8, down 6.1 →
+5.7, attention core 0.33 → 0.17, silu·up 0.64 → 0.47).
+
+What paid off, each measured on the board:
+
+- **Decode GEMV, two groups per iteration.** With a hot cache the
+  one-group kernel spent 68 cycles per 4×32 group: the in-order core does
+  not overlap one group's reduction chain with the next group's
+  multiplies. Two groups per loop body: 56 cycles; one core 1.51 → 1.77
+  GB/s of weights, two cores 2.67 → 3.04.
+- **Prefill GEMM with vector scales** (`gemm4t`): 156 → ~124 instructions
+  per group, 4.30 → 4.90 GMAC/s per core (I = 1024).
+- **Four exp chains per iteration** in silu·up and softmax (80 → 35 µs
+  for 4608 elements) and **register-resident attention rows** (one head at
+  130 positions 32.7 → 13.4 µs).
+- **`THREADS_DECODE=3`.** An empty OpenMP region costs 8 µs median at any
+  team size here, but with 4 threads the mean is 36–51 µs (p99 0.3–1 ms):
+  a thread that shares its core with the vision workload gets preempted
+  and every decode matmul ends in a barrier that waits for it (one core
+  was 38 % busy with that workload, the others 11–15 %). 3 threads: mean
+  10–12 µs. Decode is bandwidth-bound, so the 4th thread adds little
+  bandwidth but all of the stall risk; prefill (compute-bound) keeps 4.
+- **`HEAD_TOPK=512`**: the head (37.7 of the 199 MB per token) 10.3 →
+  5.5 ms. Opt-in because it is not exact: over 2047 teacher-forced
+  positions the argmax equals the full int4 head's at 99.76 % (K=512),
+  99.41 % (K=256). Candidate generators rejected on HF hidden states: an
+  SVD of the head (rank 256: 94 % top-1 recall in the top 512).
+
+Tried, no gain (measured): `-mtune=cortex-a53` (same cycles), reciprocal
+estimate + Newton instead of the SiLU division (38 vs 35 µs), a parallel
+silu·up in decode (slower than serial on the shared cores), far L2
+prefetch and 768/1536/2048-byte prefetch distances in the GEMV, two
+4-row blocks per GEMV iteration (faster hot, 1.86 → 1.43 GB/s cold: two
+interleaved weight streams), blocking the prefill GEMM along I (4.31 →
+4.0–4.2 GMAC/s), a compiler barrier against accumulator spills in the
+GEMM (no change: spills are not the bottleneck), pinning the decode
+threads to the three least busy cores (within noise).
+
+Where the remaining gap goes:
+
+- **Decode** reaches 17.2 tok/s; the matmuls stream ~3.1–3.3 GB/s against
+  ~4.4 GB/s of read bandwidth with 3 threads. The in-order GEMV itself
+  caps one core at ~1.8 GB/s with a cold cache (56 cycles per 72-byte
+  group), the vision workload takes ~20 % of the CPU time, and barriers
+  still wait for preempted threads — together that is the ~25 % gap. The
+  rest of a decode step (norms, conv, attention, silu, sampling) is 3.4
+  ms of 58.
+- **Prefill** reaches 48 tok/s = 13.8 GMAC/s, 38 % of the 36.7 GMAC/s
+  `SMLAL` peak. Per 4×4×32 tile the GEMM executes 64 multiply
+  instructions and ~60 others: the unpack of the nibbles, the pairwise
+  reduction of the int16 lanes to one int32 per row (3 `ADDP` + `SADDLP`
+  per token — already minimal for 4 rows), the int→float conversion and
+  the two scale FMAs. That is the cost of group-32 scales on both
+  weights and activations; at ~3 MAC/cycle per core and ~80 % of the CPU
+  available the matmuls run at their ceiling.
