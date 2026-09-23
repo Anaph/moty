@@ -55,6 +55,14 @@ static int run_ref(Model *m, const char *refpath) {
     g_temp = 0;                                    /* la validazione e' greedy */
     double t0 = now_s();
     float *logit = step_chunked(m, prompt, np, 0);
+    /* REF_LOGITS=<file>: raw f32 logits of the last prompt position, for a
+     * logit-level comparison against the reference (tools/ref/cmp_logits.py) */
+    const char *lpath = getenv("REF_LOGITS");
+    if (lpath && *lpath) {
+        FILE *lf = fopen(lpath, "wb");
+        if (!lf || fwrite(logit, sizeof(float), m->c.vocab, lf) != (size_t)m->c.vocab) { perror(lpath); exit(1); }
+        fclose(lf);
+    }
     int len = np;
     for (int s = 0; s < n_new; s++) {
         int best = argmax_v(logit, m->c.vocab);
@@ -71,6 +79,38 @@ static int run_ref(Model *m, const char *refpath) {
     printf("Speed: %.2f tok/s | PEAK RSS %.2f GB\n", n_new/dt, rss_gb());
     json_free(ref); free(buf); free(prompt); free(full); free(out);
     return match == n_new ? 0 : 2;
+}
+
+/* ---------- PPL=<file.json> {"ids":[...]}: teacher-forced quality probe ----------
+ * Feeds ids one at a time (the decode path) and scores every next token:
+ * prints perplexity over ids[1..n) and, with PPL_OUT=<file>, writes the
+ * per-position argmax ids (one per line) so top-1 agreement against the
+ * reference model can be computed offline. PPL_N caps the token count. */
+static int run_ppl(Model *m, const char *path) {
+    char *buf = slurp_file(path, NULL);
+    jval *js = json_parse(buf);
+    int n; int *ids = read_int_array(js, "ids", &n);
+    const char *cap = getenv("PPL_N");
+    if (cap && atoi(cap) > 1 && atoi(cap) < n) n = atoi(cap);
+    if (n < 2) { fprintf(stderr, "PPL: need at least 2 ids\n"); return 1; }
+    kv_alloc(m, n + 1);
+    const char *opath = getenv("PPL_OUT");
+    FILE *of = opath && *opath ? fopen(opath, "w") : NULL;
+    int V = m->c.vocab;
+    double nll = 0; double t0 = now_s();
+    for (int t = 0; t + 1 < n; t++) {
+        float *lo = step(m, &ids[t], 1, t);
+        float mx = lo[0]; int am = 0;
+        for (int v = 1; v < V; v++) if (lo[v] > mx) { mx = lo[v]; am = v; }
+        double se = 0; for (int v = 0; v < V; v++) se += exp((double)lo[v] - mx);
+        nll += -((double)lo[ids[t+1]] - mx - log(se));
+        if (of) fprintf(of, "%d\n", am);
+        free(lo);
+    }
+    if (of) fclose(of);
+    printf("PPL: %.4f over %d tokens (%.1f s)\n", exp(nll / (n - 1)), n - 1, now_s() - t0);
+    json_free(js); free(buf); free(ids);
+    return 0;
 }
 
 /* ---------- generazione di un turno ----------

@@ -28,3 +28,4 @@ stats*.txt
 *.log
 c/nn/*.o
 c/build/
+__pycache__/

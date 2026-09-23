@@ -1,0 +1,18 @@
+When in the Course of human events, it becomes necessary for one people to dissolve the political bands which have connected them with another, and to assume among the powers of the earth, the separate and equal station to which the Laws of Nature and of Nature's God entitle them, a decent respect to the opinions of mankind requires that they should declare the causes which impel them to the separation.
+
+The sun had not yet risen over the harbour when the fishermen began to load their nets. Each boat carried two men, a lantern, and enough bread for the day. The older men talked about the weather, which had been unusually calm for the season, while the younger ones checked the ropes and argued about the price of fuel.
+
+def moving_average(values, window):
+    if window <= 0:
+        raise ValueError("window must be positive")
+    result = []
+    total = 0.0
+    for i, v in enumerate(values):
+        total += v
+        if i >= window:
+            total -= values[i - window]
+        if i >= window - 1:
+            result.append(total / window)
+    return result
+
+Камера установлена на перекрёстке и передаёт изображение на сервер каждые две секунды. Если связь пропадает, кадры сохраняются локально, а затем отправляются пакетом.

@@ -131,6 +131,8 @@ static int engine_main(int argc, char **argv) {
 
     const char *refpath = getenv("REF");
     if (refpath) return run_ref(&m, refpath);
+    const char *pplpath = getenv("PPL");
+    if (pplpath && *pplpath) return run_ppl(&m, pplpath);
 
     Tok T;
     if (g_gguf) tok_load_gguf(&T, &g_gguf_meta);   /* single-file: vocab/merges dai metadati */
