@@ -264,3 +264,26 @@ int lt_fused_bitexact(void) {
     free(la); free(lb);
     return 0;
 }
+
+/* SAVE_PACKED container: QBITS=4 Q4R4 model saved, reloaded from the
+ * container (raw packed read) -> bit-identical logits, prefill + decode */
+int lt_packed_roundtrip(void) {
+    const char *dir = tst_dir("lfm2_tiny_hf");
+    lt_write_dir(dir);
+    char src[512]; snprintf(src, sizeof src, "%s", dir);
+    const char *pk = tst_dir("lfm2_tiny_packed");
+    int save = g_q4fmt; g_q4fmt = 1;
+    Model a; model_init(&a, src, 4);
+    CHECK(a.L[0].in_proj.fmt == WF_Q4R4 && a.base.lm_head.fmt == WF_Q4R4);
+    model_save_packed(&a, src, pk);
+    Model b; model_init(&b, pk, 4);
+    CHECK(b.L[1].q.fmt == WF_Q4R4 && b.base.lm_head.fmt == WF_Q4R4);
+    int T = 8;
+    float *la = calloc((size_t)T*LV, sizeof(float)), *lb = calloc((size_t)T*LV, sizeof(float));
+    kv_alloc(&a, 16); kv_alloc(&b, 16);
+    lt_engine_logits(&a, 3, T, la); lt_engine_logits(&b, 3, T, lb);
+    CHECK(!memcmp(la + 2*LV, lb + 2*LV, (size_t)(T-2)*LV*sizeof(float)));
+    g_q4fmt = save;
+    free(la); free(lb);
+    return 0;
+}

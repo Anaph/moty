@@ -124,6 +124,8 @@ static int engine_main(int argc, char **argv) {
 
     Model m;
     model_init_ex(&m, snap, e.qbits, e.budget, maxctx);
+    const char *savep = getenv("SAVE_PACKED");
+    if (savep && *savep) { model_save_packed(&m, snap, savep); return 0; }
     banner(&m);
     /* banner precede il ramo REF: l'hook gira UNA volta per entrambi i percorsi */
     ENGINE_POST_INIT(&m);
