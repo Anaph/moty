@@ -76,6 +76,14 @@ void    moty_hw_dn_row_update_dot(float *restrict S, float ki,
 void    moty_hw_quant_g32(const float *x, int I, int8_t *xq, float *xs, int32_t *xsum);
 void    moty_hw_q4r4_gemm(const uint8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
                           const int32_t *xsum, int nb, int ns, float *y, int ys);
+/* prefill tile: 4 tokens (activation rows ldx apart) with per-group scales
+ * pre-arranged by moty_hw_q4r4_tile_scales (xst[g*4+t] = xs[t][g],
+ * xct[g*4+t] = 8*xsum*xs) */
+void    moty_hw_q4r4_gemm4t(const uint8_t *w, const uint16_t *d, const int8_t *xq, int64_t ldx,
+                            const float *xst, const float *xct, int nb, float *y, int ys);
+void    moty_hw_q4r4_gemm4t_ref(const uint8_t *w, const uint16_t *d, const int8_t *xq, int64_t ldx,
+                                const float *xst, const float *xct, int nb, float *y, int ys);
+void    moty_hw_q4r4_tile_scales(const float *xs, const int32_t *xsum, int nb, float *xst, float *xct);
 /* scalar references of the two above (always compiled: tests compare) */
 void    moty_hw_quant_g32_ref(const float *x, int I, int8_t *xq, float *xs, int32_t *xsum);
 void    moty_hw_q4r4_gemm_ref(const uint8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,

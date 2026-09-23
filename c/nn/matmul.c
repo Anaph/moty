@@ -319,8 +319,8 @@ void moty_matmul_q6k_native(float *y, const float *x, const uint8_t *raw,
 #define Q4R4_TT 32
 void moty_matmul_q4r4_s(float *y, const float *x, const uint8_t *q4, const uint16_t *s16,
                         int S, int I, int O) {
-    static int8_t *xq = NULL; static float *xs = NULL; static int32_t *xsum = NULL;
-    static int64_t c1 = 0, c2 = 0, c3 = 0;
+    static int8_t *xq = NULL; static float *xs = NULL, *xst = NULL, *xct = NULL; static int32_t *xsum = NULL;
+    static int64_t c1 = 0, c2 = 0, c3 = 0, c4 = 0, c5 = 0;
     int nb = I / 32, O4 = (O + 3) / 4, full = O / 4;
     grow((void **)&xq, &c1, (int64_t)S*I, 1, "q4r4 xq");
     grow((void **)&xs, &c2, (int64_t)S*nb, sizeof(float), "q4r4 xs");
@@ -330,19 +330,32 @@ void moty_matmul_q4r4_s(float *y, const float *x, const uint8_t *q4, const uint1
         for (int s = 0; s < S; s++) moty_hw_quant_g32(x + (int64_t)s*I, I, xq + (int64_t)s*I, xs + (int64_t)s*nb, xsum + (int64_t)s*nb);
     } else
         for (int s = 0; s < S; s++) moty_hw_quant_g32(x + (int64_t)s*I, I, xq + (int64_t)s*I, xs + (int64_t)s*nb, xsum + (int64_t)s*nb);
+    /* 4-token groups: scales rearranged once (moty_hw_q4r4_gemm4t layout) */
+    int S4 = S / 4;
+    if (S4) {
+        grow((void **)&xst, &c4, (int64_t)S4*nb*4, sizeof(float), "q4r4 xst");
+        grow((void **)&xct, &c5, (int64_t)S4*nb*4, sizeof(float), "q4r4 xct");
+        for (int k = 0; k < S4; k++)
+            moty_hw_q4r4_tile_scales(xs + (int64_t)k*4*nb, xsum + (int64_t)k*4*nb, nb, xst + (int64_t)k*nb*4, xct + (int64_t)k*nb*4);
+    }
     size_t bw = (size_t)nb * 64, bd = (size_t)nb * 4;
     for (int t0 = 0; t0 < S; t0 += Q4R4_TT) {
-        int ns = S - t0 < Q4R4_TT ? S - t0 : Q4R4_TT;
+        int ns = S - t0 < Q4R4_TT ? S - t0 : Q4R4_TT, n4 = ns / 4 * 4;
         const int8_t *xq_t = xq + (int64_t)t0*I;
         const float *xs_t = xs + (int64_t)t0*nb; const int32_t *xm_t = xsum + (int64_t)t0*nb;
         float *y_t = y + (int64_t)t0*O;
         #pragma omp parallel for schedule(dynamic, 8)
-        for (int ob = 0; ob < full; ob++)
-            moty_hw_q4r4_gemm(q4 + ob*bw, s16 + ob*bd, xq_t, xs_t, xm_t, nb, ns, y_t + ob*4, O);
-        if (full < O4) {                              /* ragged last block: rows O%4 */
-            float tmp[4 * Q4R4_TT];
-            moty_hw_q4r4_gemm(q4 + full*bw, s16 + full*bd, xq_t, xs_t, xm_t, nb, ns, tmp, 4);
-            for (int t = 0; t < ns; t++) for (int r = 0; r < O - full*4; r++) y_t[(int64_t)t*O + full*4 + r] = tmp[t*4 + r];
+        for (int ob = 0; ob < O4; ob++) {
+            float tmp[4 * Q4R4_TT]; int ragged = ob == full;   /* rows O%4 of the last block */
+            float *yo = ragged ? tmp : y_t + ob*4; int ys = ragged ? 4 : O;
+            for (int t = 0; t < n4; t += 4)
+                moty_hw_q4r4_gemm4t(q4 + ob*bw, s16 + ob*bd, xq_t + (int64_t)t*I, I,
+                                    xst + ((int64_t)(t0 + t)/4)*nb*4, xct + ((int64_t)(t0 + t)/4)*nb*4, nb, yo + (int64_t)t*ys, ys);
+            if (n4 < ns)
+                moty_hw_q4r4_gemm(q4 + ob*bw, s16 + ob*bd, xq_t + (int64_t)n4*I, xs_t + (int64_t)n4*nb, xm_t + (int64_t)n4*nb,
+                                  nb, ns - n4, yo + (int64_t)n4*ys, ys);
+            if (ragged)
+                for (int t = 0; t < ns; t++) for (int r = 0; r < O - full*4; r++) y_t[(int64_t)t*O + full*4 + r] = tmp[t*4 + r];
         }
     }
 }

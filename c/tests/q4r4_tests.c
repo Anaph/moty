@@ -117,6 +117,60 @@ int q4_gemm_int_exact(void) {
     return 0;
 }
 
+/* 4-token tile kernel: integer-exact with unit scales (incl. the int16 lane
+ * worst case), and against the per-token reference with real scales */
+int q4_gemm4t(void) {
+    enum { NB = 9, I = NB*32 };
+    uint8_t w[NB*64]; uint16_t d[NB*4]; int8_t xq[4*I]; float xs[4*NB], xst[NB*4], xct[NB*4], y[16], yr[16], y1[16];
+    int32_t xm[4*NB];
+    for (int i = 0; i < NB*64; i++) w[i] = (uint8_t)(q4_frnd() * 512);
+    for (int g = 0; g < NB; g++) memset(w + g*64 + 32, 0xff, 16);   /* row 2: codes 15 */
+    for (int i = 0; i < NB*4; i++) d[i] = 0x3c00;
+    for (int t = 0; t < 4; t++) for (int g = 0; g < NB; g++) {
+        int32_t s = 0;
+        for (int j = 0; j < 32; j++) { int v = t == 1 ? 127 : t == 2 ? -127 : (int)(q4_frnd() * 254); xq[t*I+g*32+j] = (int8_t)v; s += v; }
+        xs[t*NB+g] = 1.f; xm[t*NB+g] = s;
+    }
+    moty_hw_q4r4_tile_scales(xs, xm, NB, xst, xct);
+    moty_hw_q4r4_gemm4t(w, d, xq, I, xst, xct, NB, y, 4);
+    moty_hw_q4r4_gemm4t_ref(w, d, xq, I, xst, xct, NB, yr, 4);
+    for (int t = 0; t < 4; t++) for (int r = 0; r < 4; r++) {
+        int64_t e = 0;
+        for (int g = 0; g < NB; g++) for (int j = 0; j < 16; j++) {
+            uint8_t b = w[g*64 + r*16 + j];
+            e += ((b & 15) - 8) * xq[t*I+g*32+j] + ((b >> 4) - 8) * xq[t*I+g*32+16+j];
+        }
+        CHECK(y[t*4+r] == (float)e && yr[t*4+r] == (float)e);
+    }
+    /* real scales: same result as the per-token GEMM reference up to f32 rounding */
+    for (int i = 0; i < NB*4; i++) d[i] = moty_f32_to_f16(q4_frnd() * 0.02f);
+    for (int t = 0; t < 4; t++) for (int g = 0; g < NB; g++) xs[t*NB+g] = 0.01f + q4_frnd() * 0.005f;
+    moty_hw_q4r4_tile_scales(xs, xm, NB, xst, xct);
+    moty_hw_q4r4_gemm4t(w, d, xq, I, xst, xct, NB, y, 4);
+    moty_hw_q4r4_gemm_ref(w, d, xq, xs, xm, NB, 4, y1, 4);
+    for (int k = 0; k < 16; k++) CHECK(fabsf(y[k] - y1[k]) <= 1e-4f * (fabsf(y1[k]) + 1.f));
+    return 0;
+}
+
+/* the generic entry point on long rows: nb > 64 takes the chunked 4-token
+ * path (activation rows stay I apart), ns = 6 adds a GEMV tail */
+int q4_gemm_long_rows(void) {
+    enum { NB = 150, I = NB*32, NS = 6 };
+    static uint8_t w[NB*64]; static uint16_t d[NB*4]; static int8_t xq[NS*I];
+    float xs[NS*NB], y[NS*4], yr[NS*4]; int32_t xm[NS*NB];
+    for (int i = 0; i < NB*64; i++) w[i] = (uint8_t)(q4_frnd() * 512);
+    for (int i = 0; i < NB*4; i++) d[i] = moty_f32_to_f16(q4_frnd() * 0.02f);
+    for (int t = 0; t < NS; t++) for (int g = 0; g < NB; g++) {
+        int32_t s = 0;
+        for (int j = 0; j < 32; j++) { int v = (int)(q4_frnd() * 254); xq[t*I+g*32+j] = (int8_t)v; s += v; }
+        xs[t*NB+g] = 0.01f + q4_frnd() * 0.005f; xm[t*NB+g] = s;
+    }
+    moty_hw_q4r4_gemm(w, d, xq, xs, xm, NB, NS, y, 4);
+    moty_hw_q4r4_gemm_ref(w, d, xq, xs, xm, NB, NS, yr, 4);
+    for (int k = 0; k < NS*4; k++) CHECK(fabsf(y[k] - yr[k]) <= 1e-4f * (fabsf(yr[k]) + 1.f));
+    return 0;
+}
+
 /* full driver vs a dequantized double reference: ragged O, decode (S=1),
  * the 4-token GEMM + tails (S=7) and more than one 32-token tile (S=37) */
 static int q4_matmul_case(int O, int I, int S) {
@@ -162,7 +216,7 @@ int main(void) {
     struct { const char *n; int (*f)(void); } T[] = {
         {"f16_roundtrip", q4_f16_roundtrip}, {"quant_g32_exact", q4_quant_g32_exact},
         {"pack_noclip", q4_pack_noclip}, {"gemm_int_exact", q4_gemm_int_exact},
-        {"matmul_driver", q4_matmul_driver} };
+        {"matmul_driver", q4_matmul_driver}, {"gemm4t", q4_gemm4t}, {"gemm_long_rows", q4_gemm_long_rows} };
     int bad = 0;
     for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) {
         int r = T[i].f(); bad |= r;
