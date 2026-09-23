@@ -135,6 +135,15 @@ static int engine_main(int argc, char **argv) {
     if (refpath) return run_ref(&m, refpath);
     const char *pplpath = getenv("PPL");
     if (pplpath && *pplpath) return run_ppl(&m, pplpath);
+    /* after REF/PPL: validation and perplexity always use the full head */
+    static MotyHeadSL head_sl;
+    if (g_head_topk > 0) {
+        if (moty_nn_head_sl_build(&head_sl, &m.base.lm_head, g_head_topk)) {
+            m.base.head_sl = &head_sl;
+            fprintf(stderr, "[" ENGINE_TAG "] HEAD_TOPK=%d: 1-bit head %.1f MB\n", head_sl.K,
+                    (double)head_sl.V * head_sl.D / 8 / 1048576.0);
+        } else fprintf(stderr, "[" ENGINE_TAG "] HEAD_TOPK ignored: needs a Q4R4 lm_head (QBITS=4 Q4FMT=r4)\n");
+    }
 
     Tok T;
     if (g_gguf) tok_load_gguf(&T, &g_gguf_meta);   /* single-file: vocab/merges dai metadati */

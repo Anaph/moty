@@ -24,6 +24,7 @@ extern int moty_rt_g_micro_drop;            /* MICRO_DROP=0 */
 extern int moty_rt_g_tokens_dump;           /* TOKENS=1 */
 extern int moty_rt_g_q4fmt;                 /* Q4FMT: 1 Q4R4, 0 legacy grouped int4 */
 extern int moty_rt_g_embed_disk;            /* EMBED=disk */
+extern int moty_rt_g_head_topk;             /* HEAD_TOPK: lm_head shortlist size (0 off) */
 
 int      moty_rt_parse_env(MotyRunConfig *e);   /* 0 = valore invalido (msg stampato) */
 void     moty_rt_omp_hot_tune(char **argv);     /* re-exec una volta sola; MOTY_NO_OMP_TUNE spegne */
@@ -40,5 +41,6 @@ int64_t  moty_rt_budget_from_env(const char *gb, const char *frac, int64_t total
 #define g_tokens_dump   moty_rt_g_tokens_dump
 #define g_q4fmt         moty_rt_g_q4fmt
 #define g_embed_disk    moty_rt_g_embed_disk
+#define g_head_topk     moty_rt_g_head_topk
 #endif
 #endif /* MOTY_RT_CONFIG_H */

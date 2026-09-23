@@ -128,12 +128,29 @@ int op_attn_rows(void) {
     return 0;
 }
 
+/* bit-plane popcounts: kernel == reference exactly (integer), incl. more
+ * than 16 chunks (the u8 lane flush) and a row stride != nbytes */
+int op_popc4x3(void) {
+    static const int nbs[3] = {16, 128, 272};
+    for (int k = 0; k < 3; k++) {
+        int nb = nbs[k]; int64_t bs = nb + 16;
+        uint8_t *b = malloc(4*bs), *pl = malloc(3*nb); uint32_t c0[12], c1[12];
+        for (int i = 0; i < 4*bs; i++) b[i] = (uint8_t)(op_frnd() * 512);
+        for (int i = 0; i < 3*nb; i++) pl[i] = (uint8_t)(op_frnd() * 512);
+        memset(b, 0xff, nb); memset(pl, 0xff, nb);            /* row 0 x plane 0: all bits */
+        moty_hw_popc4x3(b, bs, pl, nb, c0); moty_hw_popc4x3_ref(b, bs, pl, nb, c1);
+        CHECK(!memcmp(c0, c1, sizeof c0) && c0[0] == (uint32_t)nb*8);
+        free(b); free(pl);
+    }
+    return 0;
+}
+
 #ifdef OPS_TEST_MAIN
 int main(void) {
     struct { const char *n; int (*f)(void); } T[] = {
         {"rmsnorm", op_rmsnorm}, {"silu_mul", op_silu_mul}, {"softmax", op_softmax},
         {"axpy_add", op_axpy_add}, {"shortconv", op_shortconv}, {"rope_table", op_rope_table},
-        {"attn_rows", op_attn_rows} };
+        {"attn_rows", op_attn_rows}, {"popc4x3", op_popc4x3} };
     int bad = 0;
     for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) { int r = T[i].f(); bad |= r; printf("[%s] %s\n", r ? "FAIL" : " OK ", T[i].n); }
     printf("tier: %s\n", HW_IDOT_KERNEL);

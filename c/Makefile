@@ -156,10 +156,10 @@ endif
 # ---- libmoty-nn (M2 core + M3 layer): UNA copia di tutta la compute ----
 NN_CORE_SRCS = nn/alloc.c nn/quant.c nn/mat.c nn/matmul.c nn/norm.c nn/rope.c \
                nn/attn_kernels.c nn/sample.c nn/attn.c nn/conv.c nn/ffn.c \
-               nn/moe.c runtime/moecache.c io/tier.c
+               nn/moe.c nn/head.c runtime/moecache.c io/tier.c
 NN_CORE_DEPS = nn/nn_alloc.h nn/nn_quant.h nn/nn_mat.h nn/nn_matmul.h \
                nn/nn_norm.h nn/nn_rope.h nn/nn_attn_kernels.h nn/nn_sample.h \
-               nn/attn.h nn/conv.h nn/ffn.h nn/moe.h runtime/moe.h io/tier.h
+               nn/attn.h nn/conv.h nn/ffn.h nn/moe.h nn/head.h runtime/moe.h io/tier.h
 libmoty-nn.a: $(NN_CORE_SRCS) $(NN_CORE_DEPS) libmoty-hw.a
 	@for src in $(NN_CORE_SRCS); do \
 		obj=$${src%.c}.o; \

@@ -58,7 +58,7 @@ endif()
 # libmoty-nn completa (M3): stessa lista del Makefile
 set(MOTY_NN_SRCS ../nn/alloc.c ../nn/quant.c ../nn/mat.c ../nn/matmul.c
                  ../nn/norm.c ../nn/rope.c ../nn/attn_kernels.c ../nn/sample.c
-                 ../nn/attn.c ../nn/conv.c ../nn/ffn.c ../nn/moe.c
+                 ../nn/attn.c ../nn/conv.c ../nn/ffn.c ../nn/moe.c ../nn/head.c
                  ../runtime/moecache.c ../io/tier.c)
 add_library(moty_core STATIC ${MOTY_NN_SRCS})
 target_include_directories(moty_core PRIVATE ${ENGDIR})
@@ -120,6 +120,7 @@ moty_test(test_qwen    qwen_tests.c    qwen_gtest.cc)
 moty_test(test_lfm2    lfm2_tests.c    lfm2_gtest.cc)
 moty_test(test_q4r4    q4r4_tests.c    q4r4_gtest.cc)
 moty_test(test_ops     ops_tests.c     ops_gtest.cc)
+moty_test(test_head    head_tests.c    head_gtest.cc)
 moty_test(test_gemma   gemma_tests.c   gemma_gtest.cc)
 moty_test(test_glm     glm_tests.c     glm_gtest.cc)
 

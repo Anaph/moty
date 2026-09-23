@@ -59,11 +59,11 @@ jobs:
       # Q4R4 int4 GEMV/GEMM and the row ops (hw/hw_q4r4.h, hw/hw_ops.h) are
       # ARMv8.0 NEON only (no SDOT); x86 ctest runs their scalar references,
       # so the NEON kernels are checked here on an emulated Cortex-A53.
-      - name: aarch64 Q4R4 + row-op kernels vs scalar references (qemu cortex-a53)
+      - name: aarch64 Q4R4, row-op and lm_head shortlist kernels vs scalar references (qemu cortex-a53)
         run: |
           cd c
           make -j libmoty-hw.a libmoty-nn.a CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar ARCH=armv8-a
-          for t in q4r4:Q4R4 ops:OPS; do
+          for t in q4r4:Q4R4 ops:OPS head:HEAD; do
             n=${t%%:*}
             aarch64-linux-gnu-gcc -O2 -march=armv8-a -fopenmp -static -I. -D${t#*:}_TEST_MAIN \
               tests/${n}_tests.c libmoty-nn.a libmoty-hw.a -lm -o /tmp/${n}_test

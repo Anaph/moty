@@ -705,7 +705,8 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         g_tta.h_valid = 1;
     }
     float *logit = falloc(c->vocab);
-    mat_apply(logit, last, &m->base.lm_head, 1);
+    /* the shortlist ranks rows of the base head: off with an lm_head adapter */
+    moty_nn_head_apply(logit, last, &m->base.lm_head, m->lm_lora.r ? NULL : m->base.head_sl);
     lora_apply(&m->lm_lora, logit, last, 1, m->base.lm_head.I, m->base.lm_head.O);
     OP_ACC(OP_LM_HEAD, t_h);
     free(x); free(nrm); free(tmp); free(last);

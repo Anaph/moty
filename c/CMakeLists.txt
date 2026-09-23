@@ -62,7 +62,7 @@ target_link_libraries(moty_hw PUBLIC ${MOTY_OMPC})
 
 set(MOTY_NN_SRCS nn/alloc.c nn/quant.c nn/mat.c nn/matmul.c nn/norm.c nn/rope.c
                  nn/attn_kernels.c nn/sample.c nn/attn.c nn/conv.c nn/ffn.c
-                 nn/moe.c runtime/moecache.c io/tier.c)
+                 nn/moe.c nn/head.c runtime/moecache.c io/tier.c)
 add_library(moty_nn STATIC ${MOTY_NN_SRCS})
 target_link_libraries(moty_nn PUBLIC moty_hw)
 

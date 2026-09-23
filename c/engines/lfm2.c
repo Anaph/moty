@@ -297,7 +297,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     double t_c1 = 0; if (PROF_ON) t_c1 = now_s(); else (void)t_c1;
     OP_T(t_h);
     float *last = falloc(D); rmsnorm_row(last, x + (int64_t)(S-1)*D, m->base.final_norm, D, c->eps);
-    float *logit = falloc(c->vocab); mat_apply(logit, last, &m->base.lm_head, 1);
+    float *logit = falloc(c->vocab); moty_nn_head_apply(logit, last, &m->base.lm_head, m->base.head_sl);
     OP_ACC(OP_LM_HEAD, t_h);
     PROF_ACC(log, t_c1);
     PROF_WINDOW(m->c.vocab);

@@ -12,6 +12,7 @@
 #include "nn/nn_attn_kernels.h" /* L1: att_scores_*, att_accum_* */
 #include "nn/nn_mat.h"          /* L1: Mat, MODEL_COMMON_FIELDS, mat_apply, kv_store_row */
 #include "nn/nn_norm.h"         /* L1: rmsnorm_row, softmax_row */
-#include "nn/nn_sample.h"       /* L1: pick_tok, nucleus, stop-set */
+#include "nn/nn_sample.h"
+#include "nn/head.h"            /* L1: two-stage lm_head (HEAD_TOPK) */       /* L1: pick_tok, nucleus, stop-set */
 
 #endif /* NN_H */

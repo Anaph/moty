@@ -101,6 +101,9 @@ void    moty_hw_attn_scores(float *sc, const float *q, const float *K, int n, in
 void    moty_hw_attn_accum(float *cx, const float *sc, const float *V, int n, int hd);
 void    moty_hw_attn_scores_ref(float *sc, const float *q, const float *K, int n, int hd, float scale);
 void    moty_hw_attn_accum_ref(float *cx, const float *sc, const float *V, int n, int hd);
+/* cnt[r*3+p] = popcount(b[r*bs ..] & pl[p*nbytes ..]) over nbytes (%16 == 0), r<4, p<3 */
+void    moty_hw_popc4x3(const uint8_t *b, int64_t bs, const uint8_t *pl, int nbytes, uint32_t *cnt);
+void    moty_hw_popc4x3_ref(const uint8_t *b, int64_t bs, const uint8_t *pl, int nbytes, uint32_t *cnt);
 
 /* Legacy spellings: engines/nn headers keep calling dot_i8i8(...) —
  * rewritten to the exported symbol. Delete when M3/M4 migrate callers

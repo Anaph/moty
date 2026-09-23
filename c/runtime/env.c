@@ -20,6 +20,7 @@ int moty_rt_g_q4fmt = 1;
 int moty_rt_g_q4fmt = 0;
 #endif
 int moty_rt_g_embed_disk = 0;               /* EMBED=disk: no resident table */
+int moty_rt_g_head_topk = 0;                /* HEAD_TOPK=K: two-stage lm_head (nn/head.h) */
 int moty_rt_g_prefill_chunk = 0;
 int moty_rt_g_kv_bits = 0;
 int moty_rt_g_micro = 0;
@@ -74,6 +75,10 @@ int moty_rt_parse_env(MotyRunConfig *e) {
         if (!strcmp(f, "disk")) moty_rt_g_embed_disk = 1;
         else if (!strcmp(f, "ram")) moty_rt_g_embed_disk = 0;
         else { fprintf(stderr, "EMBED deve essere ram o disk\n"); return 0; }
+    }
+    if (getenv("HEAD_TOPK")) {
+        moty_rt_g_head_topk = atoi(getenv("HEAD_TOPK"));
+        if (moty_rt_g_head_topk < 0) { fprintf(stderr, "HEAD_TOPK deve essere >= 0\n"); return 0; }
     }
     e->ngen = getenv("NGEN") ? atoi(getenv("NGEN")) : 256;
     if (getenv("PREFILL_CHUNK")) moty_rt_g_prefill_chunk = atoi(getenv("PREFILL_CHUNK"));

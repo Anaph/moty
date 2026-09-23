@@ -45,6 +45,7 @@ typedef struct MotyCommon {
     float *embed, *final_norm;
     int8_t *embed_q; float *embed_qs;                /* QBITS=8: embedding int8 */
     Mat lm_head; int lm_tied;
+    struct MotyHeadSL *head_sl;                      /* HEAD_TOPK shortlist (nn/head.h) or NULL */
     float **K, **V; int kv_len, max_t;               /* KV f32: [li][h*max_t*hd] */
     int8_t **K8, **V8; float **Ks, **Vs;             /* KV_BITS=8: [li] + scale per (h,t) */
     float *att_sc;                                   /* score per-thread: nth*max_t */

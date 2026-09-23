@@ -1,6 +1,6 @@
 /* hw_ops.h — non-matmul row ops (libmoty-hw, included by hw_impl.h):
  * RMSNorm, SiLU*up, softmax, y+=a*x, y+=x, short-conv step (depthwise
- * causal conv1d, K taps, state [D][K-1]).
+ * causal conv1d, K taps, state [D][K-1]), bit-plane popcounts.
  *
  * Every op has a *_ref scalar reference that is ALSO the portable kernel
  * (bit-identical to the loops it replaced in nn/ and the engines, so non-NEON
@@ -56,6 +56,18 @@ void moty_hw_attn_scores_ref(float *sc, const float *q, const float *K, int n, i
 void moty_hw_attn_accum_ref(float *cx, const float *sc, const float *V, int n, int hd) {
     for (int d = 0; d < hd; d++) cx[d] = 0;
     for (int t = 0; t < n; t++) moty_hw_axpy(cx, sc[t], V + (int64_t)t*hd, hd);
+}
+
+/* bit-plane popcounts of a 1-bit-weight dot product (the lm_head shortlist,
+ * nn/head.c): 4 weight-sign rows b + r*bs and 3 activation bit-planes
+ * pl + p*nbytes; cnt[r*3 + p] = popcount(b_r & pl_p) over nbytes bytes
+ * (nbytes a multiple of 16). */
+void moty_hw_popc4x3_ref(const uint8_t *b, int64_t bs, const uint8_t *pl, int nbytes, uint32_t *cnt) {
+    for (int r = 0; r < 4; r++) for (int p = 0; p < 3; p++) {
+        uint32_t c = 0;
+        for (int i = 0; i < nbytes; i++) c += (uint32_t)__builtin_popcount(b[r*bs + i] & pl[p*nbytes + i]);
+        cnt[r*3 + p] = c;
+    }
 }
 
 #if defined(__aarch64__) && defined(__ARM_NEON)
@@ -186,6 +198,31 @@ void moty_hw_attn_accum(float *cx, const float *sc, const float *V, int n, int h
     _Pragma("GCC unroll 16") for (int i = 0; i < 16; i++) vst1q_f32(cx + 4*i, a[i]);
 }
 
+/* 12 named u8 accumulators (an indexed array would live on the stack):
+ * per 16 bytes 4 row loads + 3 plane loads, 12 AND + CNT + ADD */
+#define POPC_ROW(w, a0, a1, a2) \
+    a0 = vaddq_u8(a0, vcntq_u8(vandq_u8(w, p0))); a1 = vaddq_u8(a1, vcntq_u8(vandq_u8(w, p1))); \
+    a2 = vaddq_u8(a2, vcntq_u8(vandq_u8(w, p2)));
+void moty_hw_popc4x3(const uint8_t *b, int64_t bs, const uint8_t *pl, int nbytes, uint32_t *cnt) {
+    for (int k = 0; k < 12; k++) cnt[k] = 0;
+    for (int c0 = 0; c0 < nbytes; c0 += 16*16) {      /* u8 lanes: <= 16 chunks x 8 bits */
+        int c1 = nbytes - c0 < 16*16 ? nbytes : c0 + 16*16;
+        uint8x16_t z = vdupq_n_u8(0);
+        uint8x16_t a00 = z, a01 = z, a02 = z, a10 = z, a11 = z, a12 = z;
+        uint8x16_t a20 = z, a21 = z, a22 = z, a30 = z, a31 = z, a32 = z;
+        for (int i = c0; i < c1; i += 16) {
+            uint8x16_t p0 = vld1q_u8(pl + i), p1 = vld1q_u8(pl + nbytes + i), p2 = vld1q_u8(pl + 2*nbytes + i);
+            uint8x16_t w0 = vld1q_u8(b + i), w1 = vld1q_u8(b + bs + i), w2 = vld1q_u8(b + 2*bs + i), w3 = vld1q_u8(b + 3*bs + i);
+            POPC_ROW(w0, a00, a01, a02) POPC_ROW(w1, a10, a11, a12)
+            POPC_ROW(w2, a20, a21, a22) POPC_ROW(w3, a30, a31, a32)
+        }
+        cnt[0] += vaddlvq_u8(a00); cnt[1] += vaddlvq_u8(a01); cnt[2] += vaddlvq_u8(a02);
+        cnt[3] += vaddlvq_u8(a10); cnt[4] += vaddlvq_u8(a11); cnt[5] += vaddlvq_u8(a12);
+        cnt[6] += vaddlvq_u8(a20); cnt[7] += vaddlvq_u8(a21); cnt[8] += vaddlvq_u8(a22);
+        cnt[9] += vaddlvq_u8(a30); cnt[10] += vaddlvq_u8(a31); cnt[11] += vaddlvq_u8(a32);
+    }
+}
+#undef POPC_ROW
 void moty_hw_shortconv_step(float *y, const float *b, const float *c, const float *x,
                             const float *w, float *state, int K, int c0, int c1) {
     int ch = c0;
@@ -213,6 +250,9 @@ void moty_hw_add(float *y, const float *x, int64_t n) { moty_hw_add_ref(y, x, n)
 void moty_hw_shortconv_step(float *y, const float *b, const float *c, const float *x,
                             const float *w, float *state, int K, int c0, int c1) {
     moty_hw_shortconv_step_ref(y, b, c, x, w, state, K, c0, c1);
+}
+void moty_hw_popc4x3(const uint8_t *b, int64_t bs, const uint8_t *pl, int nbytes, uint32_t *cnt) {
+    moty_hw_popc4x3_ref(b, bs, pl, nbytes, cnt);
 }
 void moty_hw_attn_scores(float *sc, const float *q, const float *K, int n, int hd, float scale) {
     moty_hw_attn_scores_ref(sc, q, K, n, hd, scale);
