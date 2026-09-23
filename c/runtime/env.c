@@ -1,5 +1,8 @@
 /* env.c — M4 libmoty-runtime: manopole ambiente + tuning OMP, una copia.
  * Corpo portato 1:1 da rt_env_cfg.h (era static-per-TU). */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE            /* sched_setaffinity / CPU_SET (hot-tune re-exec) */
+#endif
 #include "runtime/config.h"
 #include "nn/nn_sample.h"      /* moty_g_temp/nuc/rng */
 #include "util/compat.h"       /* compat_total_ram_bytes */
@@ -8,6 +11,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 const char *moty_rt_g_gguf = NULL;
 int moty_rt_g_qgroup = 32;
@@ -35,6 +41,20 @@ int64_t moty_rt_budget_from_env(const char *gb, const char *frac, int64_t total_
 
 void moty_rt_omp_hot_tune(char **argv) {
     if (!getenv("MOTY_OMP_TUNED") && !getenv("MOTY_NO_OMP_TUNE")) {
+#if defined(__linux__)
+        /* with OMP_PROC_BIND/OMP_PLACES already in the environment libgomp has
+         * pinned this (master) thread to the first place before main(), and
+         * exec inherits the one-CPU mask: the re-executed engine then saw a
+         * single CPU and ran one thread. Widen the mask back to every online
+         * CPU (to combine taskset with explicit OMP binding, set
+         * MOTY_NO_OMP_TUNE=1). */
+        if (getenv("OMP_PROC_BIND") || getenv("OMP_PLACES")) {
+            cpu_set_t all; CPU_ZERO(&all);
+            long n = sysconf(_SC_NPROCESSORS_ONLN);
+            for (long c = 0; c < n && c < CPU_SETSIZE; c++) CPU_SET(c, &all);
+            if (sched_setaffinity(0, sizeof all, &all)) perror("[OMP] sched_setaffinity");
+        }
+#endif
         setenv("OMP_WAIT_POLICY", "active", 0);
         setenv("GOMP_SPINCOUNT", "200000", 0);
         setenv("OMP_PROC_BIND", "close", 0);
