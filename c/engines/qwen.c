@@ -444,8 +444,13 @@ static void load_small(Model *m) {
         LDT(in_ln,  "input_layernorm.weight", D);
         LDT(post_ln,"post_attention_layernorm.weight", D);
         if (l->type == LT_FULL) {
-            LDT(qn, "self_attn.q_norm.weight", hd);  /* per testa, NON per hidden */
-            LDT(kn, "self_attn.k_norm.weight", hd);
+            /* QK-norm per head (Qwen3). Llama-family checkpoints (e.g. MiniCPM5,
+             * LlamaForCausalLM) have none: qn/kn stay NULL and are skipped. */
+            snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_norm.weight",i);
+            if (st_has(&m->S, nm)) {
+                LDT(qn, "self_attn.q_norm.weight", hd);  /* per testa, NON per hidden */
+                LDT(kn, "self_attn.k_norm.weight", hd);
+            }
             /* Qwen3.5: q_proj raddoppiato = [query|gate]. Rilevato dalla forma. */
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_proj.weight",i);
             l->gated = (st_numel(&m->S, nm) == (int64_t)2*H*hd*D);
@@ -526,12 +531,12 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         int pos = pos_base + s;
         for (int hh = 0; hh < H; hh++) {
             float *qh = q + s*qw + (int64_t)hh*hd;
-            rmsnorm_row(qh, qh, l->qn, hd, c->eps);
+            if (l->qn) rmsnorm_row(qh, qh, l->qn, hd, c->eps);
             rope_head(qh, pos, c->theta, c->rot);
         }
         for (int hh = 0; hh < KV; hh++) {
             float *kh = k + s*kw + (int64_t)hh*hd;
-            rmsnorm_row(kh, kh, l->kn, hd, c->eps);
+            if (l->kn) rmsnorm_row(kh, kh, l->kn, hd, c->eps);
             rope_head(kh, pos, c->theta, c->rot);
         }
     }

@@ -1471,3 +1471,102 @@ int qt_prefill_chunk_tta(void) {
     tta_setup(TTA_OFF, 0, 0);       /* non inquinare gli altri test */
     return 0;
 }
+
+/* ---- Llama-family (MiniCPM5-1B shape): no QK-norm, q-dim != hidden,
+ * GQA 4:1, untied lm_head. Engine vs an independent double reference
+ * (tests/ref_dense.h) at every position, prefill + decode. ---- */
+#include "ref_dense.h"
+enum { YD = 24, YL = 2, YH = 4, YKV = 1, YHD = 8, YI = 40, YV = 36 };
+static void qt_write_llama_dir(const char *dir) {
+    tst_write_text(dir, "config.json",
+        "{\"architectures\":[\"LlamaForCausalLM\"],\"model_type\":\"llama\","
+        "\"hidden_size\":24,\"num_hidden_layers\":2,\"num_attention_heads\":4,"
+        "\"num_key_value_heads\":1,\"head_dim\":8,\"intermediate_size\":40,"
+        "\"vocab_size\":36,\"rope_theta\":5000000,\"rms_norm_eps\":1e-06,"
+        "\"tie_word_embeddings\":false,\"eos_token_id\":[1,30],"
+        "\"max_position_embeddings\":128}");
+    tst_reset(23);
+    tst_add("model.embed_tokens.weight", "[36,24]", YV*YD, 1.0f, 0);
+    tst_add("lm_head.weight", "[36,24]", YV*YD, 1.0f, 0);
+    tst_add("model.norm.weight", "[24]", YD, 0, 1);
+    char nm[128];
+    for (int i = 0; i < YL; i++) {
+        #define AT(suffix, shape, numel, sc, ones) \
+            do { snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); tst_add(nm,shape,numel,sc,ones); } while(0)
+        AT("input_layernorm.weight", "[24]", YD, 0, 1);
+        AT("post_attention_layernorm.weight", "[24]", YD, 0, 1);
+        AT("self_attn.q_proj.weight", "[32,24]", YH*YHD*YD, 0.5f, 0);
+        AT("self_attn.k_proj.weight", "[8,24]", YKV*YHD*YD, 0.5f, 0);
+        AT("self_attn.v_proj.weight", "[8,24]", YKV*YHD*YD, 0.5f, 0);
+        AT("self_attn.o_proj.weight", "[24,32]", YD*YH*YHD, 0.5f, 0);
+        AT("mlp.gate_proj.weight", "[40,24]", YI*YD, 0.5f, 0);
+        AT("mlp.up_proj.weight",   "[40,24]", YI*YD, 0.5f, 0);
+        AT("mlp.down_proj.weight", "[24,40]", YD*YI, 0.5f, 0);
+        #undef AT
+    }
+    tst_write(dir);
+}
+
+static void qt_llama_ref(shards *S, const int *ids, int T, double *lo) {
+    char nm[128]; int D = YD, qw = YH*YHD, kw = YKV*YHD;
+    double *E = rd_load(S, "model.embed_tokens.weight", (int64_t)YV*D);
+    double *Hd = rd_load(S, "lm_head.weight", (int64_t)YV*D);
+    double *x = malloc(sizeof(double)*T*D), *nrm = malloc(sizeof(double)*T*D), *o = malloc(sizeof(double)*T*D);
+    for (int t = 0; t < T; t++) for (int d = 0; d < D; d++) x[t*D+d] = E[(int64_t)ids[t]*D+d];
+    #define LDW(suffix, n) (snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i), rd_load(S,nm,(n)))
+    for (int i = 0; i < YL; i++) {
+        double *in = LDW("input_layernorm.weight", D), *pn = LDW("post_attention_layernorm.weight", D);
+        double *Wq = LDW("self_attn.q_proj.weight", qw*D), *Wk = LDW("self_attn.k_proj.weight", kw*D);
+        double *Wv = LDW("self_attn.v_proj.weight", kw*D), *Wo = LDW("self_attn.o_proj.weight", D*qw);
+        double *W1 = LDW("mlp.gate_proj.weight", YI*D), *W3 = LDW("mlp.up_proj.weight", YI*D);
+        double *W2 = LDW("mlp.down_proj.weight", D*YI);
+        double *q = malloc(sizeof(double)*T*qw), *k = malloc(sizeof(double)*T*kw);
+        double *v = malloc(sizeof(double)*T*kw), *cx = malloc(sizeof(double)*T*qw);
+        for (int t = 0; t < T; t++) {
+            rd_rmsnorm(nrm+t*D, x+t*D, in, D, 1e-6);
+            rd_matvec(q+t*qw, Wq, nrm+t*D, qw, D); rd_matvec(k+t*kw, Wk, nrm+t*D, kw, D);
+            rd_matvec(v+t*kw, Wv, nrm+t*D, kw, D);
+            for (int hh = 0; hh < YH; hh++)  rd_rope(q+t*qw+hh*YHD, t, 5000000.0, YHD);
+            for (int hh = 0; hh < YKV; hh++) rd_rope(k+t*kw+hh*YHD, t, 5000000.0, YHD);
+        }
+        rd_attention(cx, q, k, v, T, YH, YKV, YHD);
+        for (int t = 0; t < T; t++) rd_matvec(o+t*D, Wo, cx+t*qw, D, qw);
+        for (int j = 0; j < T*D; j++) x[j] += o[j];
+        for (int t = 0; t < T; t++) { rd_rmsnorm(nrm+t*D, x+t*D, pn, D, 1e-6); rd_swiglu(o+t*D, W1, W3, W2, nrm+t*D, D, YI); }
+        for (int j = 0; j < T*D; j++) x[j] += o[j];
+        free(in); free(pn); free(Wq); free(Wk); free(Wv); free(Wo); free(W1); free(W3); free(W2);
+        free(q); free(k); free(v); free(cx);
+    }
+    #undef LDW
+    double *fw = rd_load(S, "model.norm.weight", D);
+    for (int t = 0; t < T; t++) { rd_rmsnorm(nrm, x+t*D, fw, D, 1e-6); rd_matvec(lo+(int64_t)t*YV, Hd, nrm, YV, D); }
+    free(fw); free(E); free(Hd); free(x); free(nrm); free(o);
+}
+
+int qt_llama_no_qknorm(void) {
+    const char *dir = tst_dir("qwen_tiny_llama");
+    qt_write_llama_dir(dir);
+    static const int ids[9] = {3, 7, 11, 2, 35, 19, 4, 28, 9};
+    int T = 9;
+    double *ref = malloc(sizeof(double)*T*YV);
+    Model m; model_init(&m, dir, 0);
+    CHECK(!m.base.lm_tied);
+    CHECK(m.c.n_eos == 2 && m.c.eos[0] == 1 && m.c.eos[1] == 30);
+    for (int i = 0; i < YL; i++) CHECK(m.L[i].qn == NULL && m.L[i].kn == NULL);
+    CHECK(m.L[0].q.O == YH*YHD && m.L[0].o.I == YH*YHD);
+    qt_llama_ref(&m.S, ids, T, ref);
+    kv_alloc(&m, 16);
+    float *l = step(&m, ids, 4, 0);
+    double md = 0;
+    for (int v = 0; v < YV; v++) md = fmax(md, fabs(l[v] - ref[3*YV+v]));
+    free(l);
+    for (int t = 4; t < T; t++) {
+        l = step(&m, &ids[t], 1, t);
+        for (int v = 0; v < YV; v++) md = fmax(md, fabs(l[v] - ref[t*YV+v]));
+        free(l);
+    }
+    if (md > 2e-4) fprintf(stderr, "qt_llama_no_qknorm: max |dlogit| %.3g\n", md);
+    CHECK(md < 2e-4);
+    free(ref);
+    return 0;
+}

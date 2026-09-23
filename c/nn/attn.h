@@ -21,7 +21,7 @@
 
 typedef struct MotyAttnView {
     const Mat *q, *k, *v, *o;      /* proiezioni + out */
-    const float *qn, *kn;          /* pesi QK-norm per head [head_dim] */
+    const float *qn, *kn;          /* pesi QK-norm per head [head_dim]; NULL = no QK-norm (Llama) */
     int n_heads, n_kv_heads, head_dim;
     float theta, eps; int rot;     /* RoPE base, norm eps, rotary dim */
     /* per-layer storage (da MotyCommon) */

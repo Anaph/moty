@@ -13,11 +13,11 @@ static void attn_tail(const MotyAttnView *a, float *q, float *k, float *vv,
     for (int s = 0; s < S; s++) {
         int pos = pos_base + s;
         for (int hh = 0; hh < H; hh++) {
-            rmsnorm_row(q + s*qw + hh*hd, q + s*qw + hh*hd, a->qn, hd, a->eps);
+            if (a->qn) rmsnorm_row(q + s*qw + hh*hd, q + s*qw + hh*hd, a->qn, hd, a->eps);
             rope_head(q + s*qw + hh*hd, pos, a->theta, a->rot);
         }
         for (int hh = 0; hh < KV; hh++) {
-            rmsnorm_row(k + s*kw + hh*hd, k + s*kw + hh*hd, a->kn, hd, a->eps);
+            if (a->kn) rmsnorm_row(k + s*kw + hh*hd, k + s*kw + hh*hd, a->kn, hd, a->eps);
             rope_head(k + s*kw + hh*hd, pos, a->theta, a->rot);
         }
     }
