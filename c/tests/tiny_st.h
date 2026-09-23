@@ -10,9 +10,13 @@
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <direct.h>
+#include <process.h>
 #define TST_MKDIR(p) _mkdir(p)
+#define TST_PID() ((long)_getpid())
 #else
+#include <unistd.h>
 #define TST_MKDIR(p) mkdir(p, 0755)
+#define TST_PID() ((long)getpid())
 #endif
 
 typedef struct { char name[128]; char shape[64]; int64_t numel; float *data; } TstTensor;
@@ -68,10 +72,13 @@ static void tst_write_text(const char *dir, const char *fname, const char *body)
     fputs(body, f); fclose(f);
 }
 
+/* per-process directory: ctest runs every TEST in its own process, and with
+ * `ctest -j` two tests writing the same fixture model (e.g. the shared
+ * qwen_tiny_model) raced and crashed each other */
 static const char *tst_dir(const char *name) {
     static char dir[512];
     const char *tmp = getenv("TMPDIR"); if (!tmp) tmp = "/tmp";
-    snprintf(dir, sizeof(dir), "%s/%s", tmp, name);
+    snprintf(dir, sizeof(dir), "%s/%s.%ld", tmp, name, TST_PID());
     TST_MKDIR(dir);
     return dir;
 }
