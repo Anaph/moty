@@ -56,6 +56,21 @@ jobs:
             echo ":: $tier ($(qemu-aarch64 -cpu max /tmp/sm_$tier 2>&1 | grep -o 'idot=[^ ]* f32=[^ ]*' | head -1))"
             qemu-aarch64 -cpu max /tmp/sm_$tier 2>&1 | tail -1 | grep -q "ALL PASS" || { echo "FAIL $tier"; exit 1; }
           done
+      # Q4R4 int4 GEMV/GEMM and the row ops (hw/hw_q4r4.h, hw/hw_ops.h) are
+      # ARMv8.0 NEON only (no SDOT); x86 ctest runs their scalar references,
+      # so the NEON kernels are checked here on an emulated Cortex-A53.
+      - name: aarch64 Q4R4 + row-op kernels vs scalar references (qemu cortex-a53)
+        run: |
+          cd c
+          make -j libmoty-hw.a libmoty-nn.a CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar ARCH=armv8-a
+          for t in q4r4:Q4R4 ops:OPS; do
+            n=${t%%:*}
+            aarch64-linux-gnu-gcc -O2 -march=armv8-a -fopenmp -static -I. -D${t#*:}_TEST_MAIN \
+              tests/${n}_tests.c libmoty-nn.a libmoty-hw.a -lm -o /tmp/${n}_test
+            qemu-aarch64 -cpu cortex-a53 /tmp/${n}_test > /tmp/${n}.out || { cat /tmp/${n}.out; echo "FAIL $n"; exit 1; }
+            cat /tmp/${n}.out
+            grep -qx "tier: neon" /tmp/${n}.out || { echo "FAIL $n: NEON tier not compiled"; exit 1; }
+          done
       - name: aarch64 engine cross-compile (SVE2)
         run: cd c && make clean && make all CC=aarch64-linux-gnu-gcc ARCH=armv9-a
       - name: armv7 simd parity (Cortex-A7 / A15, non-dotprod NEON)
