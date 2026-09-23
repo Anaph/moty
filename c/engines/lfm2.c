@@ -1,6 +1,9 @@
-/* LFM2 (Liquid Foundation Model 2.5-8B-A1B, lfm2moe arch).
+/* LFM2 (Liquid Foundation Model 2 / 2.5): lfm2moe (8B-A1B, GGUF) and dense
+ * lfm2 (e.g. LFM2.5-350M, HF safetensors snapshot or GGUF).
  * Hybrid: short-conv (depthwise conv1d + gate) + GQA attention.
  * MoE: sigmoid gating + expert_bias + weight normalization.
+ * Tensor names: GGUF (after gguf_map_name) and HF transformers Lfm2 are both
+ * accepted; the source is detected once from the final-norm tensor name.
  *
  * Uses shared headers: nn_attn.h (attention), nn_conv.h (shortconv),
  * nn_ffn.h (dense SwiGLU), nn_moe_sigmoid.h (MoE dispatch).
@@ -69,6 +72,27 @@ static void load_cfg(Cfg *c, const char *snap) {
     jval *r = cfg_slurp(snap, &root, &buf);
     cfg_common(r, c);
     c->theta = json_get(r,"rope_theta") ? (float)json_get(r,"rope_theta")->num : 5000000.f;
+    /* HF Lfm2Config: rope_theta nested under rope_parameters, eps is norm_eps,
+     * tying is tie_embedding (not tie_word_embeddings) */
+    jval *rp = json_get(r,"rope_parameters");
+    if (rp && rp->t == J_OBJ && json_get(rp,"rope_theta")) c->theta = (float)json_get(rp,"rope_theta")->num;
+    if (json_get(r,"norm_eps")) c->eps = (float)json_get(r,"norm_eps")->num;
+    jval *te = json_get(r,"tie_embedding");
+    c->tie_emb = te && te->t == J_BOOL ? te->boolean : 1;
+    /* Lfm2MLP: block_auto_adjust_ff_dim rescales intermediate_size
+     * (int(2I/3), * multiplier, round up to block_multiple_of) */
+    jval *aa = json_get(r,"block_auto_adjust_ff_dim");
+    if (aa && aa->t == J_BOOL && aa->boolean && !json_get(r,"moe_intermediate_size")) {
+        int I = (int)(2 * (int64_t)c->inter / 3);
+        jval *mu = json_get(r,"block_ffn_dim_multiplier");
+        jval *mo = json_get(r,"block_multiple_of");
+        if (mu && mu->t == J_NUM) {
+            int mult = mo ? (int)mo->num : 1;
+            I = (int)(mu->num * I);
+            if (mult > 0) I = mult * ((I + mult - 1) / mult);
+        }
+        c->inter = I;
+    }
     c->rot = c->head_dim;
     c->n_experts = json_get(r,"num_experts") ? (int)json_get(r,"num_experts")->num : 0;
     c->topk = json_get(r,"num_experts_per_tok") ? (int)json_get(r,"num_experts_per_tok")->num : 0;
@@ -84,7 +108,30 @@ static void load_cfg(Cfg *c, const char *snap) {
 }
 
 static const char *LN(char *b, int sz, int i, const char *s) { snprintf(b,sz,"blk.%d.%s",i,s); return b; }
-static const char *HFN(char *b, int sz, int i, const char *s) { snprintf(b,sz,"model.layers.%d.%s",i,s); return b; }
+
+/* per-layer tensor names: [0] GGUF (as seen after gguf_map_name), [1] HF Lfm2 */
+enum { N_ATTN_NORM, N_FFN_NORM, N_Q, N_K, N_V, N_O, N_QN, N_KN,
+       N_CONV_IN, N_CONV_OUT, N_CONV_W, N_GATE, N_UP, N_DOWN, N_COUNT };
+static const char *const g_lfm_names[N_COUNT][2] = {
+    [N_ATTN_NORM] = { "model.layers.%d.input_layernorm.weight",          "model.layers.%d.operator_norm.weight" },
+    [N_FFN_NORM]  = { "model.layers.%d.post_attention_layernorm.weight", "model.layers.%d.ffn_norm.weight" },
+    [N_Q]         = { "model.layers.%d.self_attn.q_proj.weight",         "model.layers.%d.self_attn.q_proj.weight" },
+    [N_K]         = { "model.layers.%d.self_attn.k_proj.weight",         "model.layers.%d.self_attn.k_proj.weight" },
+    [N_V]         = { "model.layers.%d.self_attn.v_proj.weight",         "model.layers.%d.self_attn.v_proj.weight" },
+    [N_O]         = { "model.layers.%d.self_attn.o_proj.weight",         "model.layers.%d.self_attn.out_proj.weight" },
+    [N_QN]        = { "model.layers.%d.self_attn.q_norm.weight",         "model.layers.%d.self_attn.q_layernorm.weight" },
+    [N_KN]        = { "model.layers.%d.self_attn.k_norm.weight",         "model.layers.%d.self_attn.k_layernorm.weight" },
+    [N_CONV_IN]   = { "blk.%d.shortconv.in_proj.weight",                 "model.layers.%d.conv.in_proj.weight" },
+    [N_CONV_OUT]  = { "blk.%d.shortconv.out_proj.weight",                "model.layers.%d.conv.out_proj.weight" },
+    [N_CONV_W]    = { "blk.%d.shortconv.conv.weight",                    "model.layers.%d.conv.conv.weight" },
+    [N_GATE]      = { "model.layers.%d.mlp.gate_proj.weight",            "model.layers.%d.feed_forward.w1.weight" },
+    [N_UP]        = { "model.layers.%d.mlp.up_proj.weight",              "model.layers.%d.feed_forward.w3.weight" },
+    [N_DOWN]      = { "model.layers.%d.mlp.down_proj.weight",            "model.layers.%d.feed_forward.w2.weight" },
+};
+static int g_lfm_hf;   /* 1: HF snapshot naming (set by load_small) */
+static const char *TN(char *b, int sz, int i, int which) {
+    snprintf(b, sz, g_lfm_names[which][g_lfm_hf], i); return b;
+}
 
 /* ---------- weight loading ---------- */
 static void load_small(Model *m) {
@@ -92,21 +139,22 @@ static void load_small(Model *m) {
     int D = c->hidden, L = c->n_layers, convK = c->conv_L;
     int hd = c->head_dim;
     m->L = calloc(L, sizeof(Layer));
+    g_lfm_hf = st_has(&m->S, "model.embedding_norm.weight");
     char nm[128]; int cap = getenv("EXPERT_CACHE") ? atoi(getenv("EXPERT_CACHE")) : 0;
     if (cap < 1) cap = c->n_experts;
     for (int i = 0; i < L; i++) {
         Layer *l = &m->L[i];
-        l->attn_norm = load_t(m, HFN(nm,sizeof(nm),i,"input_layernorm.weight"), D);
-        l->ffn_norm  = load_t(m, HFN(nm,sizeof(nm),i,"post_attention_layernorm.weight"), D);
-        l->is_full = (st_find(&m->S, HFN(nm,sizeof(nm),i,"self_attn.q_proj.weight")) != NULL);
+        l->attn_norm = load_t(m, TN(nm,sizeof(nm),i,N_ATTN_NORM), D);
+        l->ffn_norm  = load_t(m, TN(nm,sizeof(nm),i,N_FFN_NORM), D);
+        l->is_full = (st_find(&m->S, TN(nm,sizeof(nm),i,N_Q)) != NULL);
         l->type = l->is_full ? LT_FULL : LT_CONV;
         c->ltype[i] = l->type;
-        l->is_moe = (i >= c->n_dense_layers);
+        l->is_moe = c->n_experts > 0 && i >= c->n_dense_layers;   /* dense lfm2: no MoE layers */
         if (l->is_full) {
-            l->qn = load_t(m, HFN(nm,sizeof(nm),i,"self_attn.q_norm.weight"), hd);
-            l->kn = load_t(m, HFN(nm,sizeof(nm),i,"self_attn.k_norm.weight"), hd);
+            l->qn = load_t(m, TN(nm,sizeof(nm),i,N_QN), hd);
+            l->kn = load_t(m, TN(nm,sizeof(nm),i,N_KN), hd);
         } else {
-            l->conv_w = load_t(m, LN(nm,sizeof(nm),i,"shortconv.conv.weight"), (int64_t)convK*D);
+            l->conv_w = load_t(m, TN(nm,sizeof(nm),i,N_CONV_W), (int64_t)convK*D);
             l->conv_state = falloc((int64_t)(convK-1)*D);
         }
         if (l->is_moe && c->n_experts > 0) {
@@ -119,7 +167,7 @@ static void load_small(Model *m) {
         /* the layer Mats (q/k/v/o, conv in/out, router, gate/up/down) are loaded by
          * the runtime from layer_matrefs: loading them here too leaked a full copy */
     }
-    m->base.final_norm = load_t(m, "token_embd_norm.weight", D);
+    m->base.final_norm = load_t(m, g_lfm_hf ? "model.embedding_norm.weight" : "token_embd_norm.weight", D);
 }
 
 /* ---------- expert load hook ---------- */
@@ -250,18 +298,18 @@ static int layer_matrefs(Model *m, int li, MatRef *r) {
     #define MR(field, fmt, O_, I_) do { r[n].mat=&l->field; \
         snprintf(r[n].name,sizeof(r[n].name),fmt,li); r[n].O=(O_); r[n].I=(I_); n++; } while(0)
     if (l->is_full) {
-        MR(q, "model.layers.%d.self_attn.q_proj.weight", H*hd, D);
-        MR(k, "model.layers.%d.self_attn.k_proj.weight", KV*hd, D);
-        MR(v, "model.layers.%d.self_attn.v_proj.weight", KV*hd, D);
-        MR(o, "model.layers.%d.self_attn.o_proj.weight", D, H*hd);
+        MR(q, g_lfm_names[N_Q][g_lfm_hf], H*hd, D);
+        MR(k, g_lfm_names[N_K][g_lfm_hf], KV*hd, D);
+        MR(v, g_lfm_names[N_V][g_lfm_hf], KV*hd, D);
+        MR(o, g_lfm_names[N_O][g_lfm_hf], D, H*hd);
     } else {
-        MR(in_proj,  "blk.%d.shortconv.in_proj.weight", 3*D, D);
-        MR(out_proj, "blk.%d.shortconv.out_proj.weight", D, D);
+        MR(in_proj,  g_lfm_names[N_CONV_IN][g_lfm_hf],  3*D, D);
+        MR(out_proj, g_lfm_names[N_CONV_OUT][g_lfm_hf], D, D);
     }
     if (l->is_moe) { MR(router, "blk.%d.ffn_gate_inp.weight", c->n_experts, D); }
-    else { MR(gate, "model.layers.%d.mlp.gate_proj.weight", c->inter, D);
-           MR(up,   "model.layers.%d.mlp.up_proj.weight",   c->inter, D);
-           MR(down, "model.layers.%d.mlp.down_proj.weight", D, c->inter); }
+    else { MR(gate, g_lfm_names[N_GATE][g_lfm_hf], c->inter, D);
+           MR(up,   g_lfm_names[N_UP][g_lfm_hf],   c->inter, D);
+           MR(down, g_lfm_names[N_DOWN][g_lfm_hf], D, c->inter); }
     #undef MR
     return n;
 }
@@ -282,6 +330,7 @@ static void banner(Model *m) {
         m->base.load_s, rss_gb(), IDOT_KERNEL, F32_KERNEL);
 }
 
+#ifndef LFM2_TEST
 int main(int argc, char **argv) {
 #ifdef M_MMAP_THRESHOLD                    /* glibc: logits 512KB, niente mmap/munmap per token */
     mallopt(M_MMAP_THRESHOLD, 8*1024*1024);
@@ -295,3 +344,4 @@ int main(int argc, char **argv) {
     else { int nc = omp_get_num_procs(); if (nc > 12) omp_set_num_threads(nc*3/4); }  /* 8C/16T: 12 > 8 */
     return engine_main(argc, argv);
 }
+#endif /* LFM2_TEST */

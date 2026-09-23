@@ -47,6 +47,7 @@ static const ModelEntry models[] = {
     {"qwen3",     qwen_main,   "Qwen3 (dense)"},
     {"glm_moe_dsa", glm_main, "GLM-5.2 MoE (MLA + DSA indexer)"},
     {"qwen2",     qwen_main,   "Qwen2 (dense)"},
+    {"lfm2",      lfm2_main,   "Liquid Foundation Model 2 dense (LFM2.5-350M)"},
     {NULL, NULL, NULL},
 };
 

@@ -117,6 +117,7 @@ moty_test(test_prof    prof_tests.c    prof_gtest.cc ${CMAKE_CURRENT_BINARY_DIR}
 moty_test(test_moe     moe_tests.c     moe_gtest.cc)
 moty_test(test_mla     mla_tests.c     mla_gtest.cc)
 moty_test(test_qwen    qwen_tests.c    qwen_gtest.cc)
+moty_test(test_lfm2    lfm2_tests.c    lfm2_gtest.cc)
 moty_test(test_gemma   gemma_tests.c   gemma_gtest.cc)
 moty_test(test_glm     glm_tests.c     glm_gtest.cc)
 
