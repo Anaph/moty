@@ -107,6 +107,28 @@ uint16_t moty_f32_to_f16(float f) {
  * top-1): LFM2.5-350M amax/7 1.056/56.9%, Q4_0 0.844/60.4%, no-clip
  * 0.747/62.4%; MiniCPM5-1B 0.312/72.2%, 0.267/74.6%, 0.271/73.8%. A squared-
  * error scale search was worse still (it clips the group outliers). */
+void moty_pack_q8r4_block(const float *w, int nr, int I, int8_t *blk, uint16_t *d) {
+    int nb = I / 32;
+    for (int g = 0; g < nb; g++)
+        for (int r = 0; r < 4; r++) {
+            int8_t *dst = blk + (size_t)g*128 + r*32;
+            if (r >= nr) { memset(dst, 0, 32); d[(size_t)g*4 + r] = 0; continue; }
+            const float *wg = w + (size_t)r*I + g*32;
+            float mx = 0;
+            for (int j = 0; j < 32; j++) if (fabsf(wg[j]) > fabsf(mx)) mx = wg[j];
+            float opp = 0;
+            for (int j = 0; j < 32; j++) if ((wg[j] > 0) != (mx > 0) && fabsf(wg[j]) > opp) opp = fabsf(wg[j]);
+            float dm = fmaxf(fabsf(mx) / 128.f, opp / 127.f);
+            uint16_t h = moty_f32_to_f16(mx > 0 ? -dm : dm);
+            float dd = moty_hw_f16_to_f32(h), inv = dd != 0.f ? 1.f / dd : 0.f;
+            for (int j = 0; j < 32; j++) {
+                int v = (int)lrintf(wg[j] * inv); if (v < -128) v = -128; if (v > 127) v = 127;
+                dst[j] = (int8_t)v;
+            }
+            d[(size_t)g*4 + r] = h;
+        }
+}
+
 void moty_pack_q4r4_block(const float *w, int nr, int I, uint8_t *blk, uint16_t *d) {
     int nb = I / 32;
     for (int g = 0; g < nb; g++)

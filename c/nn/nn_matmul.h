@@ -67,6 +67,8 @@ void moty_matmul_i4_s(float *y, const float *x, const uint8_t *q4, const float *
 void moty_matmul_i4_grouped_s(float *y, const float *x, const uint8_t *q4, const float *scale,
                                 int S, int I, int O, int gs);
 void moty_matmul_i2_s(float *y, const float *x, const uint8_t *q2, const float *scale, int S, int I, int O);
+void moty_matmul_q8r4_s(float *y, const float *x, const int8_t *q8, const uint16_t *s16,
+                        int S, int I, int O);
 void moty_matmul_q4r4_s(float *y, const float *x, const uint8_t *q4, const uint16_t *s16,
                         int S, int I, int O);
 void moty_matmul_q4k_native(float *y, const float *x, const uint8_t *raw,

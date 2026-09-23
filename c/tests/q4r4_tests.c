@@ -211,12 +211,95 @@ int q4_matmul_driver(void) {
     return 0;
 }
 
+/* ---------------- Q8R4 (the int8 sibling for mixed precision) ---------------- */
+
+/* packing: codes in range, the group max is exact (no clip), every other
+ * weight within half a step; missing rows are zero */
+int q8_pack_noclip(void) {
+    enum { I = 64 };
+    float w[3*I];
+    for (int i = 0; i < 3*I; i++) w[i] = q4_frnd();
+    w[3] = 1.5f; w[I+33] = -2.f;
+    int8_t blk[2*128]; uint16_t d[2*4];
+    moty_pack_q8r4_block(w, 3, I, blk, d);
+    for (int g = 0; g < 2; g++) for (int r = 0; r < 4; r++) {
+        const int8_t *b = blk + g*128 + r*32; float dd = moty_hw_f16_to_f32(d[g*4 + r]);
+        if (r == 3) { CHECK(dd == 0.f); for (int j = 0; j < 32; j++) CHECK(b[j] == 0); continue; }
+        float mx = 0, opp = 0;
+        for (int j = 0; j < 32; j++) if (fabsf(w[r*I + g*32+j]) > fabsf(mx)) mx = w[r*I + g*32+j];
+        for (int j = 0; j < 32; j++) { float x = w[r*I + g*32+j]; if ((x > 0) != (mx > 0) && fabsf(x) > opp) opp = fabsf(x); }
+        for (int j = 0; j < 32; j++) CHECK(fabsf(b[j] * dd - w[r*I + g*32+j]) <= 0.5f * fabsf(dd) * 1.001f + 1e-7f);
+        float dm = fmaxf(fabsf(mx) / 128.f, opp / 127.f);
+        CHECK(fabsf(fabsf(dd) - dm) <= dm * 1e-3f && (dd < 0) == (mx > 0));
+    }
+    return 0;
+}
+
+/* integer sums exact with unit scales, incl. the int16 lane worst case
+ * (codes -128 against x = -127: 2 x 16256 per lane); NB odd, NS = 6 */
+int q8_gemm_int_exact(void) {
+    enum { NB = 7, I = NB*32, NS = 6 };
+    int8_t w[NB*128]; uint16_t d[NB*4]; int8_t xq[NS*I]; float xs[NS*NB], y[NS*4], yr[NS*4];
+    for (int i = 0; i < NB*128; i++) w[i] = (int8_t)(q4_frnd() * 255);
+    for (int g = 0; g < NB; g++) memset(w + g*128 + 64, 0x80, 32);   /* row 2: -128 */
+    for (int i = 0; i < NB*4; i++) d[i] = 0x3c00;
+    for (int t = 0; t < NS; t++) for (int g = 0; g < NB; g++) {
+        for (int j = 0; j < 32; j++) xq[t*I+g*32+j] = (int8_t)(t == 1 ? -127 : t == 2 ? 127 : (int)(q4_frnd() * 254));
+        xs[t*NB+g] = 1.f;
+    }
+    moty_hw_q8r4_gemm(w, d, xq, xs, NB, NS, y, 4);
+    moty_hw_q8r4_gemm_ref(w, d, xq, xs, NB, NS, yr, 4);
+    for (int t = 0; t < NS; t++) for (int r = 0; r < 4; r++) {
+        int64_t e = 0;
+        for (int g = 0; g < NB; g++) for (int j = 0; j < 32; j++) e += w[g*128 + r*32 + j] * xq[t*I+g*32+j];
+        CHECK(y[t*4+r] == (float)e && yr[t*4+r] == (float)e);
+    }
+    return 0;
+}
+
+/* driver vs a dequantized double reference (ragged O, decode, tails, >1 tile) */
+static int q8_matmul_case(int O, int I, int S) {
+    int nb = I/32, O4 = (O+3)/4;
+    float *W = malloc(sizeof(float)*O*I), *x = malloc(sizeof(float)*S*I), *y = malloc(sizeof(float)*S*O);
+    int8_t *q = malloc((size_t)O4*nb*128); uint16_t *d = malloc((size_t)O4*nb*8);
+    for (int i = 0; i < O*I; i++) W[i] = q4_frnd();
+    for (int i = 0; i < S*I; i++) x[i] = q4_frnd() * (i % 31 == 0 ? 8.f : 1.f);
+    for (int b = 0; b < O4; b++) moty_pack_q8r4_block(W + (size_t)b*4*I, O - b*4 < 4 ? O - b*4 : 4, I, q + (size_t)b*nb*128, d + (size_t)b*nb*4);
+    moty_matmul_q8r4_s(y, x, q, d, S, I, O);
+    int8_t *xq = malloc(I); float *xs = malloc(sizeof(float)*nb); int32_t *xm = malloc(sizeof(int32_t)*nb);
+    double worst = 0;
+    for (int s = 0; s < S; s++) {
+        moty_hw_quant_g32_ref(x + (size_t)s*I, I, xq, xs, xm);
+        for (int o = 0; o < O; o++) {
+            int b = o/4, r = o%4; double a = 0, mag = 0;
+            for (int g = 0; g < nb; g++) {
+                const int8_t *wr = q + ((size_t)b*nb + g)*128 + r*32;
+                double dd = moty_hw_f16_to_f32(d[((size_t)b*nb + g)*4 + r]) * xs[g];
+                for (int j = 0; j < 32; j++) { a += dd * wr[j] * xq[g*32+j]; mag += fabs(dd) * 128 * abs(xq[g*32+j]); }
+            }
+            double e = fabs(y[(size_t)s*O+o] - a) / (mag + 1e-30);
+            if (e > worst) worst = e;
+        }
+    }
+    free(W); free(x); free(y); free(q); free(d); free(xq); free(xs); free(xm);
+    if (worst > 1e-6) fprintf(stderr, "q8_matmul O=%d I=%d S=%d: worst rel %.3g\n", O, I, S, worst);
+    return worst > 1e-6;
+}
+int q8_matmul_driver(void) {
+    CHECK(q8_matmul_case(64, 96, 1) == 0);
+    CHECK(q8_matmul_case(37, 64, 1) == 0);
+    CHECK(q8_matmul_case(38, 128, 7) == 0);
+    CHECK(q8_matmul_case(20, 64, 37) == 0);
+    return 0;
+}
+
 #ifdef Q4R4_TEST_MAIN
 int main(void) {
     struct { const char *n; int (*f)(void); } T[] = {
         {"f16_roundtrip", q4_f16_roundtrip}, {"quant_g32_exact", q4_quant_g32_exact},
         {"pack_noclip", q4_pack_noclip}, {"gemm_int_exact", q4_gemm_int_exact},
-        {"matmul_driver", q4_matmul_driver}, {"gemm4t", q4_gemm4t}, {"gemm_long_rows", q4_gemm_long_rows} };
+        {"matmul_driver", q4_matmul_driver}, {"gemm4t", q4_gemm4t}, {"gemm_long_rows", q4_gemm_long_rows},
+        {"q8_pack_noclip", q8_pack_noclip}, {"q8_gemm_int_exact", q8_gemm_int_exact}, {"q8_matmul_driver", q8_matmul_driver} };
     int bad = 0;
     for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) {
         int r = T[i].f(); bad |= r;

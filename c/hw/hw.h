@@ -50,7 +50,7 @@
  *  The tier strings below must be compiled with the SAME       *
  *  -march as hw.c (both come from the same CFLAGS).            *
  * ============================================================ */
-enum { WF_F32=0, WF_I8=1, WF_I4=2, WF_I2=3, WF_I4G=4, WF_Q4K=5, WF_Q6K=6, WF_Q4R4=7 };
+enum { WF_F32=0, WF_I8=1, WF_I4=2, WF_I2=3, WF_I4G=4, WF_Q4K=5, WF_Q6K=6, WF_Q4R4=7, WF_Q8R4=8 };
 
 #include <stdint.h>
 #include <math.h>
@@ -84,6 +84,11 @@ void    moty_hw_q4r4_gemm4t(const uint8_t *w, const uint16_t *d, const int8_t *x
 void    moty_hw_q4r4_gemm4t_ref(const uint8_t *w, const uint16_t *d, const int8_t *xq, int64_t ldx,
                                 const float *xst, const float *xct, int nb, float *y, int ys);
 void    moty_hw_q4r4_tile_scales(const float *xs, const int32_t *xsum, int nb, float *xst, float *xct);
+/* Q8R4 (int8 codes in the Q4R4 block/scale layout, 128 B per block-group) */
+void    moty_hw_q8r4_gemm(const int8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
+                          int nb, int ns, float *y, int ys);
+void    moty_hw_q8r4_gemm_ref(const int8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
+                              int nb, int ns, float *y, int ys);
 /* scalar references of the two above (always compiled: tests compare) */
 void    moty_hw_quant_g32_ref(const float *x, int I, int8_t *xq, float *xs, int32_t *xsum);
 void    moty_hw_q4r4_gemm_ref(const uint8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,

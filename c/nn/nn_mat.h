@@ -15,10 +15,10 @@
 
 #include <stdint.h>
 
-typedef struct Mat { int fmt;             /* WF_F32/WF_I8/WF_I4/WF_I4G/WF_I2/WF_Q4R4 */
+typedef struct Mat { int fmt;             /* WF_F32/WF_I8/WF_I4/WF_I4G/WF_I2/WF_Q4R4/WF_Q8R4 */
                      float *f; int8_t *q; float *qs; int O, I;
-                     uint8_t *q4; int gs;
-                     uint16_t *s16;       /* WF_Q4R4: f16 group scales [O/4][I/32][4] */
+                     uint8_t *q4; int gs;  /* WF_Q8R4: its int8 codes live in q4 too */
+                     uint16_t *s16;       /* WF_Q4R4/Q8R4: f16 group scales [O/4][I/32][4] */
                      const void *sh; const char *sname; } Mat;
 
 /* M3: implementazioni in nn/mat.c (libmoty-nn) */
@@ -26,7 +26,7 @@ typedef void (*MotyMatStreamFn)(float *y, const float *x, const struct Mat *w, i
 void  moty_nn_set_stream_fn(MotyMatStreamFn fn);   /* MEM_GB: hook dello streamer */
 void  moty_mat_apply(float *y, const float *x, const Mat *w, int S);
 void  moty_kv_store_row(int8_t *dst, float *scale_slot, const float *src, int hd);
-/* concatenate the rows of n WF_Q4R4 matrices (same I, O%4==0) into dst: one
+/* concatenate the rows of n WF_Q4R4 (or n WF_Q8R4) matrices (same I, O%4==0) into dst: one
  * GEMV/GEMM, one activation quantization, one parallel region instead of n.
  * The sources become zero-copy views into dst's buffers. Returns 0 (and
  * leaves everything untouched) when the formats do not qualify. */

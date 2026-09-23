@@ -27,6 +27,7 @@ int moty_rt_g_q4fmt = 0;
 #endif
 int moty_rt_g_embed_disk = 0;               /* EMBED=disk: no resident table */
 int moty_rt_g_head_topk = 0;                /* HEAD_TOPK=K: two-stage lm_head (nn/head.h) */
+const char *moty_rt_g_q8_tensors = NULL;    /* Q8_TENSORS=glob,...: Q8R4 instead of Q4R4 */
 int moty_rt_g_prefill_chunk = 0;
 int moty_rt_g_kv_bits = 0;
 int moty_rt_g_micro = 0;
@@ -96,6 +97,7 @@ int moty_rt_parse_env(MotyRunConfig *e) {
         else if (!strcmp(f, "ram")) moty_rt_g_embed_disk = 0;
         else { fprintf(stderr, "EMBED deve essere ram o disk\n"); return 0; }
     }
+    moty_rt_g_q8_tensors = getenv("Q8_TENSORS");
     if (getenv("HEAD_TOPK")) {
         moty_rt_g_head_topk = atoi(getenv("HEAD_TOPK"));
         if (moty_rt_g_head_topk < 0) { fprintf(stderr, "HEAD_TOPK deve essere >= 0\n"); return 0; }

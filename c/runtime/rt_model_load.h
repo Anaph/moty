@@ -28,22 +28,49 @@ static void load_mat_q4_0(Model *m, Mat *w, const char *name, int O, int I) {
     w->gs = 32; w->fmt = WF_I4G;
 }
 
+/* Q8_TENSORS=<glob>[,<glob>...] ('*' matches any run of characters):
+ * tensors (snapshot names; the tied head is "lm_head.weight") that take
+ * Q8R4 instead of Q4R4 under QBITS=4 Q4FMT=r4 — mixed precision for the
+ * tensors int4 damages most (docs/performance.md). */
+static int r4_glob(const char *p, const char *s) {
+    for (; *p && *p != ','; p++, s++) {
+        if (*p == '*') {
+            for (const char *t = s; ; t++) { if (r4_glob(p + 1, t)) return 1; if (!*t) return 0; }
+        }
+        if (*s != *p) return 0;
+    }
+    return *s == 0;
+}
+static int r4_wants_q8(const char *name) {
+    const char *p = g_q8_tensors;
+    for (; p && *p; p = strchr(p, ',') ? strchr(p, ',') + 1 : NULL)
+        if (r4_glob(p, name)) return 1;
+    return 0;
+}
+
 /* QBITS=4 + Q4FMT=r4: rows read from disk in ~4 MB chunks (never the whole
  * f32 matrix — the lm_head of a 130k-vocab model would be 800 MB) and
- * packed into Q4R4 4-row blocks in parallel (nn/quant.c, hw/hw_q4r4.h). */
-static void load_mat_q4r4(Model *m, Mat *w, const char *name, int O, int I) {
+ * packed into 4-row blocks in parallel (nn/quant.c, hw/hw_q4r4.h): Q4R4,
+ * or Q8R4 when `pname` matches Q8_TENSORS. A pre-packed container decides
+ * by itself: "<name>" + F16 "<name>.s16", 64 bytes per block-group = Q4R4,
+ * 128 = Q8R4. */
+static void load_mat_r4(Model *m, Mat *w, const char *name, const char *pname, int O, int I) {
     int nb = I / 32, O4 = (O + 3) / 4;
-    w->q4 = balloc((int64_t)O4*nb*64, name);
-    w->s16 = balloc((int64_t)O4*nb*4*sizeof(uint16_t), name);
-    /* pre-packed container (SAVE_PACKED): U8 blocks + F16 "<name>.s16" -> raw read */
     char sn[256]; snprintf(sn, sizeof sn, "%s.s16", name);
-    if (st_has(&m->S, sn)) {
-        if (st_nbytes(&m->S, name) != (int64_t)O4*nb*64 || st_nbytes(&m->S, sn) != (int64_t)O4*nb*4*2) {
-            fprintf(stderr, "[" ENGINE_TAG "] %s: packed Q4R4 size mismatch (O=%d I=%d)\n", name, O, I); exit(1);
+    int packed = st_has(&m->S, sn), gb;
+    if (packed) {
+        int64_t nq = st_nbytes(&m->S, name);
+        gb = nq == (int64_t)O4*nb*64 ? 64 : nq == (int64_t)O4*nb*128 ? 128 : 0;
+        if (!gb || st_nbytes(&m->S, sn) != (int64_t)O4*nb*4*2) {
+            fprintf(stderr, "[" ENGINE_TAG "] %s: packed R4 size mismatch (O=%d I=%d)\n", name, O, I); exit(1);
         }
+    } else gb = r4_wants_q8(pname) ? 128 : 64;
+    w->q4 = balloc((int64_t)O4*nb*gb, name);
+    w->s16 = balloc((int64_t)O4*nb*4*sizeof(uint16_t), name);
+    w->O = O; w->I = I; w->fmt = gb == 128 ? WF_Q8R4 : WF_Q4R4;
+    if (packed) {                                   /* pre-packed container: raw read */
         st_read_raw(&m->S, name, w->q4, 0);
         st_read_raw(&m->S, sn, w->s16, 0);
-        w->O = O; w->I = I; w->fmt = WF_Q4R4;
         return;
     }
     st_expect(&m->S, name, (int64_t)O*I);
@@ -55,11 +82,11 @@ static void load_mat_q4r4(Model *m, Mat *w, const char *name, int O, int I) {
         #pragma omp parallel for schedule(static)
         for (int b = 0; b < (rr + 3) / 4; b++) {
             int nr = rr - b*4 < 4 ? rr - b*4 : 4, ob = o0/4 + b;
-            moty_pack_q4r4_block(chunk + (int64_t)b*4*I, nr, I, w->q4 + (int64_t)ob*nb*64, w->s16 + (int64_t)ob*nb*4);
+            if (gb == 128) moty_pack_q8r4_block(chunk + (int64_t)b*4*I, nr, I, (int8_t *)w->q4 + (int64_t)ob*nb*128, w->s16 + (int64_t)ob*nb*4);
+            else moty_pack_q4r4_block(chunk + (int64_t)b*4*I, nr, I, w->q4 + (int64_t)ob*nb*64, w->s16 + (int64_t)ob*nb*4);
         }
     }
     free(chunk);
-    w->O = O; w->I = I; w->fmt = WF_Q4R4;
 }
 
 static void quantize_from_disk(Model *m, const char *name, int8_t *q, float *qs, int64_t N, int I, int rows);
@@ -68,7 +95,7 @@ static void load_mat_bits(Model *m, Mat *w, const char *name, int O, int I, int 
     mat_reset_storage(w);            /* fmt = WF_F32 di default */
     mat_reset_storage(w);
     w->O = O; w->I = I;
-    if (bits == 4 && g_q4fmt && I % 32 == 0) { load_mat_q4r4(m, w, name, O, I); return; }
+    if (bits == 4 && g_q4fmt && I % 32 == 0) { load_mat_r4(m, w, name, name, O, I); return; }
     if (bits == 8) {             /* row chunks: bit-identical to quantize_rows on the whole matrix */
         st_expect(&m->S, name, (int64_t)O*I);
         w->q = balloc((int64_t)O*I, name); w->qs = falloc(O);
@@ -354,8 +381,8 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
             /* tied head in Q4R4 packed from the original rows (not from the
              * int8 table: no double quantization); a container stores it
              * pre-packed as lm_head.weight */
-            load_mat_q4r4(m, &m->base.lm_head, st_has(&m->S, "lm_head.weight.s16") ? "lm_head.weight"
-                                                   : "model.embed_tokens.weight", c->vocab, D);
+            load_mat_r4(m, &m->base.lm_head, st_has(&m->S, "lm_head.weight.s16") ? "lm_head.weight"
+                                                   : "model.embed_tokens.weight", "lm_head.weight", c->vocab, D);
         } else if (m->base.qbits == 4 && m->base.embed_q && D <= 2048) {
             /* lm_head separato in INT4: il GEMV del logit e' ~43% del traffico
              * per-token in decode (262MB→131). Lookup embed resta int8. */
@@ -399,7 +426,7 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
 
 /* ---------- SAVE_PACKED=<dir>: write a pre-packed Q4R4 container ----------
  * A safetensors snapshot (moty container convention, cf. olmoe/glm "name.qs"):
- * every resident WF_Q4R4 matrix as U8 "<name>" (its 4-row blocks) + F16
+ * every resident WF_Q4R4 (WF_Q8R4) matrix as U8 (I8) "<name>" (its 4-row blocks) + F16
  * "<name>.s16"; the lm_head as "lm_head.weight" (+.s16), also when tied; all
  * other tensors copied byte for byte with their dtype (flattened shape).
  * config/tokenizer files are copied. Loading it with QBITS=4 skips the
@@ -412,10 +439,11 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
 #define rt_mkdir(p) mkdir(p, 0755)
 #endif
 static int pk_name_is(Model *m, const char *name, Mat **out) {
-    if (!strcmp(name, "lm_head.weight") && m->base.lm_head.fmt == WF_Q4R4) { *out = &m->base.lm_head; return 1; }
+    if (!strcmp(name, "lm_head.weight") && (m->base.lm_head.fmt == WF_Q4R4 || m->base.lm_head.fmt == WF_Q8R4)) { *out = &m->base.lm_head; return 1; }
     for (int i = 0; i < m->c.n_layers; i++) {
         MatRef r[MAX_LAYER_MATS]; int n = layer_matrefs(m, i, r);
-        for (int j = 0; j < n; j++) if (!strcmp(r[j].name, name) && r[j].mat->fmt == WF_Q4R4) { *out = r[j].mat; return 1; }
+        for (int j = 0; j < n; j++)
+            if (!strcmp(r[j].name, name) && (r[j].mat->fmt == WF_Q4R4 || r[j].mat->fmt == WF_Q8R4)) { *out = r[j].mat; return 1; }
     }
     return 0;
 }
@@ -432,8 +460,9 @@ static void model_save_packed(Model *m, const char *snap, const char *dir) {
     for (int i = 0; i < m->S.n; i++) {
         st_tensor *st = &m->S.t[i]; Mat *w;
         if (pk_name_is(m, st->name, &w)) {
-            int64_t nb = w->I / 32, O4 = (w->O + 3) / 4;
-            snprintf(t[nt].name, 256, "%s", st->name); t[nt].dt = "U8"; t[nt].n = t[nt].bytes = O4*nb*64; t[nt].mem = w->q4; t[nt].src = -1; nt++;
+            int64_t nb = w->I / 32, O4 = (w->O + 3) / 4, gb = w->fmt == WF_Q8R4 ? 128 : 64;
+            snprintf(t[nt].name, 256, "%s", st->name); t[nt].dt = gb == 128 ? "I8" : "U8";
+            t[nt].n = t[nt].bytes = O4*nb*gb; t[nt].mem = w->q4; t[nt].src = -1; nt++;
             snprintf(t[nt].name, 256, "%s.s16", st->name); t[nt].dt = "F16"; t[nt].n = O4*nb*4; t[nt].bytes = O4*nb*8; t[nt].mem = w->s16; t[nt].src = -1; nt++;
             if (!strcmp(st->name, "lm_head.weight")) head_done = 1;
         } else {
@@ -442,9 +471,10 @@ static void model_save_packed(Model *m, const char *snap, const char *dir) {
             t[nt].bytes = st->nbytes; t[nt].mem = NULL; t[nt].src = i; nt++;
         }
     }
-    if (!head_done && m->base.lm_head.fmt == WF_Q4R4) {           /* tied head */
-        Mat *w = &m->base.lm_head; int64_t nb = w->I / 32, O4 = (w->O + 3) / 4;
-        snprintf(t[nt].name, 256, "lm_head.weight"); t[nt].dt = "U8"; t[nt].n = t[nt].bytes = O4*nb*64; t[nt].mem = w->q4; t[nt].src = -1; nt++;
+    if (!head_done && (m->base.lm_head.fmt == WF_Q4R4 || m->base.lm_head.fmt == WF_Q8R4)) {  /* tied head */
+        Mat *w = &m->base.lm_head; int64_t nb = w->I / 32, O4 = (w->O + 3) / 4, gb = w->fmt == WF_Q8R4 ? 128 : 64;
+        snprintf(t[nt].name, 256, "lm_head.weight"); t[nt].dt = gb == 128 ? "I8" : "U8";
+        t[nt].n = t[nt].bytes = O4*nb*gb; t[nt].mem = w->q4; t[nt].src = -1; nt++;
         snprintf(t[nt].name, 256, "lm_head.weight.s16"); t[nt].dt = "F16"; t[nt].n = O4*nb*4; t[nt].bytes = O4*nb*8; t[nt].mem = w->s16; t[nt].src = -1; nt++;
     }
     int64_t hcap = 256 + (int64_t)nt * 400; char *hdr = malloc(hcap); int64_t hl = 0, off = 0;

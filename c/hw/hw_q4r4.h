@@ -92,6 +92,28 @@ void moty_hw_q4r4_tile_scales(const float *xs, const int32_t *xsum, int nb, floa
         }
 }
 
+/* Q8R4: the int8 sibling for tensors that int4 damages (mixed precision).
+ * Same 4-row blocks, groups of 32 and f16 scale stream as Q4R4; per
+ * (block, group) 128 bytes, row r = 32 signed codes, value = q * d.
+ * Activations: the Q4R4 group-32 int8 quantization (no offset term).
+ *   y[t*ys + r] = Σ_g f16(d[g][r]) * xs[t][g] * Σ_j q[r][g,j] · x[t][g,j] */
+void moty_hw_q8r4_gemm_ref(const int8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
+                           int nb, int ns, float *y, int ys) {
+    int I = nb * 32;
+    for (int t = 0; t < ns; t++)
+        for (int r = 0; r < 4; r++) {
+            float acc = 0;
+            for (int g = 0; g < nb; g++) {
+                const int8_t *wr = w + (size_t)g*128 + r*32;
+                const int8_t *xg = xq + (size_t)t*I + g*32;
+                int32_t s = 0;
+                for (int j = 0; j < 32; j++) s += (int32_t)wr[j] * xg[j];
+                acc += (float)s * (moty_hw_f16_to_f32(d[(size_t)g*4 + r]) * xs[(size_t)t*nb + g]);
+            }
+            y[(size_t)t*ys + r] = acc;
+        }
+}
+
 #if defined(__aarch64__) && defined(__ARM_NEON)
 /* ---------------- NEON (ARMv8.0: SMULL/SMLAL2, no SDOT) ---------------- */
 void moty_hw_quant_g32(const float *x, int I, int8_t *xq, float *xs, int32_t *xsum) {
@@ -227,6 +249,52 @@ void moty_hw_q4r4_gemm(const uint8_t *w, const uint16_t *d, const int8_t *xq, co
         memcpy(y + (size_t)t*ys, tmp, sizeof tmp);
     }
 }
+/* Q8R4 one group, 4 rows -> int32x4 [row0..row3]: two products per int16
+ * lane (|q| <= 128, |x| <= 127: <= 32512), then widened (SADDLP/SADALP) */
+#define Q8R4_ROWSUM(w, x0, x1, s) { \
+    int8x16_t w0_ = vld1q_s8(w), w1_ = vld1q_s8((w) + 16); \
+    int16x8_t p_ = vmlal_high_s8(vmull_s8(vget_low_s8(w0_), vget_low_s8(x0)), w0_, x0); \
+    int16x8_t q_ = vmlal_high_s8(vmull_s8(vget_low_s8(w1_), vget_low_s8(x1)), w1_, x1); \
+    s = vpadalq_s16(vpaddlq_s16(p_), q_); }
+static inline int32x4_t q8r4_group(const int8_t *w, int8x16_t x0, int8x16_t x1) {
+    int32x4_t s0, s1, s2, s3;
+    Q8R4_ROWSUM(w, x0, x1, s0) Q8R4_ROWSUM(w + 32, x0, x1, s1)
+    Q8R4_ROWSUM(w + 64, x0, x1, s2) Q8R4_ROWSUM(w + 96, x0, x1, s3)
+    return vpaddq_s32(vpaddq_s32(s0, s1), vpaddq_s32(s2, s3));
+}
+/* one token; two groups per iteration (two accumulators, as the Q4R4 GEMV) */
+static inline void q8r4_gemv(const int8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
+                             int nb, float *y) {
+    float32x4_t a0 = vdupq_n_f32(0), a1 = a0;
+    int g = 0;
+    for (; g + 2 <= nb; g += 2) {
+        __builtin_prefetch(w + 2*Q4R4_PF, 0, 3); __builtin_prefetch(w + 2*Q4R4_PF + 64, 0, 3);
+        __builtin_prefetch(w + 2*Q4R4_PF + 128, 0, 3); __builtin_prefetch(w + 2*Q4R4_PF + 192, 0, 3);
+        if ((g & 7) == 0) __builtin_prefetch(d + Q4R4_PF / 2, 0, 3);
+        int32x4_t s0 = q8r4_group(w, vld1q_s8(xq), vld1q_s8(xq + 16));
+        int32x4_t s1 = q8r4_group(w + 128, vld1q_s8(xq + 32), vld1q_s8(xq + 48));
+        w += 256; xq += 64;
+        float16x8_t dh = vreinterpretq_f16_u16(vld1q_u16(d)); d += 8;
+        a0 = vfmaq_f32(a0, vcvtq_f32_s32(s0), vmulq_n_f32(vcvt_f32_f16(vget_low_f16(dh)), xs[g]));
+        a1 = vfmaq_f32(a1, vcvtq_f32_s32(s1), vmulq_n_f32(vcvt_high_f32_f16(dh), xs[g+1]));
+    }
+    if (g < nb) {
+        int32x4_t s0 = q8r4_group(w, vld1q_s8(xq), vld1q_s8(xq + 16));
+        a0 = vfmaq_f32(a0, vcvtq_f32_s32(s0), vmulq_n_f32(vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(d))), xs[g]));
+    }
+    vst1q_f32(y, vaddq_f32(a0, a1));
+}
+/* prefill: token by token over the block (4 rows x I int8 stay in L1) */
+void moty_hw_q8r4_gemm(const int8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
+                       int nb, int ns, float *y, int ys) {
+    int I = nb * 32;
+    for (int t = 0; t < ns; t++) {
+        float tmp[4];
+        q8r4_gemv(w, d, xq + (size_t)t*I, xs + (size_t)t*nb, nb, tmp);
+        memcpy(y + (size_t)t*ys, tmp, sizeof tmp);
+    }
+}
+#undef Q8R4_ROWSUM
 #undef Q4R4_ROW
 #undef Q4R4_GROUP
 #else
@@ -241,6 +309,10 @@ void moty_hw_q4r4_gemm(const uint8_t *w, const uint16_t *d, const int8_t *xq, co
 void moty_hw_q4r4_gemm4t(const uint8_t *w, const uint16_t *d, const int8_t *xq, int64_t ldx,
                          const float *xst, const float *xct, int nb, float *y, int ys) {
     moty_hw_q4r4_gemm4t_ref(w, d, xq, ldx, xst, xct, nb, y, ys);
+}
+void moty_hw_q8r4_gemm(const int8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
+                       int nb, int ns, float *y, int ys) {
+    moty_hw_q8r4_gemm_ref(w, d, xq, xs, nb, ns, y, ys);
 }
 #endif
 

@@ -22,6 +22,11 @@ void moty_pack_int2(const float *w, uint8_t *q2, float *scale, int O, int I, int
  * block: blk[nb*64] nibbles + d[nb*4] f16 scales; rows >= nr are zero.
  * Per group: "no-clip Q4_0" scale (see nn/quant.c), stored signed in f16. */
 void moty_pack_q4r4_block(const float *w, int nr, int I, uint8_t *blk, uint16_t *d);
+/* Q8R4 (mixed precision): same blocks/groups/scale stream, 128 B per
+ * block-group (row r: 32 int8 codes). Scale rule as Q4R4 with 8 bits: the
+ * largest magnitude maps to -128 unless that clips the other sign (then
+ * opp/127). Rows r >= nr: codes 0, scale 0. */
+void moty_pack_q8r4_block(const float *w, int nr, int I, int8_t *blk, uint16_t *d);
 uint16_t moty_f32_to_f16(float f);
 
 /* macro legacy (M2 strangler) */

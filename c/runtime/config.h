@@ -25,6 +25,7 @@ extern int moty_rt_g_tokens_dump;           /* TOKENS=1 */
 extern int moty_rt_g_q4fmt;                 /* Q4FMT: 1 Q4R4, 0 legacy grouped int4 */
 extern int moty_rt_g_embed_disk;            /* EMBED=disk */
 extern int moty_rt_g_head_topk;             /* HEAD_TOPK: lm_head shortlist size (0 off) */
+extern const char *moty_rt_g_q8_tensors;    /* Q8_TENSORS: globs of tensors packed Q8R4 */
 
 int      moty_rt_parse_env(MotyRunConfig *e);   /* 0 = valore invalido (msg stampato) */
 void     moty_rt_omp_hot_tune(char **argv);     /* re-exec una volta sola; MOTY_NO_OMP_TUNE spegne */
@@ -42,5 +43,6 @@ int64_t  moty_rt_budget_from_env(const char *gb, const char *frac, int64_t total
 #define g_q4fmt         moty_rt_g_q4fmt
 #define g_embed_disk    moty_rt_g_embed_disk
 #define g_head_topk     moty_rt_g_head_topk
+#define g_q8_tensors    moty_rt_g_q8_tensors
 #endif
 #endif /* MOTY_RT_CONFIG_H */
