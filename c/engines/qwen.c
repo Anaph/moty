@@ -617,7 +617,7 @@ static void mlp(Model *m, Layer *l, float *x, int S, float *out) {
     }
     OP_ACC(OP_FFN_GATE_UP, t0);
     OP_T(t1);
-    for (int64_t i = 0; i < (int64_t)S*I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+    moty_hw_silu_mul(g, u, (int64_t)S*I);
     OP_ACC(OP_FFN_SILU, t1);
     OP_T(t2);
     mat_apply(out, g, &l->down, S);
@@ -650,14 +650,14 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         if (l->type == LT_LINEAR) deltanet(m, l, nrm, S, tmp);
         else attention(m, l, i, nrm, S, pos_base, tmp);
         OP_T(t_r1);
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        moty_hw_add(x, tmp, (int64_t)S*D);
         OP_ACC(OP_RESID, t_r1);
         OP_T(t_n2);
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
         OP_ACC(OP_NORM, t_n2);
         mlp(m, l, nrm, S, tmp);
         OP_T(t_r2);
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        moty_hw_add(x, tmp, (int64_t)S*D);
         OP_ACC(OP_RESID, t_r2);
     }
     m->base.kv_len = pos_base + S;

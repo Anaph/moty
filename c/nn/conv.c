@@ -33,22 +33,10 @@ void moty_nn_conv_layer(const MotyConvView *cv, const float *x, int S, float *ou
         mat_apply(bcx, x, cv->in_proj, S);
         OP_ACC(OP_CONV_IN, t_in);
         OP_T(t_dw);
-        int dc = K - 1;
         for (int s = 0; s < S; s++) {
             float *row = bcx + (int64_t)s*3*D;
-            float *b = row, *co = row+D, *xx = row+2*D;
-            float *ys = ybuf + (int64_t)s*D;
-            for (int ch = 0; ch < D; ch++) {
-                float bx = b[ch]*xx[ch], acc = 0;
-                for (int tt = 0; tt < dc; tt++) acc += cv->conv_state[ch*dc+tt] * cv->conv_w[ch*K+tt];
-                acc += bx * cv->conv_w[ch*K+dc];
-                ys[ch] = co[ch] * acc;
-            }
-            if (dc > 0)
-                for (int ch = 0; ch < D; ch++) {
-                    for (int tt = 0; tt < dc-1; tt++) cv->conv_state[ch*dc+tt] = cv->conv_state[ch*dc+tt+1];
-                    cv->conv_state[ch*dc+dc-1] = b[ch]*xx[ch];
-                }
+            moty_hw_shortconv_step(ybuf + (int64_t)s*D, row, row+D, row+2*D,
+                                   cv->conv_w, cv->conv_state, K, 0, D);
         }
         OP_ACC(OP_CONV_DW, t_dw);
         OP_T(t_out);
@@ -66,7 +54,6 @@ void moty_nn_conv_layer(const MotyConvView *cv, const float *x, int S, float *ou
         }
     }
     int rb = (D+1)/2;
-    int dc = K - 1;
     int nth = omp_get_max_threads();
     #pragma omp parallel
     {
@@ -84,18 +71,8 @@ void moty_nn_conv_layer(const MotyConvView *cv, const float *x, int S, float *ou
         int ch0 = (int)((int64_t)D * t / nth), ch1 = (int)((int64_t)D * (t+1) / nth);
         for (int s = 0; s < S; s++) {
             float *row = bcx + (int64_t)s*3*D;
-            float *b = row, *co = row+D, *xx = row+2*D;
-            float *ys = ybuf + (int64_t)s*D;
-            for (int ch = ch0; ch < ch1; ch++) {
-                float bx = b[ch]*xx[ch], acc = 0;
-                for (int tt = 0; tt < dc; tt++) acc += cv->conv_state[ch*dc+tt] * cv->conv_w[ch*K+tt];
-                acc += bx * cv->conv_w[ch*K+dc];
-                ys[ch] = co[ch] * acc;
-                if (dc > 0) {
-                    for (int tt = 0; tt < dc-1; tt++) cv->conv_state[ch*dc+tt] = cv->conv_state[ch*dc+tt+1];
-                    cv->conv_state[ch*dc+dc-1] = bx;
-                }
-            }
+            moty_hw_shortconv_step(ybuf + (int64_t)s*D, row, row+D, row+2*D,
+                                   cv->conv_w, cv->conv_state, K, ch0, ch1);
         }
         /* quant ybuf per token — BARRIER prima: omp for sincronizza all'USCITA,
          * non all'ingresso; senza questa un thread quota ybuf[0] mentre altri

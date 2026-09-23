@@ -21,9 +21,7 @@ void moty_att_accum_f32(float *cx, const float *sc, const float *V,
                                  int64_t kvbase, int t0, int qpos, int hd) {
     for (int dd = 0; dd < hd; dd++) cx[dd] = 0;
     for (int t = t0; t <= qpos; t++) {
-        const float *vr = V + (kvbase + t)*hd;
-        float a = sc[t-t0];
-        for (int dd = 0; dd < hd; dd++) cx[dd] += a * vr[dd];
+        moty_hw_axpy(cx, sc[t-t0], V + (kvbase + t)*hd, hd);
     }
 }
 

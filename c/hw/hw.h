@@ -81,6 +81,21 @@ void    moty_hw_quant_g32_ref(const float *x, int I, int8_t *xq, float *xs, int3
 void    moty_hw_q4r4_gemm_ref(const uint8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
                               const int32_t *xsum, int nb, int ns, float *y, int ys);
 float   moty_hw_f16_to_f32(uint16_t h);
+/* non-matmul row ops (hw/hw_ops.h); *_ref = scalar reference (= portable kernel) */
+void    moty_hw_rmsnorm(float *out, const float *x, const float *w, int n, float eps);
+void    moty_hw_silu_mul(float *g, const float *u, int64_t n);          /* g = silu(g)*u */
+void    moty_hw_softmax(float *x, int n);
+void    moty_hw_axpy(float *y, float a, const float *x, int n);          /* y += a*x */
+void    moty_hw_add(float *y, const float *x, int64_t n);                /* y += x */
+void    moty_hw_shortconv_step(float *y, const float *b, const float *c, const float *x,
+                               const float *w, float *state, int K, int c0, int c1);
+void    moty_hw_rmsnorm_ref(float *out, const float *x, const float *w, int n, float eps);
+void    moty_hw_silu_mul_ref(float *g, const float *u, int64_t n);
+void    moty_hw_softmax_ref(float *x, int n);
+void    moty_hw_axpy_ref(float *y, float a, const float *x, int n);
+void    moty_hw_add_ref(float *y, const float *x, int64_t n);
+void    moty_hw_shortconv_step_ref(float *y, const float *b, const float *c, const float *x,
+                                   const float *w, float *state, int K, int c0, int c1);
 
 /* Legacy spellings: engines/nn headers keep calling dot_i8i8(...) —
  * rewritten to the exported symbol. Delete when M3/M4 migrate callers

@@ -195,7 +195,7 @@ libmoty-runtime.a: $(RT_SRCS) $(RT_DEPS) libmoty-nn.a libmoty-hw.a
 HW_SRCS = hw/hw.c
 HW_DEPS = hw/hw.h hw/hw_impl.h hw/hw_avx512.h hw/hw_avx2.h hw/hw_neon.h \
           hw/hw_sve2.h hw/hw_vsx.h hw/hw_scalar.h hw/hw_quant.h \
-          hw/hw_deltanet.h hw/hw_q4r4.h hw/hw_backend.h
+          hw/hw_deltanet.h hw/hw_q4r4.h hw/hw_ops.h hw/hw_backend.h
 libmoty-hw.a: $(HW_SRCS) $(HW_DEPS)
 	$(CC) $(CFLAGS) -c $(HW_SRCS) -o hw/hw.o
 	$(AR) rcs $@ hw/hw.o

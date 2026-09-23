@@ -263,7 +263,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         if (l->type == LT_CONV) { PROF_ACC(conv, c0); } else { PROF_ACC(attn, c0); }
         if (PROF_ON) c0 = now_s();
         OP_T(t_r1);
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        moty_hw_add(x, tmp, (int64_t)S*D);
         OP_ACC(OP_RESID, t_r1);
         OP_T(t_n2);
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->ffn_norm, D, c->eps);
@@ -272,7 +272,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         else ffn_run(m, l, nrm, S, tmp);
         if (l->is_moe) { PROF_ACC(moe, c0); } else { PROF_ACC(ffn, c0); }
         OP_T(t_r2);
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        moty_hw_add(x, tmp, (int64_t)S*D);
         OP_ACC(OP_RESID, t_r2);
     }
     PROF_COUNT();

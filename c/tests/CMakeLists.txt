@@ -119,6 +119,7 @@ moty_test(test_mla     mla_tests.c     mla_gtest.cc)
 moty_test(test_qwen    qwen_tests.c    qwen_gtest.cc)
 moty_test(test_lfm2    lfm2_tests.c    lfm2_gtest.cc)
 moty_test(test_q4r4    q4r4_tests.c    q4r4_gtest.cc)
+moty_test(test_ops     ops_tests.c     ops_gtest.cc)
 moty_test(test_gemma   gemma_tests.c   gemma_gtest.cc)
 moty_test(test_glm     glm_tests.c     glm_gtest.cc)
 

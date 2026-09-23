@@ -1,13 +1,10 @@
 /* norm.c — M3 libmoty-nn */
 #include "nn/nn_norm.h"
+#include "hw/hw.h"
 
+/* bodies in hw/hw_ops.h (NEON on aarch64; the scalar reference elsewhere
+ * is the exact former loop, so non-NEON numerics are unchanged) */
 void moty_rmsnorm_row(float *out, const float *x, const float *w, int D, float eps) {
-    double ms = 0; for (int i = 0; i < D; i++) ms += (double)x[i]*x[i];
-    float r = 1.f / sqrtf((float)(ms / D) + eps);
-    for (int i = 0; i < D; i++) out[i] = x[i] * r * w[i];
+    moty_hw_rmsnorm(out, x, w, D, eps);
 }
-void moty_softmax_row(float *x, int n) {
-    float m = -1e30f; for (int i = 0; i < n; i++) if (x[i] > m) m = x[i];
-    float s = 0; for (int i = 0; i < n; i++) { x[i] = expf(x[i]-m); s += x[i]; }
-    for (int i = 0; i < n; i++) x[i] /= s;
-}
+void moty_softmax_row(float *x, int n) { moty_hw_softmax(x, n); }
