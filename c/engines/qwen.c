@@ -18,6 +18,7 @@
  *   TOKENS=1                          dump degli id generati su stderr
  */
 #define _GNU_SOURCE
+#include "util/prof.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -503,6 +504,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     int G = H / KV;                       /* teste query per testa kv */
     int64_t qw = (int64_t)H*hd, kw = (int64_t)KV*hd;
     float *q, *gate = NULL;
+    OP_T(t_qkv);
     if (l->gated) {
         float *qg = falloc(S*2*qw);
         mat_apply(qg, x, &l->q, S);
@@ -526,7 +528,9 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         lora_apply(&l->lo->k, k,  x, S, l->k.I, l->k.O);
         lora_apply(&l->lo->v, vv, x, S, l->v.I, l->v.O);
     }
+    OP_ACC(OP_QKV, t_qkv);
     /* qk-norm PER TESTA (Qwen3), poi RoPE per testa */
+    OP_T(t_qk);
     for (int s = 0; s < S; s++) {
         int pos = pos_base + s;
         for (int hh = 0; hh < H; hh++) {
@@ -540,7 +544,9 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             rope_head(kh, pos, c->theta, c->rot);
         }
     }
+    OP_ACC(OP_QKNORM_ROPE, t_qk);
     /* scrive k,v nella kv-cache alle posizioni pos_base..pos_base+S-1 */
+    OP_T(t_kv);
     int kv8 = m->base.K8[layer] != NULL;           /* KV_BITS=8 su questo layer */
     for (int s = 0; s < S; s++) for (int hh = 0; hh < KV; hh++) {
         int t = pos_base + s;
@@ -553,6 +559,8 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             memcpy(m->base.V[layer] + slot*hd, vv + s*kw + (int64_t)hh*hd, hd*sizeof(float));
         }
     }
+    OP_ACC(OP_KV_STORE, t_kv);
+    OP_T(t_at);
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = falloc(S*qw);
     #pragma omp parallel for collapse(2) schedule(static)
@@ -577,8 +585,11 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         for (int64_t i = 0; i < S*qw; i++) ctx[i] *= 1.f/(1.f + expf(-gate[i]));
         free(gate);
     }
+    OP_ACC(OP_ATTN_CORE, t_at);
+    OP_T(t_o);
     mat_apply(out, ctx, &l->o, S);
     if (l->lo) lora_apply(&l->lo->o, out, ctx, S, l->o.I, l->o.O);
+    OP_ACC(OP_O_PROJ, t_o);
     free(q); free(k); free(vv); free(ctx);
 }
 
@@ -597,15 +608,21 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
 static void mlp(Model *m, Layer *l, float *x, int S, float *out) {
     Cfg *c = &m->c; int I = c->inter;
     float *g = falloc((int64_t)S*I), *u = falloc((int64_t)S*I);
+    OP_T(t0);
     mat_apply(g, x, &l->gate, S);
     mat_apply(u, x, &l->up,   S);
     if (l->lo) {
         lora_apply(&l->lo->gate, g, x, S, l->gate.I, l->gate.O);
         lora_apply(&l->lo->up,   u, x, S, l->up.I,   l->up.O);
     }
+    OP_ACC(OP_FFN_GATE_UP, t0);
+    OP_T(t1);
     for (int64_t i = 0; i < (int64_t)S*I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+    OP_ACC(OP_FFN_SILU, t1);
+    OP_T(t2);
     mat_apply(out, g, &l->down, S);
     if (l->lo) lora_apply(&l->lo->down, out, g, S, l->down.I, l->down.O);  /* input = g fuso */
+    OP_ACC(OP_FFN_DOWN, t2);
     free(g); free(u);
 }
 
@@ -613,7 +630,9 @@ static void mlp(Model *m, Layer *l, float *x, int S, float *out) {
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     float *x = falloc((int64_t)S*D);
+    OP_T(t_e);
     for (int s = 0; s < S; s++) embed_row(m, ids[s], 1.f, x + (int64_t)s*D);
+    OP_ACC(OP_EMBED, t_e);
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
     /* gli scratch di streaming esistono solo nel percorso MEM_GB classico;
      * in micro-RSS lo streaming avviene DENTRO mat_apply, matrice per matrice */
@@ -625,18 +644,27 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
             layer_stream_in(m, i);                  /* rilegge il layer dal disco (f32) */
             if (i + 1 < c->n_layers && i + 1 >= m->base.n_resident) layer_prefetch(m, i + 1);
         }
+        OP_T(t_n1);
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
+        OP_ACC(OP_NORM, t_n1);
         if (l->type == LT_LINEAR) deltanet(m, l, nrm, S, tmp);
         else attention(m, l, i, nrm, S, pos_base, tmp);
+        OP_T(t_r1);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        OP_ACC(OP_RESID, t_r1);
+        OP_T(t_n2);
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
+        OP_ACC(OP_NORM, t_n2);
         mlp(m, l, nrm, S, tmp);
+        OP_T(t_r2);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        OP_ACC(OP_RESID, t_r2);
     }
     m->base.kv_len = pos_base + S;
     /* blocco intermedio di un prefill a blocchi: KV/stati aggiornati, ma
      * niente final-norm/lm_head/stash TTA (validi solo per l'ultimo token) */
     if (g_skip_logits) { free(x); free(nrm); free(tmp); return NULL; }
+    OP_T(t_h);
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->base.final_norm, D, c->eps);
     if ((g_tta.mode == TTA_CACHE || g_tta.mode == TTA_LORA) && g_tta.alloc) {
@@ -646,6 +674,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     float *logit = falloc(c->vocab);
     mat_apply(logit, last, &m->base.lm_head, 1);
     lora_apply(&m->lm_lora, logit, last, 1, m->base.lm_head.I, m->base.lm_head.O);
+    OP_ACC(OP_LM_HEAD, t_h);
     free(x); free(nrm); free(tmp); free(last);
     return logit;
 }

@@ -41,3 +41,6 @@ void *moty_scr_take(Scratch *s, int64_t bytes) {
     s->used += bytes;
     return p;
 }
+
+#include "util/prof.h"
+double moty_prof_op[OP_N];   /* util/prof.h per-op table */

@@ -1,6 +1,7 @@
 /* attn.c — M3 libmoty-nn: implementazione condivisa dell'attenzione GQA.
  * Trasformata 1:1 da nn_attn.h (paste-in) alla MotyAttnView: stesse
  * regioni OpenMP, stesso ordine delle operazioni, stesse scelte VNNI. */
+#include "util/prof.h"
 #include "nn/attn.h"
 
 /* coda comune: QK-norm + RoPE → KV store → scores/accum → (gate) → o_proj */
@@ -10,6 +11,7 @@ static void attn_tail(const MotyAttnView *a, float *q, float *k, float *vv,
     int64_t qw = (int64_t)H*hd, kw = (int64_t)KV*hd;
     int li = a->li;
     /* QK-norm + RoPE */
+    OP_T(t_qk);
     for (int s = 0; s < S; s++) {
         int pos = pos_base + s;
         for (int hh = 0; hh < H; hh++) {
@@ -21,7 +23,9 @@ static void attn_tail(const MotyAttnView *a, float *q, float *k, float *vv,
             rope_head(k + s*kw + hh*hd, pos, a->theta, a->rot);
         }
     }
+    OP_ACC(OP_QKNORM_ROPE, t_qk);
     /* KV store */
+    OP_T(t_kv);
     int kv8 = a->K8[li] != NULL;
     for (int s = 0; s < S; s++) for (int hh = 0; hh < KV; hh++) {
         int t = pos_base + s; int64_t slot = (int64_t)hh*a->max_t + t;
@@ -33,7 +37,9 @@ static void attn_tail(const MotyAttnView *a, float *q, float *k, float *vv,
             memcpy(a->V[li] + slot*hd, vv + s*kw + hh*hd, hd*sizeof(float));
         }
     }
+    OP_ACC(OP_KV_STORE, t_kv);
     /* scores + accumulation */
+    OP_T(t_at);
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = scr_take(a->scr, (int64_t)S*qw*4);
     #pragma omp parallel for collapse(2) schedule(static)
@@ -51,7 +57,10 @@ static void attn_tail(const MotyAttnView *a, float *q, float *k, float *vv,
     }
     if (gate)
         for (int64_t i = 0; i < (int64_t)S*qw; i++) ctx[i] *= 1.f/(1.f + expf(-gate[i]));
+    OP_ACC(OP_ATTN_CORE, t_at);
+    OP_T(t_o);
     mat_apply(out, ctx, a->o, S);
+    OP_ACC(OP_O_PROJ, t_o);
 }
 
 void moty_nn_attention(const MotyAttnView *a, const float *x, int S, int pos_base, float *out) {
@@ -71,6 +80,7 @@ void moty_nn_attention(const MotyAttnView *a, const float *x, int S, int pos_bas
     float *q = scr_take(a->scr, (int64_t)S*qw*4);
     float *k = scr_take(a->scr, (int64_t)S*kw*4), *vv = scr_take(a->scr, (int64_t)S*kw*4);
     /* q/k/v in UNA regione quando tutte WF_I4G gs=32 D%64==0 (VNNI) */
+    OP_T(t_qkv);
     {
         int64_t nk = (int64_t)S*kw;
         int64_t tot = (int64_t)S*qw + 2*nk;
@@ -105,6 +115,7 @@ void moty_nn_attention(const MotyAttnView *a, const float *x, int S, int pos_bas
             mat_apply(vv, x, a->v, S);
         }
     }
+    OP_ACC(OP_QKV, t_qkv);
     attn_tail(a, q, k, vv, x, S, pos_base, out, NULL);
 }
 

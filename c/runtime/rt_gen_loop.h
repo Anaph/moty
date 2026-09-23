@@ -3,6 +3,7 @@
  * e le dichiarazioni degli hook. Un'istanza per TU (tutto static). */
 #ifndef RT_GEN_LOOP_H
 #define RT_GEN_LOOP_H
+#include "util/prof.h"    /* OP_T/OP_ACC per-op table (no-ops without MOTY_PROF) */
 
 /* ---------- prefill a blocchi (PREFILL_CHUNK) ----------
  * Le attivazioni del prefill crescono con S (mlp: 2*S*inter f32 — 1.6 GB a
@@ -117,21 +118,46 @@ static int run_ppl(Model *m, const char *path) {
  * hist[len..len+k) = token nuovi da prefillare; genera fino a n_new token o stop.
  * Stampa il testo su stdout se echo!=0. Ritorna il numero di token generati
  * (stop incluso se emesso); *stopped=1 se l'ultimo token e' uno stop. */
+/* per-op table (util/prof.h, MOTY_PROF builds): ms per phase, then reset */
+static void prof_op_report(const char *what, int ntok, double wall) {
+#ifdef MOTY_PROF
+    static const char *nm[OP_N] = OP_NAMES;
+    double tot = 0; for (int i = 0; i < OP_N; i++) tot += moty_prof_op[i];
+    fprintf(stderr, "[prof-op] %s: %d tok, wall %.1f ms (%.2f ms/tok)\n", what, ntok, wall*1e3, wall*1e3/(ntok?ntok:1));
+    for (int i = 0; i < OP_N; i++) if (moty_prof_op[i] > 0)
+        fprintf(stderr, "[prof-op]   %-22s %9.2f ms %6.2f ms/tok %5.1f%%\n", nm[i], moty_prof_op[i]*1e3,
+                moty_prof_op[i]*1e3/(ntok?ntok:1), 100*moty_prof_op[i]/wall);
+    fprintf(stderr, "[prof-op]   %-22s %9.2f ms %6.2f ms/tok %5.1f%%\n", "(unattributed)", (wall-tot)*1e3,
+            (wall-tot)*1e3/(ntok?ntok:1), 100*(wall-tot)/wall);
+    for (int i = 0; i < OP_N; i++) moty_prof_op[i] = 0;
+#else
+    (void)what; (void)ntok; (void)wall;
+#endif
+}
+
 static int gen_turn(Model *m, Tok *T, int *hist, int len, int k, int n_new, int echo, int *stopped) {
     int dump = g_tokens_dump;
+    static int ignore_eos = -1;            /* IGNORE_EOS=1: fixed-length runs for benchmarks */
+    if (ignore_eos < 0) ignore_eos = getenv("IGNORE_EOS") && atoi(getenv("IGNORE_EOS"));
+#ifdef MOTY_PROF
+    for (int i = 0; i < OP_N; i++) moty_prof_op[i] = 0;
+#endif
     double t0 = now_s();
     float *logit = step_chunked(m, hist + len, k, len);  /* PREFILL (a blocchi se PREFILL_CHUNK) */
     ENGINE_LOGITS_HOOK(m, logit);
     double tpre = now_s() - t0;
+    prof_op_report("prefill", k, tpre);
     int base = len + k, ng = 0; *stopped = 0;
     t0 = now_s();
     for (int s = 0; s < n_new; s++) {
+        OP_T(t_s);
         int t = pick_tok(&m->base.scr, logit, m->c.vocab);
+        OP_ACC(OP_SAMPLE, t_s);
         free(logit); logit = NULL;
         hist[base + ng++] = t;
         ENGINE_OBSERVE(m, t);
         if (dump) fprintf(stderr, "%d ", t);
-        if (is_stop(t)) { *stopped = 1; break; }
+        if (is_stop(t) && !ignore_eos) { *stopped = 1; break; }
         if (echo) {
             char buf[64]; int bn = tok_decode(T, &t, 1, buf, 63);
             fwrite(buf, 1, bn, stdout); fflush(stdout);
@@ -143,6 +169,7 @@ static int gen_turn(Model *m, Tok *T, int *hist, int len, int k, int n_new, int 
     if (logit) free(logit);
     if (dump) fprintf(stderr, "\n");
     double tgen = now_s() - t0;
+    prof_op_report("decode", ng, tgen);
     fprintf(stderr, "\n[" ENGINE_TAG "] prefill %d tok in %.2fs (%.1f tok/s) | decode %d tok in %.2fs (%.2f tok/s) | RSS %.2f GB\n",
             k, tpre, k/(tpre>1e-9?tpre:1e-9), ng, tgen, ng/(tgen>1e-9?tgen:1e-9), rss_gb());
     return ng;

@@ -43,4 +43,23 @@
 #define PROF_WINDOW(nom)             /* sparisce */
 #endif
 
+/* ---- per-op table (global, all TUs + libmoty-nn): where a token's time goes.
+ * OP_T(v) / OP_ACC(id, v) wrap serial call sites (never inside an omp
+ * region); gen_turn prints the table for the prefill and per decoded token.
+ * The array always exists (nn/alloc.c) so libraries and engines can be built
+ * with or without MOTY_PROF independently. */
+enum { OP_EMBED, OP_NORM, OP_RESID, OP_QKV, OP_QKNORM_ROPE, OP_KV_STORE, OP_ATTN_CORE, OP_O_PROJ,
+       OP_CONV_IN, OP_CONV_DW, OP_CONV_OUT, OP_FFN_GATE_UP, OP_FFN_SILU, OP_FFN_DOWN,
+       OP_LM_HEAD, OP_SAMPLE, OP_N };
+extern double moty_prof_op[OP_N];
+#define OP_NAMES { "embed", "rmsnorm", "resid", "qkv_proj", "qknorm+rope", "kv_store", "attn(score+softmax+V)", \
+    "o_proj", "conv_in_proj", "conv_depthwise", "conv_out_proj", "ffn_gate+up", "ffn_silu*up", "ffn_down", "lm_head", "sample" }
+#ifdef MOTY_PROF
+#define OP_T(v) double v = now_s()
+#define OP_ACC(id, v) (moty_prof_op[id] += now_s() - (v))
+#else
+#define OP_T(v)
+#define OP_ACC(id, v) ((void)0)
+#endif
+
 #endif /* PROF_H */

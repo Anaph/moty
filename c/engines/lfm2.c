@@ -244,33 +244,45 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     float *nb = scr_take(&m->base.bscr, (int64_t)S*D*4);
     float *tb = scr_take(&m->base.bscr, (int64_t)S*D*4);
     float *x=xb,*nrm=nb,*tmp=tb;
+    OP_T(t_e);
     for (int s = 0; s < S; s++) embed_row(m, ids[s], 1.f, x + (int64_t)s*D);
+    OP_ACC(OP_EMBED, t_e);
     int strm = m->base.stream_buf != NULL || m->base.stream_q != NULL;
     if (strm && m->base.n_resident < c->n_layers) layer_prefetch(m, m->base.n_resident);
     PROF_DECL();
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
         if (strm && i >= m->base.n_resident) { layer_stream_in(m, i); if (i+1 < c->n_layers && i+1 >= m->base.n_resident) layer_prefetch(m, i+1); }
+        OP_T(t_n1);
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->attn_norm, D, c->eps);
+        OP_ACC(OP_NORM, t_n1);
         double c0 = 0;
         if (PROF_ON) c0 = now_s();
         else (void)c0;
         if (l->type == LT_CONV) conv_run(m, l, nrm, S, tmp); else att_run(m, l, i, nrm, S, pos_base, tmp);
         if (l->type == LT_CONV) { PROF_ACC(conv, c0); } else { PROF_ACC(attn, c0); }
         if (PROF_ON) c0 = now_s();
+        OP_T(t_r1);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        OP_ACC(OP_RESID, t_r1);
+        OP_T(t_n2);
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->ffn_norm, D, c->eps);
+        OP_ACC(OP_NORM, t_n2);
         if (l->is_moe) moe_run(m, l, i, nrm, S, tmp);
         else ffn_run(m, l, nrm, S, tmp);
         if (l->is_moe) { PROF_ACC(moe, c0); } else { PROF_ACC(ffn, c0); }
+        OP_T(t_r2);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        OP_ACC(OP_RESID, t_r2);
     }
     PROF_COUNT();
     m->base.kv_len = pos_base + S;
     if (g_skip_logits) return NULL;
     double t_c1 = 0; if (PROF_ON) t_c1 = now_s(); else (void)t_c1;
+    OP_T(t_h);
     float *last = falloc(D); rmsnorm_row(last, x + (int64_t)(S-1)*D, m->base.final_norm, D, c->eps);
     float *logit = falloc(c->vocab); mat_apply(logit, last, &m->base.lm_head, 1);
+    OP_ACC(OP_LM_HEAD, t_h);
     PROF_ACC(log, t_c1);
     PROF_WINDOW(m->c.vocab);
     free(last); return logit;

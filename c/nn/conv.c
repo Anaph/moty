@@ -1,4 +1,5 @@
 /* conv.c — M3 libmoty-nn: conv corta causale fusa (da nn_conv.h, 1:1). */
+#include "util/prof.h"
 #include "nn/conv.h"
 
 void moty_nn_conv_layer(const MotyConvView *cv, const float *x, int S, float *out) {
@@ -28,7 +29,10 @@ void moty_nn_conv_layer(const MotyConvView *cv, const float *x, int S, float *ou
       if (!conv_new) { vnni_in = 0; vnni_out = 0; } }
     if (!vnni_in || !vnni_out) {
         /* path legacy: proiezioni batched via mat_apply (2 fork/join) */
+        OP_T(t_in);
         mat_apply(bcx, x, cv->in_proj, S);
+        OP_ACC(OP_CONV_IN, t_in);
+        OP_T(t_dw);
         int dc = K - 1;
         for (int s = 0; s < S; s++) {
             float *row = bcx + (int64_t)s*3*D;
@@ -46,7 +50,10 @@ void moty_nn_conv_layer(const MotyConvView *cv, const float *x, int S, float *ou
                     cv->conv_state[ch*dc+dc-1] = b[ch]*xx[ch];
                 }
         }
+        OP_ACC(OP_CONV_DW, t_dw);
+        OP_T(t_out);
         mat_apply(out, ybuf, cv->out_proj, S);
+        OP_ACC(OP_CONV_OUT, t_out);
         return;
     }
     /* quant x per token (seriale: S=1 in decode; ~8us per S=27) */
