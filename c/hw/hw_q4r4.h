@@ -114,6 +114,21 @@ void moty_hw_q8r4_gemm_ref(const int8_t *w, const uint16_t *d, const int8_t *xq,
         }
 }
 
+void moty_hw_q8r4_gemm4t_ref(const int8_t *w, const uint16_t *d, const int8_t *xq, int64_t ldx,
+                             const float *xst, int nb, float *y, int ys) {
+    for (int t = 0; t < 4; t++)
+        for (int r = 0; r < 4; r++) {
+            float acc = 0;
+            for (int g = 0; g < nb; g++) {
+                const int8_t *wr = w + (size_t)g*128 + r*32, *xg = xq + t*ldx + g*32;
+                int32_t s = 0;
+                for (int j = 0; j < 32; j++) s += (int32_t)wr[j] * xg[j];
+                acc += (float)s * (moty_hw_f16_to_f32(d[(size_t)g*4 + r]) * xst[g*4 + t]);
+            }
+            y[(size_t)t*ys + r] = acc;
+        }
+}
+
 #if defined(__aarch64__) && defined(__ARM_NEON)
 /* ---------------- NEON (ARMv8.0: SMULL/SMLAL2, no SDOT) ---------------- */
 void moty_hw_quant_g32(const float *x, int I, int8_t *xq, float *xs, int32_t *xsum) {
@@ -284,7 +299,36 @@ static inline void q8r4_gemv(const int8_t *w, const uint16_t *d, const int8_t *x
     }
     vst1q_f32(y, vaddq_f32(a0, a1));
 }
-/* prefill: token by token over the block (4 rows x I int8 stay in L1) */
+/* prefill tile: 4 rows x 4 tokens, each group's 8 weight registers reused
+ * for the 4 tokens; per-token scales as one vector per group (xst[g][t],
+ * the Q4R4 tile layout; Q8R4 has no offset term) */
+void moty_hw_q8r4_gemm4t(const int8_t *w, const uint16_t *d, const int8_t *xq, int64_t ldx,
+                         const float *xst, int nb, float *y, int ys) {
+    float32x4_t a0 = vdupq_n_f32(0), a1 = a0, a2 = a0, a3 = a0;
+    const int8_t *x0p = xq, *x1p = xq + ldx, *x2p = xq + 2*ldx, *x3p = xq + 3*ldx;
+    for (int g = 0; g < nb; g++) {
+        int8x16_t w00 = vld1q_s8(w), w01 = vld1q_s8(w + 16), w10 = vld1q_s8(w + 32), w11 = vld1q_s8(w + 48);
+        int8x16_t w20 = vld1q_s8(w + 64), w21 = vld1q_s8(w + 80), w30 = vld1q_s8(w + 96), w31 = vld1q_s8(w + 112);
+        w += 128;
+        float32x4_t dv = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(d))); d += 4;
+        float32x4_t xs4 = vld1q_f32(xst + 4*g);
+        #define Q8R4_RS(wa, wb, x0, x1, s) { \
+            int16x8_t p_ = vmlal_high_s8(vmull_s8(vget_low_s8(wa), vget_low_s8(x0)), wa, x0); \
+            int16x8_t q_ = vmlal_high_s8(vmull_s8(vget_low_s8(wb), vget_low_s8(x1)), wb, x1); \
+            s = vpadalq_s16(vpaddlq_s16(p_), q_); }
+        #define Q8R4_TOK(xp, lane, acc) { \
+            int8x16_t x0 = vld1q_s8(xp + g*32), x1 = vld1q_s8(xp + g*32 + 16); int32x4_t s0, s1, s2, s3; \
+            Q8R4_RS(w00, w01, x0, x1, s0) Q8R4_RS(w10, w11, x0, x1, s1) \
+            Q8R4_RS(w20, w21, x0, x1, s2) Q8R4_RS(w30, w31, x0, x1, s3) \
+            float32x4_t s = vcvtq_f32_s32(vpaddq_s32(vpaddq_s32(s0, s1), vpaddq_s32(s2, s3))); \
+            acc = vfmaq_f32(acc, s, vmulq_laneq_f32(dv, xs4, lane)); }
+        Q8R4_TOK(x0p, 0, a0) Q8R4_TOK(x1p, 1, a1) Q8R4_TOK(x2p, 2, a2) Q8R4_TOK(x3p, 3, a3)
+        #undef Q8R4_TOK
+        #undef Q8R4_RS
+    }
+    vst1q_f32(y, a0); vst1q_f32(y + ys, a1); vst1q_f32(y + 2*ys, a2); vst1q_f32(y + 3*ys, a3);
+}
+/* generic entry: token by token over the block (4 rows x I int8 stay in L1) */
 void moty_hw_q8r4_gemm(const int8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
                        int nb, int ns, float *y, int ys) {
     int I = nb * 32;
@@ -313,6 +357,10 @@ void moty_hw_q4r4_gemm4t(const uint8_t *w, const uint16_t *d, const int8_t *xq, 
 void moty_hw_q8r4_gemm(const int8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
                        int nb, int ns, float *y, int ys) {
     moty_hw_q8r4_gemm_ref(w, d, xq, xs, nb, ns, y, ys);
+}
+void moty_hw_q8r4_gemm4t(const int8_t *w, const uint16_t *d, const int8_t *xq, int64_t ldx,
+                         const float *xst, int nb, float *y, int ys) {
+    moty_hw_q8r4_gemm4t_ref(w, d, xq, ldx, xst, nb, y, ys);
 }
 #endif
 

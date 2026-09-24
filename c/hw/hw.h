@@ -89,6 +89,11 @@ void    moty_hw_q8r4_gemm(const int8_t *w, const uint16_t *d, const int8_t *xq, 
                           int nb, int ns, float *y, int ys);
 void    moty_hw_q8r4_gemm_ref(const int8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,
                               int nb, int ns, float *y, int ys);
+/* Q8R4 prefill tile: 4 tokens, xst as for moty_hw_q4r4_gemm4t */
+void    moty_hw_q8r4_gemm4t(const int8_t *w, const uint16_t *d, const int8_t *xq, int64_t ldx,
+                            const float *xst, int nb, float *y, int ys);
+void    moty_hw_q8r4_gemm4t_ref(const int8_t *w, const uint16_t *d, const int8_t *xq, int64_t ldx,
+                                const float *xst, int nb, float *y, int ys);
 /* scalar references of the two above (always compiled: tests compare) */
 void    moty_hw_quant_g32_ref(const float *x, int I, int8_t *xq, float *xs, int32_t *xsum);
 void    moty_hw_q4r4_gemm_ref(const uint8_t *w, const uint16_t *d, const int8_t *xq, const float *xs,

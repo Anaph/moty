@@ -257,6 +257,35 @@ int q8_gemm_int_exact(void) {
     return 0;
 }
 
+/* the 4-token tile: integer-exact with unit scales, = the per-token reference */
+int q8_gemm4t(void) {
+    enum { NB = 5, I = NB*32 };
+    int8_t w[NB*128], xq[4*I]; uint16_t d[NB*4]; float xs[4*NB], xst[NB*4], xct[NB*4], y[16], yr[16], y1[16];
+    int32_t xm[4*NB];
+    for (int i = 0; i < NB*128; i++) w[i] = (int8_t)(q4_frnd() * 255);
+    for (int g = 0; g < NB; g++) memset(w + g*128, 0x80, 32);         /* row 0: -128 */
+    for (int i = 0; i < NB*4; i++) d[i] = 0x3c00;
+    for (int t = 0; t < 4; t++) for (int g = 0; g < NB; g++) {
+        for (int j = 0; j < 32; j++) xq[t*I+g*32+j] = (int8_t)(t == 1 ? -127 : (int)(q4_frnd() * 254));
+        xs[t*NB+g] = 1.f; xm[t*NB+g] = 0;
+    }
+    moty_hw_q4r4_tile_scales(xs, xm, NB, xst, xct);
+    moty_hw_q8r4_gemm4t(w, d, xq, I, xst, NB, y, 4);
+    moty_hw_q8r4_gemm4t_ref(w, d, xq, I, xst, NB, yr, 4);
+    for (int t = 0; t < 4; t++) for (int r = 0; r < 4; r++) {
+        int64_t e = 0;
+        for (int g = 0; g < NB; g++) for (int j = 0; j < 32; j++) e += w[g*128 + r*32 + j] * xq[t*I+g*32+j];
+        CHECK(y[t*4+r] == (float)e && yr[t*4+r] == (float)e);
+    }
+    for (int i = 0; i < NB*4; i++) d[i] = moty_f32_to_f16(q4_frnd() * 0.02f);
+    for (int k = 0; k < 4*NB; k++) xs[k] = 0.01f + q4_frnd() * 0.005f;
+    moty_hw_q4r4_tile_scales(xs, xm, NB, xst, xct);
+    moty_hw_q8r4_gemm4t(w, d, xq, I, xst, NB, y, 4);
+    moty_hw_q8r4_gemm_ref(w, d, xq, xs, NB, 4, y1, 4);
+    for (int k = 0; k < 16; k++) CHECK(fabsf(y[k] - y1[k]) <= 1e-4f * (fabsf(y1[k]) + 1.f));
+    return 0;
+}
+
 /* driver vs a dequantized double reference (ragged O, decode, tails, >1 tile) */
 static int q8_matmul_case(int O, int I, int S) {
     int nb = I/32, O4 = (O+3)/4;
@@ -299,7 +328,8 @@ int main(void) {
         {"f16_roundtrip", q4_f16_roundtrip}, {"quant_g32_exact", q4_quant_g32_exact},
         {"pack_noclip", q4_pack_noclip}, {"gemm_int_exact", q4_gemm_int_exact},
         {"matmul_driver", q4_matmul_driver}, {"gemm4t", q4_gemm4t}, {"gemm_long_rows", q4_gemm_long_rows},
-        {"q8_pack_noclip", q8_pack_noclip}, {"q8_gemm_int_exact", q8_gemm_int_exact}, {"q8_matmul_driver", q8_matmul_driver} };
+        {"q8_pack_noclip", q8_pack_noclip}, {"q8_gemm_int_exact", q8_gemm_int_exact}, {"q8_matmul_driver", q8_matmul_driver},
+        {"q8_gemm4t", q8_gemm4t} };
     int bad = 0;
     for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) {
         int r = T[i].f(); bad |= r;

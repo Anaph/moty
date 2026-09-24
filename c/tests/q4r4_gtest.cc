@@ -12,6 +12,7 @@ int q4_gemm_long_rows(void);
 int q8_pack_noclip(void);
 int q8_gemm_int_exact(void);
 int q8_matmul_driver(void);
+int q8_gemm4t(void);
 }
 
 TEST(Q4R4, F16RoundTrip)      { EXPECT_EQ(q4_f16_roundtrip(), 0); }
@@ -24,3 +25,4 @@ TEST(Q4R4, GemmLongRows)      { EXPECT_EQ(q4_gemm_long_rows(), 0); }
 TEST(Q8R4, PackNoClip)        { EXPECT_EQ(q8_pack_noclip(), 0); }
 TEST(Q8R4, GemmIntegerExact)  { EXPECT_EQ(q8_gemm_int_exact(), 0); }
 TEST(Q8R4, MatmulDriver)      { EXPECT_EQ(q8_matmul_driver(), 0); }
+TEST(Q8R4, Gemm4Tile)         { EXPECT_EQ(q8_gemm4t(), 0); }
