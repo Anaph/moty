@@ -3,6 +3,7 @@ calibrated int4 codes.
 
   pack_r4.py <snapshot> <out_dir> [--method rtn|gptq] [--calib text]
              [--q8 glob,glob,...] [--tokens N] [--variants "dir=globs;dir2=globs"]
+             [--calib-tiles tiles --calib-prompt prompt_ids.json]
 
 Every matrix moty packs for an LFM2 / Qwen / Llama snapshot (the Linear
 weights of the layers and the tied or separate lm_head) is written as
@@ -22,6 +23,13 @@ calibration inputs (H = E[x x^T], 1 % damping, blocks of 128); a group's
 f16 scale is fixed by the no-clip rule on its error-updated weights when
 the walk reaches it. Calibration: the first --tokens (2048) tokens of
 --calib through the f32 model, every Linear's input (non-sequential).
+Vision-language snapshots: --calib-tiles (comma-separated raw f32 files
+[N][hidden] of projected image rows, or directories of *.f32) adds one
+sequence per tile — --calib-prompt's ids with the rows at the image-token
+positions, followed by the f32 model's greedy answer (64 tokens) — whose
+text positions join the statistics; the image-row positions do not (with
+them the Hessians follow the projector's rows, and GPTQ fits image
+positions at the expense of the answer tokens: tools/ref/hf_vlq.py).
 
 moty loads the result with SNAP=<out_dir> QBITS=4 (no policy needed)."""
 import argparse, fnmatch, json, os, shutil, struct, sys
@@ -104,6 +112,7 @@ def main():
     ap.add_argument("--method", default="gptq", choices=["rtn", "gptq"])
     ap.add_argument("--calib"); ap.add_argument("--tokens", type=int, default=2048)
     ap.add_argument("--q8", default="")
+    ap.add_argument("--calib-tiles", default=""); ap.add_argument("--calib-prompt", default="")
     ap.add_argument("--variants", default="",
                     help="dir=glob,glob;dir2=glob...: several containers in one pass (int4 codes computed once)")
     a = ap.parse_args()
@@ -133,16 +142,39 @@ def main():
     if a.method == "gptq":
         tok = AutoTokenizer.from_pretrained(a.snap)
         ids = tok(open(a.calib).read(), return_tensors="pt").input_ids[:, :a.tokens]
-        acc = {}
+        acc = {}; keep = {"m": None}             # token positions that enter H
         def hook(name):
             def f(mod, inp, out):
                 x = inp[0].reshape(-1, inp[0].shape[-1]).double()
+                if keep["m"] is not None: x = x[keep["m"]]
                 s = acc.setdefault(name, [0, 0]); s[0] += x.shape[0]; s[1] = s[1] + x.T @ x
             return f
+        tiles = []
+        for p in a.calib_tiles.split(","):
+            if p: tiles += sorted(os.path.join(p, f) for f in os.listdir(p) if f.endswith(".f32")) if os.path.isdir(p) else [p]
+        seqs = []
+        if tiles:                                  # f32 greedy answers first, hooks not yet attached
+            lm = model.model.language_model; emb = lm.get_input_embeddings(); head = model.lm_head
+            img_tok = model.config.image_token_id; D = emb.weight.shape[1]
+            pj = json.load(open(a.calib_prompt)); pids = torch.tensor(pj["ids"] if isinstance(pj, dict) else pj)
+            def embeds(t, rows):
+                e = emb(t.unsqueeze(0))[0].clone(); e[t == img_tok] = rows; return e.unsqueeze(0)
+            for f in tiles:
+                rows = torch.from_numpy(np.fromfile(f, dtype="<f4").reshape(-1, D))
+                out = lm(inputs_embeds=embeds(pids, rows), use_cache=True); ans = []
+                for _ in range(64):
+                    t = int(head(out.last_hidden_state[:, -1]).argmax(-1)); ans.append(t)
+                    out = lm(inputs_embeds=emb(torch.tensor([[t]])), past_key_values=out.past_key_values, use_cache=True)
+                seqs.append((torch.cat([pids, torch.tensor(ans)]), rows))
         hs = [m.register_forward_hook(hook(n)) for n, m in targets.items()]
-        model(ids); [h.remove() for h in hs]
+        model(ids)
+        for seq, rows in seqs:
+            keep["m"] = seq != img_tok
+            head(lm(inputs_embeds=embeds(seq, rows)).last_hidden_state)
+        keep["m"] = None
+        [h.remove() for h in hs]
         H = {n: (s[1] / s[0]).float() for n, s in acc.items()}
-        print(f"calibration: {ids.shape[1]} tokens of {a.calib}", flush=True)
+        print(f"calibration: {ids.shape[1]} tokens of {a.calib}" + (f" + {len(seqs)} tiles (text positions)" if seqs else ""), flush=True)
     def canon(name):              # moty's engine-side name (Q8_TENSORS globs match these)
         return "model." + name[len("model.language_model."):] if name.startswith("model.language_model.") else name
     cache = {}                                     # (name, bits) -> (codes bytes, scale bytes)

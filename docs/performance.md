@@ -644,3 +644,64 @@ decode runs alternate 13.2–13.3 / 15.2–15.4 like OpenMP's 13.3–13.5 /
 generation alone. Unpinned workers (`MOTY_POOL_PIN=0`) decode slower
 (14.04, 8 runs). The pool build does not re-exec itself (no OpenMP
 environment to seed).
+
+### 5.14 LFM2.5-VL-450M: which int4 on image inputs
+
+On live tiles from the other board (NPU encoder rows, prompt "Describe the
+image.", greedy 64 tokens) the GPTQ + Q8R4-layers-0–1 container recommended
+for text (§5.8, §5.10) diverged from the f32 language model after ~20
+tokens and invented objects (a computer monitor, keyboard and mouse), while
+the f32 LM on the same rows kept its answer. Reference below: the f32 LM on
+the same NPU rows (the NPU encoder alone already changes answers vs HF's own
+encoder, which no LM quantization can repair). 33 live tiles (one night-IR
+scene over an hour, `xchg`), HF fake-quant with moty's int8 activations
+(`tools/ref/hf_vlq.py`) and, for the finalists, moty itself on x86
+(greedy leading tokens equal to the reference, teacher-forced top-1 over the
+64 answer positions). Decode on board B: 272-token image prompt, 64 tokens,
+4 threads / decode on 3, medians of 3.
+
+| layout (`pack_r4.py`) | MB/token | decode tok/s | KL | leading tokens = f32 (of 64) | moty: leading / teacher-forced | tiles inventing a computer set |
+|---|---|---|---|---|---|---|
+| f32 weights, moty's int8 activations (ceiling) | — | — | 0.0003 | 59.2 (29 of 33 all 64) | — | 0 |
+| Q4R4, round-to-nearest | 199.4 | 15.35 | 0.052 | 20.4 | 21.5 / 93.3 % | 12 |
+| GPTQ (text) + Q8R4 layers 0–1 (the text recommendation) | 217.7 | 14.06 | 0.095 | 15.3 | 11.2 / 84.2 % | 24 |
+| GPTQ (text + tiles) | 199.4 | 15.35* | 0.044 | 28.6 | 24.0 / 92.9 % | 12 |
+| RTN + Q8R4 head | 232.9 | 13.93 | 0.041 | 25.4 | — | 7 |
+| RTN + Q8R4 layers 8–15 | 270.7 | 11.96 | 0.021 | 39.0 | — | 3 |
+| **RTN + Q8R4 head + layers 10–15** | 286.4 | **11.49** | 0.015 | **42.5** (2 all 64) | **42.0 / 96.4 %** (3 all 64) | **0** |
+| GPTQ (text + tiles) + Q8R4 head + layers 10–15 | 286.4 | 11.49* | 0.014 | 29.8 | 35.6 / 95.4 % | 21 |
+| Q8R4 everywhere | 376.6 | 10.00 | 0.0005 | 55.0 (20 all 64) | — | 3 |
+
+\* same format and bytes as the row above it (speed by construction).
+"Computer set": monitor, keyboard, mouse, laptop or screen in the answer but
+not in the reference answer (the scene has an on-screen clock, so a few
+"screen" mentions may be legitimate — the f32 ceiling has none).
+
+What the image inputs change:
+- **Sensitivity moves to the end of the network.** One tensor group in
+  int4, the rest f32 (KL, the first 4 tiles): lm_head 0.011, FFN w2 0.011, w3 / v / w1
+  0.006, attention out 0.004, conv out / in 0.003, q / k 0.002; by layer
+  14 0.006, 10 0.005, 15 0.005 … layer 0 0.0016, layer 1 0.0003 — on text
+  layers 0 and 1 cost 0.36 / 0.35 (§5.8). The text recipe protects the
+  wrong layers.
+- **GPTQ calibrated on text hurts images**: its Hessians come from text
+  activations; on image-conditioned inputs it doubles the error of plain
+  rounding (KL 0.095 vs 0.052). Calibrating on the answer positions of
+  image sequences (16 tiles of brownai test images, colour and grey, not
+  the evaluation tiles; the image-row positions left out of the Hessians —
+  on the first 4 tiles, with them KL 0.056, without 0.046) brings it below
+  rounding in KL (0.044 on the 33 tiles), but every
+  GPTQ variant still invents the computer set on more tiles than its
+  round-to-nearest twin: a lower average error, a worse answer.
+- moty's int8 activations cost almost nothing (29 of 33 tiles identical
+  over 64 tokens with f32 weights); the damage is in the int4 weights.
+
+**Recommendation for LFM2.5-VL-450M on the A53: round-to-nearest Q4R4 with
+Q8R4 for the lm_head and layers 10–15**
+(`pack_r4.py --method rtn --q8 "lm_head.weight,model.layers.1?.*"` on the
+VL snapshot): no invented objects on the 33 tiles and about three times
+the matching prefix of the text recipe (42.0 vs 11.2 tokens in moty), at
+11.5 tok/s decode instead of 14.1. For
+text-only use of LFM2.5-350M §5.8 stands. `pack_r4.py --calib-tiles` (VL
+calibration: text positions of image sequences) is kept for further
+studies; `tools/ref/hf_vl_rows.py` makes calibration tiles from images.
