@@ -440,3 +440,34 @@ further share at no cost. If quality matters more than speed, Q8R4
 everywhere reaches 94.7 % top-1 at 60 % of the int4 decode speed — and
 beats the existing `QBITS=8` path (83.9 %) because its activations are
 quantized per group of 32 instead of per row.
+
+### 5.9 LFM2.5-VL-450M: the language model on the board, images from an NPU encoder
+
+The vision tower and projector run elsewhere (here: converted to RKNN
+for the RV1126B NPU by a separate effort); moty runs the LFM2 language
+model of `LiquidAI/LFM2.5-VL-450M` from its own checkpoint and takes the
+256 projected image rows through `EMBEDS=` at the image-token positions
+of the processor's prompt (`PROMPT_IDS=`, 272 tokens for one 512×512
+tile and "Describe the image.").
+
+Exactness (x86, f32): with the HF image features moty matches HF's first
+logits to 3 decimals (top-5 identical) and its 64-token greedy answer
+word for word; COCO val2017 #39769 through `tools/ref/hf_vl_ref.py`: 15/15
+tokens, max |Δlogit| 1.3e-5. With the NPU encoder's features (cosine to
+HF: mean 0.990, min 0.61; relative L2 0.21) the f32 answer is still
+identical to HF's.
+
+On board B (4 threads, decode on 3, container load; medians of 2):
+
+| LM format | image rows | load | prefill 272 tok (= time to first token) | decode tok/s | peak RSS | answer tokens = HF (teacher-forced, of 64) |
+|---|---|---|---|---|---|---|
+| Q4R4 (RTN) | HF | 3.0 s | 43.4 tok/s (6.3 s) | 15.29 | 309 MB | 60 |
+| Q4R4 (RTN) | NPU | 2.1 s | 47.5 tok/s (5.7 s) | 14.85 | 309 MB | 60 |
+| GPTQ + Q8R4 layers 0–1 | HF | 3.3 s | 45.2 tok/s (6.0 s) | 14.50 | 327 MB | 56 |
+| GPTQ + Q8R4 layers 0–1 | NPU | 2.7 s | 42.8 tok/s (6.4 s) | 14.28 | 327 MB | 55 |
+
+64 answer tokens are a small sample; on the 2047-token evaluation text
+(x86, top-1 against moty f32, PPL 34.0) the VL language model gives
+Q4R4 PPL 39.7 / 81.3 % and GPTQ + Q8R4 layers 0–1 PPL 34.8 / 86.2 % — the
+same recommendation as for LFM2.5-350M holds, with a smaller gap (this
+model loses far less to int4: 81 % vs 61.5 % top-1).
