@@ -43,3 +43,16 @@ multi-tile path for larger images. `prep_image.py` resizes an image to
 
 `vl_pipeline.sh` runs both steps on a board and reports the encoder time,
 the time to first token, decode speed and memory.
+
+## Making the encoder (LFM2.5-VL-450M)
+
+| file | env | what |
+|---|---|---|
+| `export_lfm2vl_encoder.py <snap> <out.onnx> [--image img]` | host venv (torch, transformers) | the HF vision tower + projector as one ONNX graph for a 512×512 tile; `--image` checks it against HF `get_image_features` |
+| `convert_rknn.py <onnx> <out.rknn> [--target rv1126b] [--check tile.ppm rows.f32]` | rknn venv | fp16 `.rknn`, normalisation folded in (mean = std = 127.5); `--check` compares the toolkit simulator with reference rows |
+| `npu_contention.sh` | board | detector and VL encoder alone and at once, NPU load samples |
+
+The rknn venv is separate from the host venv: `rknn-toolkit2==2.3.2` pins
+torch 2.4.0, numpy 1.26.4 and onnx 1.16.1, and needs
+`opencv-python-headless` (the default opencv wheel wants libGL). The full
+recipe with the results: [docs/models/lfm2.5-vl-450m.md](../../docs/models/lfm2.5-vl-450m.md).

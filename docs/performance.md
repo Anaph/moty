@@ -470,7 +470,8 @@ On board B (4 threads, decode on 3, container load; medians of 2):
 (x86, top-1 against moty f32, PPL 34.0) the VL language model gives
 Q4R4 PPL 39.7 / 81.3 % and GPTQ + Q8R4 layers 0–1 PPL 34.8 / 86.2 % — the
 same recommendation as for LFM2.5-350M holds, with a smaller gap (this
-model loses far less to int4: 81 % vs 61.5 % top-1).
+model loses far less to int4: 81 % vs 61.5 % top-1). On image inputs it
+does not — §5.14 replaces this recommendation for the VL case.
 
 ### 5.10 LFM2.5-VL-450M end to end on one board: NPU encoder + moty
 
@@ -646,6 +647,9 @@ generation alone. Unpinned workers (`MOTY_POOL_PIN=0`) decode slower
 environment to seed).
 
 ### 5.14 LFM2.5-VL-450M: which int4 on image inputs
+
+(The whole recipe, scripts and results in one place:
+[docs/models/lfm2.5-vl-450m.md](models/lfm2.5-vl-450m.md).)
 
 On live tiles from the other board (NPU encoder rows, prompt "Describe the
 image.", greedy 64 tokens) the GPTQ + Q8R4-layers-0–1 container recommended

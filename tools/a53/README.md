@@ -11,6 +11,8 @@ particular device: copy the binaries and models yourself (or with
 | `rssrun.c` | target | `rssrun CMD ARGS...`: peak RSS (`ru_maxrss`) and wall time of CMD; the child gets `oom_score_adj=1000`. `aarch64-linux-gnu-gcc -O2 -static rssrun.c -o rssrun` |
 | `run_matrix.sh` | target | engine x QBITS x THREADS matrix (+ optional `llama-bench` rows), interleaved repetitions, memory sentinel, optional wait-while-busy guard; see the header |
 | `parse_table.py` | host | `run_matrix.sh` log -> markdown table (median over repetitions) |
+| `run_configs.sh` | target | labelled configurations (any engine + environment, `EMBEDS=`/`PROMPT_IDS=` runs, `llama-bench` rows), interleaved repetitions, memory sentinel, wait-while-busy guard; see the header |
+| `parse_runs.py` | host | `run_configs.sh` log(s) -> markdown table, medians with every run listed |
 | `xfer_verified.sh` | host | chunked, rate-limited, sha256-verified copy to the target; stops at the first connection failure |
 
 Typical session (int4 container of LFM2.5-350M, 1/2/4 threads, three

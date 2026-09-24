@@ -331,6 +331,10 @@ SNAP=MiniCPM5-1B-q4r4 QBITS=4 EMBED=disk THREADS=4 PROMPT="..." ./qwen
 largest single tensor); peak RSS is then ~560 MB for MiniCPM5-1B and
 ~300 MB for LFM2.5-350M.
 
+Model pages with the full recipe from the HF snapshot to the board (scripts,
+containers, evaluation, results): [LFM2.5-VL-450M](docs/models/lfm2.5-vl-450m.md)
+— vision encoder on a Rockchip NPU, language model in moty.
+
 ### Tokenizer parity (tok_oracle)
 
 The test build also produces `c/tests/build/tok_oracle` — a corpus-scale

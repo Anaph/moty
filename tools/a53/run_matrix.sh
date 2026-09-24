@@ -21,7 +21,7 @@ P="$(cat "$PROMPT_FILE")"
     a=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
     if [ "$a" -lt "${MEM_MIN_KB:-150000}" ]; then
       echo "SENTINEL $(date +%T): MemAvailable ${a} kB -> kill benchmark"
-      pkill -9 -f "$(basename "$ENGINE")|llama-bench"
+      killall -9 "$(basename "$ENGINE")" llama-bench 2>/dev/null   # busybox: no pkill
     fi
     sleep 1
   done
