@@ -371,3 +371,72 @@ Where the remaining gap goes:
   the two scale FMAs. That is the cost of group-32 scales on both
   weights and activations; at ~3 MAC/cycle per core and ~80 % of the CPU
   available the matmuls run at their ceiling.
+
+### 5.8 Quantization study: which int4 for LFM2.5-350M
+
+Evaluation: teacher-forced over 2047 tokens of `tools/ref/ppl_text_long.txt`;
+PPL, top-1 agreement with HF transformers f32 (PPL 245.4) and, in the HF
+fake-quant simulation, mean KL(f32 ‖ quantized). Calibration (imatrix,
+AWQ, GPTQ): the first 2048 tokens of `tools/ref/calib_text.txt`, disjoint
+from the evaluation text. The simulation reproduces moty: Q4R4 simulated
+PPL 339 / top-1 61.6 % vs moty 343.2 / 61.5 %.
+
+**Sensitivity** (`hf_sens.py`: one group int4, the rest f32, KL):
+layer 0 0.36 and layer 1 0.35 dominate, then layer 2 0.11 and 0.03–0.08
+for the rest; by type w2 0.23, w3 0.20, v 0.12, w1 0.12, conv out 0.11,
+attention out 0.07, conv in 0.06, q/k 0.03, lm_head 0.013 (the head is
+not the problem), int8 embedding 0.001. Some input channels carry 100–800×
+the median mean-square activation.
+
+**Weight schemes** (`hf_qstudy.py`, every Linear + head, int8 embedding):
+
+| scheme | MB/token | PPL | KL | top-1 |
+|---|---|---|---|---|
+| Q4R4 (sym, g32, f16 scale, no-clip rule) | 199.4 | 339 | 0.773 | 61.6 % |
+| sym g16 / g64 / g128 | 221.5 / 188.3 / 182.7 | 151 / 320 / 1478 | 0.898 / 1.030 / 1.975 | 59.7 / 54.9 / 43.8 % |
+| g32, int8 scales × f32 per row | 188.3 | 311 | 0.785 | 61.7 % |
+| asymmetric g32 (Q4_1: scale + min) | 221.5 | 1863 | 1.807 | 47.1 % |
+| Q5 g32 | 243.7 | 210 | 0.195 | 78.4 % |
+| Q8 g32 / int8 per row | 376.6 / 354.4 | 268 / 234 | 0.007 / 0.017 | 95.6 / 92.6 % |
+
+Finer groups and Q4_1 lower the reconstruction error of every matrix (and
+help alone: layer 0 at g16 or Q4_1 costs KL 0.11 instead of 0.36), yet
+lose on the whole model; the damage is concentrated in FFN w3 (KL 0.20 at
+g32 → 0.30 g16 → 0.68 Q4_1). Q5 is the best 5-bit option in quality but
+not on the A53: a Q5 GEMV (nibbles + a high-bit plane) takes 113 cycles
+per group instead of 56 and decodes a 9216×1024 matrix 1.6× slower at 4
+threads for 22 % more bytes.
+
+**Calibration** (on Q4R4, same format): imatrix-weighted scale search KL
+1.058 and AWQ 0.846 are *worse* than round-to-nearest (0.773) — with
+input-channel outliers this large the scale search trades exact extremes
+for weighted MSE; **GPTQ** 0.606, top-1 66.1 % (moty: PPL 285.1, top-1
+64.6 %), no format change. imatrix helps only the finer formats (g16
+0.592, Q4_1 0.576).
+
+**Pareto on board B** (moty; RV1126B, 4 threads, decode on 3,
+container load; speed medians of 6 interleaved runs; KL from the
+simulation with moty's int8 activations):
+
+| layout (`pack_r4.py`) | MB/token | prefill tok/s | decode tok/s | RSS | PPL | top-1 | KL |
+|---|---|---|---|---|---|---|---|
+| Q4R4, round-to-nearest (before) | 199.4 | 45.7 | 15.89 | 300 MB | 343.2 | 61.5 % | 0.789 |
+| Q4R4, GPTQ | 199.4 | 41.2* | 16.09 | 300 MB | 285.1 | 64.6 % | 0.601 |
+| **GPTQ + Q8R4 layers 0–1** | 217.8 | **45.2** | **15.51** | 318 MB | **219.9** | **70.5 %** | 0.454 |
+| GPTQ + Q8R4 layers 0–1 + all w2 | 250.7 | 38.3 | 13.91 | 350 MB | 284.8 | 72.3 % | 0.332 |
+| Q8R4 everywhere | 376.6 | 37.4 | 9.39 | 470 MB | 255.1 | 94.7 % | 0.013 |
+| existing int8 (`QBITS=8`, per-row activations) | 354.4 | — | — | — | 230.3 | 83.9 % | — |
+
+\* The two Q4R4 rows are the same format and kernels; their prefill
+difference is background load (runs 34–48 tok/s for both).
+
+**Recommendation for LFM2.5-350M on the A53: GPTQ-calibrated Q4R4 with
+Q8R4 for layers 0 and 1** (`pack_r4.py --method gptq --q8
+"model.layers.0.*,model.layers.1.*"`, or `Q8_TENSORS=` the same globs for
+a round-to-nearest pack inside moty). +9.2 % bytes, decode −2–3 %, prefill
+within noise, and top-1 agreement with f32 61.5 → 70.5 %, PPL 343 → 220.
+The two sensitive layers carry most of the int4 damage; GPTQ removes a
+further share at no cost. If quality matters more than speed, Q8R4
+everywhere reaches 94.7 % top-1 at 60 % of the int4 decode speed — and
+beats the existing `QBITS=8` path (83.9 %) because its activations are
+quantized per group of 32 instead of per row.

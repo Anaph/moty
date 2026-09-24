@@ -151,6 +151,9 @@ Common environment variables (qwen engine):
 | `PPL_OUT` / `PPL_N` | — | with `PPL`: write the per-position argmax ids (for top-1 agreement vs a reference, `tools/ref/cmp_ppl.py`); cap the token count |
 | `IGNORE_EOS` | 0 | 1 → keep generating past end-of-turn tokens (fixed-length benchmark runs) |
 | `THREADS_DECODE` | = `THREADS` | team size for the single-token decode steps only (prefill keeps `THREADS`). On a board whose cores also run another process one fewer thread than cores decodes faster: every decode matmul ends in a barrier that waits for a preempted thread |
+| `Q8_TENSORS` | — | `<glob>,…` (`*` wildcard, engine-side tensor names; tied head = `lm_head.weight`): these tensors take Q8R4 (int8, group-32) instead of Q4R4 under `QBITS=4 Q4FMT=r4`. LFM2.5-350M: `model.layers.0.*,model.layers.1.*` (docs/performance.md §5.8). Containers keep the mixed layout |
+| `EMBEDS` / `EMBEDS_TOKEN` | — / `image_token_id` | raw little-endian f32 `[N][hidden]` rows injected at the positions of token `EMBEDS_TOKEN` in the prompt, in order (e.g. projected image features from an external vision encoder) |
+| `PROMPT_IDS` | — | `{"ids":[...]}`: generate from a ready token sequence (e.g. a VL processor's expansion of text + image placeholders), no chat template |
 | `HEAD_TOPK` | 0 | K > 0 → two-stage lm_head for Q4R4 heads: a 1-bit copy of the head picks K candidate rows, exact int4 logits only for them, the rest -1e30 (top-K-truncated distribution). ~2× cheaper head; the argmax equals the full int4 head's at 99.76 % of positions for K=512 on LFM2.5-350M. Ignored by `REF`/`PPL` |
 | `TOKENS` | 0 | 1 → dump generated token ids to stderr |
 | `TTA` | off | **experimental** test-time adaptation: `cache` (neural cache), `bias` (online logit bias) or `lora` (online low-rank lm_head adapter); see [docs/online-learning.md](docs/online-learning.md) |

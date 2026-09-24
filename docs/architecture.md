@@ -149,6 +149,18 @@ it. `load_mat_q4r4` reads such pairs raw (size-checked) instead of
 reading bf16 and packing. Output is bit-identical to loading the original
 snapshot.
 
+**Q8R4 and mixed precision.** `WF_Q8R4` is the int8 sibling of Q4R4 for
+the tensors int4 damages most: the same 4-row blocks, groups of 32, f16
+scale stream and group-32 int8 activations, 128 bytes per block-group (32
+signed codes per row, the no-clip rule with −128/127). The GEMV keeps two
+products per int16 lane and folds them with SADDLP/SADALP; the prefill
+tile (`moty_hw_q8r4_gemm4t`) reuses a group's weight registers for 4
+tokens. `Q8_TENSORS=<glob>,…` (engine-side names, `*` wildcard; the tied
+head is `lm_head.weight`) picks Q8R4 per tensor under `QBITS=4 Q4FMT=r4`;
+`SAVE_PACKED` stores Q8R4 as I8 + F16 `.s16`, and the loader tells the
+formats apart by size, so a mixed container needs no policy at load time.
+`tools/ref/pack_r4.py` writes the same containers with GPTQ-chosen codes.
+
 **Attention rows** (`moty_hw_attn_scores` / `moty_hw_attn_accum`): for
 head_dim 64 the query (scores) or the 64 output accumulators (value
 pass) stay in 16 NEON registers across all cached positions, two rows per
@@ -165,6 +177,14 @@ then an exact select among the survivors), and stage 2 computes exact
 Q4R4 logits for their 4-row blocks; all other logits are -1e30. Greedy
 decoding and sampling therefore see a top-K-truncated distribution;
 REF and PPL always use the full head.
+
+**Embedding injection** (`EMBEDS=<file>`, `runtime/rt_model_load.h`
+`embed_row`): raw f32 rows `[N][hidden]` replace the token embedding at
+every `EMBEDS_TOKEN` position (default: the snapshot's `image_token_id`),
+in prompt order — how HF inserts projected image features, so any
+external vision encoder can drive a text backbone. Vision-language
+checkpoints load through the `model.language_model.` name fallback in
+`io/st.h` and `text_config`.
 
 **EMBED=disk** reuses the micro-RSS row gather: the embedding table is
 not resident, each input token's row is read from the snapshot. A tied
