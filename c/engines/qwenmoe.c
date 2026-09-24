@@ -654,7 +654,7 @@ static int64_t fixed_bytes(Model *m, int ctx) {
     return g_kv_bits == 8 ? rows*c->head_dim + rows*4 : rows*c->head_dim*4;
 }
 
-static int build_turn(char *buf, int cap, const char *user) {
+static int build_turn(Tok *T, char *buf, int cap, const char *user) {
     return snprintf(buf, cap, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", user);
 }
 static void stops_seed(Model *m, Tok *T) { (void)m;

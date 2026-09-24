@@ -147,4 +147,8 @@ if(MOTY_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
-install(TARGETS moty RUNTIME DESTINATION bin)
+# a library-only consumer builds just moty_lib: `cmake --install` must not
+# require the CLI
+if(NOT MOTY_LIBRARY_ONLY)
+  install(TARGETS moty RUNTIME DESTINATION bin)
+endif()

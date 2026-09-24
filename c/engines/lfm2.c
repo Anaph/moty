@@ -346,7 +346,7 @@ static int layer_matrefs(Model *m, int li, MatRef *r) {
     #undef MR
     return n;
 }
-static int build_turn(char *buf, int cap, const char *user) {
+static int build_turn(Tok *T, char *buf, int cap, const char *user) {
     return snprintf(buf, cap, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", user);
 }
 static void stops_seed(Model *m, Tok *T) { (void)m;

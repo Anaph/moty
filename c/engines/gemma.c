@@ -520,7 +520,7 @@ static void kv_alloc(Model *m, int max_t) {
 }
 
 /* costruisce il turno chat Gemma */
-static int build_turn(char *buf, int cap, const char *user) {
+static int build_turn(Tok *T, char *buf, int cap, const char *user) {
     return snprintf(buf, cap, "<start_of_turn>user\n%s<end_of_turn>\n<start_of_turn>model\n", user);
 }
 

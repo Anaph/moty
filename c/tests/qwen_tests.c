@@ -1623,3 +1623,21 @@ int qt_llama_fused_bitexact(void) {
     g_q4fmt = save;
     return 0;
 }
+
+/* ChatML turn: the pre-closed think block only for a vocabulary with <think>
+ * (Qwen3, MiniCPM5 = HF enable_thinking=False); a Llama/SmolLM2 decoder
+ * without it gets the bare turn, as its HF template (VisionPsy: 78 ids) */
+int qt_turn_think(void) {
+    Special sp[2] = { { "<|im_start|>", 12, 1 }, { "<think>", 7, 8 } };
+    Tok T; memset(&T, 0, sizeof T);
+    char buf[256];
+    const char *bare = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n";
+    T.sp = sp; T.nsp = 1;
+    int n = build_turn(&T, buf, sizeof buf, "Hi");
+    if (n != (int)strlen(bare) || strcmp(buf, bare)) { fprintf(stderr, "no <think>: '%s'\n", buf); return 1; }
+    T.nsp = 2;
+    n = build_turn(&T, buf, sizeof buf, "Hi");
+    char want[256]; snprintf(want, sizeof want, "%s<think>\n\n</think>\n\n", bare);
+    if (n != (int)strlen(want) || strcmp(buf, want)) { fprintf(stderr, "with <think>: '%s'\n", buf); return 1; }
+    return 0;
+}

@@ -732,11 +732,14 @@ static void kv_alloc(Model *m, int max_t) {
     state_reset(m);
 }
 
-/* costruisce il turno chat Qwen3 (ChatML). THINK=0 pre-chiude il blocco think. */
-static int build_turn(char *buf, int cap, const char *user) {
+/* costruisce il turno chat Qwen3 (ChatML). THINK=0 pre-chiude il blocco think,
+ * solo per i modelli che hanno il token <think> (Qwen3, MiniCPM5: il loro template
+ * HF con enable_thinking=False fa lo stesso); un Llama/SmolLM2 o Qwen2.5 senza
+ * <think> riceve il turno ChatML nudo, come il suo template HF. */
+static int build_turn(Tok *T, char *buf, int cap, const char *user) {
     int think = moty_getenv("THINK") ? atoi(moty_getenv("THINK")) : 0;
     int bl = snprintf(buf, cap, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", user);
-    if (!think) bl += snprintf(buf+bl, cap-bl, "<think>\n\n</think>\n\n");
+    if (!think && tok_id_of(T, "<think>") >= 0) bl += snprintf(buf+bl, cap-bl, "<think>\n\n</think>\n\n");
     return bl;
 }
 

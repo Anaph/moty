@@ -23,7 +23,7 @@ static int64_t fixed_bytes(Model *m, int ctx);
 static float *step(Model *m, const int *ids, int S, int pos_base);
 static void kv_alloc(Model *m, int max_t);
 static void state_reset(Model *m);
-static int build_turn(char *buf, int cap, const char *user);
+static int build_turn(Tok *T, char *buf, int cap, const char *user);
 static void stops_seed(Model *m, Tok *T);
 static void banner(Model *m);
 
@@ -218,7 +218,7 @@ static int engine_main(int argc, char **argv) {
     }
     const char *prompt = getenv("PROMPT");
     if (prompt) {                                   /* one-shot */
-        int bl = templ ? build_turn(buf, 1<<16, prompt)
+        int bl = templ ? build_turn(&T, buf, 1<<16, prompt)
                        : snprintf(buf, 1<<16, "%s", prompt);
         int k = 0;
         if (T.bos_id >= 0) hist[k++] = T.bos_id;    /* HF add_special_tokens=True */
@@ -240,7 +240,7 @@ static int engine_main(int argc, char **argv) {
         if (nr < 0) break;
         while (nr > 0 && (line[nr-1]=='\n' || line[nr-1]=='\r')) line[--nr]=0;
         if (!nr) continue;
-        int bl = templ ? build_turn(buf, 1<<16, line)
+        int bl = templ ? build_turn(&T, buf, 1<<16, line)
                        : snprintf(buf, 1<<16, "%s", line);
         int k = 0;
         if (len == 0 && T.bos_id >= 0) hist[k++] = T.bos_id;   /* BOS once per conversation */
@@ -364,7 +364,7 @@ static int eng_encode(void *p, const char *text, int add_bos, int chat, int *ids
     int tl = (int)strlen(text), bcap = tl + 256;
     char *buf = malloc((size_t)bcap);
     if (!buf) moty_fail_code(MOTY_FAIL_OOM, "OOM: tokenize");
-    int bl = chat ? build_turn(buf, bcap, text) : snprintf(buf, (size_t)bcap, "%s", text);
+    int bl = chat ? build_turn(&e->T, buf, bcap, text) : snprintf(buf, (size_t)bcap, "%s", text);
     int k = 0;
     if (add_bos && e->T.bos_id >= 0 && cap > 0) ids[k++] = e->T.bos_id;
     k += tok_encode(&e->T, buf, bl, ids + k, cap - k);
