@@ -24,7 +24,7 @@ model's Linear layers and the head are quantized; the token embedding is
 int8 per row as in moty; image rows stay f32 (moty injects them as is)."""
 import argparse, glob, json, math, os, re, sys
 import numpy as np, torch
-from transformers import AutoModelForImageTextToText, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hf_qstudy import SCHEMES, BITS, GRID, q8row, gptq
 torch.set_grad_enabled(False)
@@ -44,12 +44,20 @@ def main():
     ap.add_argument("--out", default="", help="json with per-tile results")
     ap.add_argument("--calib-img", default="all", choices=["all", "none"],
                     help="calibration statistics over the image-row positions of the tile sequences too (all) or not (none)")
+    ap.add_argument("--image-token", type=int, default=None,
+                    help="placeholder id when the snapshot is a plain causal LM (a split-off VLM decoder)")
     ap.add_argument("configs", nargs="+")
     a = ap.parse_args()
-    model = AutoModelForImageTextToText.from_pretrained(a.snap, dtype=torch.float32).eval()
-    lm = model.model.language_model; head = model.lm_head; emb = lm.get_input_embeddings()
-    img_tok = model.config.image_token_id; D = emb.weight.shape[1]
-    pj = json.load(open(a.prompt)); pids = torch.tensor(pj["ids"] if isinstance(pj, dict) else pj)
+    try:                                  # a vision-language snapshot: its language model
+        model = AutoModelForImageTextToText.from_pretrained(a.snap, dtype=torch.float32).eval()
+        lm = model.model.language_model
+    except (ValueError, KeyError):        # a plain causal LM fed image rows (a split-off decoder)
+        model = AutoModelForCausalLM.from_pretrained(a.snap, dtype=torch.float32).eval()
+        lm = model.model
+    head = model.lm_head; emb = lm.get_input_embeddings()
+    img_tok = a.image_token if a.image_token is not None else model.config.image_token_id; D = emb.weight.shape[1]
+    pj = json.load(open(a.prompt))
+    pids = torch.tensor(pj.get("ids", pj.get("input_ids")) if isinstance(pj, dict) else pj)
     npos = int((pids == img_tok).sum())
     if head.weight is emb.weight: head.weight = torch.nn.Parameter(emb.weight.detach().clone())
     lin = {n: m for n, m in lm.named_modules() if isinstance(m, torch.nn.Linear)}
