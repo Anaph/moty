@@ -95,7 +95,11 @@ static void load_mat_bits(Model *m, Mat *w, const char *name, int O, int I, int 
     mat_reset_storage(w);            /* fmt = WF_F32 di default */
     mat_reset_storage(w);
     w->O = O; w->I = I;
-    if (bits == 4 && g_q4fmt && I % 32 == 0) { load_mat_r4(m, w, name, name, O, I); return; }
+    if (bits == 4 && I % 32 == 0) {
+        /* a pre-packed container can only be read as R4, whatever Q4FMT says */
+        char sn[256]; snprintf(sn, sizeof sn, "%s.s16", name);
+        if (g_q4fmt || st_has(&m->S, sn)) { load_mat_r4(m, w, name, name, O, I); return; }
+    }
     if (bits == 8) {             /* row chunks: bit-identical to quantize_rows on the whole matrix */
         st_expect(&m->S, name, (int64_t)O*I);
         w->q = balloc((int64_t)O*I, name); w->qs = falloc(O);
@@ -367,7 +371,8 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
     /* EMBED=disk: no resident table, embed_row gathers the row from the file
      * (the micro-RSS branch). Only valid when nothing else reads the table:
      * a tied lm_head must then be packed separately (QBITS=4 Q4R4). */
-    int head_q4r4 = m->base.lm_tied && m->base.qbits == 4 && g_q4fmt && D % 32 == 0;
+    int head_q4r4 = m->base.lm_tied && m->base.qbits == 4 && D % 32 == 0
+                    && (g_q4fmt || st_has(&m->S, "lm_head.weight.s16"));
     if (g_embed_disk && m->base.lm_tied && !head_q4r4) {
         fprintf(stderr, "[" ENGINE_TAG "] EMBED=disk con lm_head legato richiede QBITS=4 Q4FMT=r4\n"); exit(1);
     }

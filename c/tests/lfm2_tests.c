@@ -351,6 +351,7 @@ int lt_packed_roundtrip(void) {
     Model a; model_init(&a, src, 4);
     CHECK(a.L[0].in_proj.fmt == WF_Q4R4 && a.base.lm_head.fmt == WF_Q4R4);
     model_save_packed(&a, src, pk);
+    g_q4fmt = 0;                              /* a container is read as R4 whatever Q4FMT says */
     Model b; model_init(&b, pk, 4);
     CHECK(b.L[1].q.fmt == WF_Q4R4 && b.base.lm_head.fmt == WF_Q4R4);
     int T = 8;
