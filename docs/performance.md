@@ -781,3 +781,37 @@ makes CMA reclaim easier; it does not guarantee it (the 132 failures were
 not reproduced here). The price: under pressure the kernel may drop weight
 pages between cycles, and the next prefill re-reads them from flash (the
 cold column).
+
+### 5.16 Integer prefill: coarser activation scales do not pay
+
+moty's prefill GEMMs are already integer: each token's activations are
+quantized to int8 per 32-wide group at run time (`moty_hw_quant_g32`,
+amax/127), multiplied with int8 (Q8R4) or unpacked int4 (Q4R4) weights by
+SMULL/SMLAL, widened by SADDLP/SADALP, and the group scales are fused
+(w8a8 / w4a8). What the group-32 scales cost is the reduction + convert +
+scale of every 32 columns. Only per-row weight scales AND one activation
+scale per token would let int32 run over the whole row; that was measured.
+
+Kernel, one A53 core, hot caches (`tests/bench_q8row.c`, exact int sums):
+current Q8R4 4-row × 4-token tile 3.9–4.07 GMAC/s; per-row / per-token
+tile 4 × 4 3.7–3.94 (register pressure), 4 × 2 4.26–4.53 GMAC/s: at most
+~10 % on the matmuls, ~8 % of a prefill.
+
+Quality (HF fake-quant, `tools/ref/hf_vlq.py`, suffix `@a8` = moty's
+group-32 activations, `@a8t` = one scale per token):
+
+| model, tiles | weights / activations | top-1 vs f32 | KL | leading tokens (/64) |
+|---|---|---|---|---|
+| VisionPsy, 8 | int8 group-32 / group-32 (moty) | 0.959 | 0.0035 | 21.9 |
+| VisionPsy, 8 | int8 per-row / per-token | 0.838 | 0.0616 | 7.2 |
+| VisionPsy, 8 | int8 per-row / group-32 | 0.965 | 0.0065 | 21.2 |
+| VisionPsy, 8 | int8 group-32 / per-token | 0.867 | 0.0495 | 7.4 |
+| LFM2.5-VL, 33 | recommended mix / group-32 (moty) | 0.966 | 0.0148 | 41.0 |
+| LFM2.5-VL, 33 | recommended mix / per-token | 0.957 | 0.0195 | 40.7 |
+
+The per-token activation scale is what hurts (VisionPsy: KL x 17, leading
+tokens 21.9 → 7.2); per-row weights with group-32 activations keep the
+quality but also keep the per-group conversion. LFM2.5-VL's layout is mostly
+Q4R4, whose group weight scales need the per-group step anyway. Not
+implemented: ~8 % prefill for a large quality loss on the model that would
+use it. The int8 prefill stays as it is (5.15).

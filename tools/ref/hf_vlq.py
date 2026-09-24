@@ -13,7 +13,9 @@ config is scored teacher-forced on prompt + reference answer: top-1
 agreement and mean KL(f32 || q) over the answer positions, and with
 --greedy by its own greedy answer: leading tokens equal to the reference.
 
-Mixes as in hf_qstudy.py, plus `+4=<regex>|...`: sym4g32 (Q4R4) for the
+Suffix @a8: activations int8 per token in groups of 32 (moty's prefill);
+@a8t: int8 with one scale per token (per-row weights could then accumulate
+int32 over the whole row). Mixes as in hf_qstudy.py, plus `+4=<regex>|...`: sym4g32 (Q4R4) for the
 matching tensors — `f32+4=<regex>` is the one-group sensitivity sweep.
 
 Calibration (for :gptq/:imx configs): Linear inputs over the
@@ -119,10 +121,10 @@ def main():
                         "H": (s["H"] / s["n"]).float(), "X": torch.cat(s["X"], 0)}
         print(f"calibration: {ntok} tokens ({'text ' if a.calib_text else ''}{len(cal)} tiles, image rows: {a.calib_img})", flush=True)
 
-    act8 = {"on": False}
+    act8 = {"on": False, "tok": False}
     def aq(mod, args):                   # moty's activation quantization: int8 per token, groups of 32
-        if not act8["on"]: return None
-        x = args[0]; sh = x.shape; g = x.reshape(-1, sh[-1] // 32, 32)
+        if not act8["on"]: return None   # (@a8t: one scale per token over the whole row)
+        x = args[0]; sh = x.shape; g = x.reshape(-1, 1 if act8["tok"] else sh[-1] // 32, sh[-1] if act8["tok"] else 32)
         s = g.abs().amax(-1, keepdim=True).clamp_min(1e-30) / 127
         return (torch.round(g / s) * s).reshape(sh),
     for m in mods.values(): m.register_forward_pre_hook(aq)
@@ -130,7 +132,8 @@ def main():
     results = {}
     gcache = {}
     for cfg0 in a.configs:
-        act8["on"] = cfg0.endswith("@a8"); cfg = cfg0[:-3] if act8["on"] else cfg0
+        act8["tok"] = cfg0.endswith("@a8t"); act8["on"] = act8["tok"] or cfg0.endswith("@a8")
+        cfg = cfg0[:-4] if act8["tok"] else cfg0[:-3] if act8["on"] else cfg0
         parts = cfg.split("+"); scheme, _, method = parts[0].partition(":"); method = method or "rtn"
         over = []
         for p in parts[1:]:
