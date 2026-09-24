@@ -10,14 +10,11 @@ max -> -8 unless that clips the opposite sign), q40s (q40 + squared-error
 scale search). Prints PPL, mean KL(f32 || q) and top-1 agreement."""
 import sys, math, json, torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-snap = sys.argv[1]; schemes = sys.argv[2].split(",")
-tok = AutoTokenizer.from_pretrained(snap)
-text = open(sys.argv[3] if len(sys.argv) > 3 else "ppl_text.txt").read()
-ids = tok(text, return_tensors="pt").input_ids[:, :2048]
-ref_lp = None
 GS = 32
-def q_g(w, mode):
-    O, I = w.shape; g = w.reshape(O, I//GS, GS)
+def q_g(w, mode, gs=None):
+    """int4 fake-quant of a [O, I] weight in groups of gs (default GS)"""
+    gs = gs or GS
+    O, I = w.shape; g = w.reshape(O, I//gs, gs)
     if mode == "amax7":
         s = g.abs().amax(-1, keepdim=True) / 7; q = torch.clamp(torch.round(g / s.clamp_min(1e-12)), -8, 7)
         return (q * s).reshape(O, I)
@@ -38,7 +35,19 @@ def q_g(w, mode):
         else:
             m = e < beste; best = torch.where(m, q, best); beste = torch.where(m, e, beste)
     return best.reshape(O, I)
-for sc in schemes:
+def q8_row(w):
+    """int8 fake-quant with one scale per row (moty QBITS=8 weights)"""
+    s = w.abs().amax(-1, keepdim=True) / 127
+    return torch.round(w / s.clamp_min(1e-12)).clamp(-127, 127) * s
+
+def main():
+  global GS
+  snap = sys.argv[1]; schemes = sys.argv[2].split(",")
+  tok = AutoTokenizer.from_pretrained(snap)
+  text = open(sys.argv[3] if len(sys.argv) > 3 else "ppl_text.txt").read()
+  ids = tok(text, return_tensors="pt").input_ids[:, :2048]
+  ref_lp = None
+  for sc in schemes:
     GS = 64 if sc.endswith("@64") else 32
     sc0 = sc.split("@")[0]
     model = AutoModelForCausalLM.from_pretrained(snap, dtype=torch.float32).eval()
@@ -53,3 +62,6 @@ for sc in schemes:
     kl = (ref_lp.exp() * (ref_lp - lp)).sum(-1).mean().item()
     top1 = (ref_lp.argmax(-1) == lp.argmax(-1)).float().mean().item()
     print(sc, "n", ids.shape[1], "ppl", round(math.exp(nll.mean().item()), 3), "KL", round(kl, 4), "top1", round(top1, 4), flush=True)
+
+if __name__ == "__main__":
+    main()
