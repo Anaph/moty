@@ -66,3 +66,57 @@ The load time depends on the page cache (1 GB board, a 574 MB file): the
 int4 container's second open came mostly from cache. The RKLLM TTFT is B's
 per-cycle figure; how much of it is the NPU encoder is B's to state. After
 close and `moty_release_scratch()` RSS falls to 11–22 MB, threads to 1.
+
+## Answer length and end of turn
+
+Measured on x86 (the boards were unavailable), the 8 tiles, greedy.
+VisionPsy writes long descriptions: with "Describe the image." HF f32 ends
+its turn (`<|im_end|>`, id 2 = the config's EOS) only after 296 / 327 / 460
+tokens (t10 / t00 / t08); any `max_new_tokens` of 32–64 cuts the answer in
+mid-sentence. moty stops cleanly at the same EOS (int8, t10: 397 tokens,
+last id 2, the marker not printed). The instruction decides the length
+(`tools/ref/vl_answer_len.py`, prompts through the model's chat template;
+"Describe the image." reproduces the node's 78 ids):
+
+| instruction | prompt ids | HF f32 answer tokens | ends at EOS | moty int8: ends at EOS / identical to HF f32 |
+|---|---|---|---|---|
+| Describe the image. | 78 | ≥ 160 on every tile | 0/8 | — (see above) |
+| Briefly describe the image. | 80 | 106, ≥ 160 on 7 tiles | 1/8 | — |
+| Describe the image in one sentence. | 81 | 36–56 | 8/8 | 8/8 / 3/8 (25–57 tokens) |
+| What is in the image? Answer in one short sentence. | 86 | 17–28 | 8/8 | 8/8 / 6/8 (17–25 tokens) |
+
+The int8 answers that differ are rewordings of the same content, e.g. t00:
+HF "A cluttered desk with various electronic devices, cables, and a box
+labeled "GOTSCHLICH" visible in the background." — int8 "The image shows a
+cluttered desk with various electronic devices, cables, and a power strip."
+(the monitor/mouse this scene's answers mention come from the f32 model
+itself).
+
+Recommendation for a node that shows the latest answer: the short-question
+contract with `max_new_tokens` 48 (the longest answer seen is 28 tokens;
+the cap only guards against a runaway), or the one-sentence instruction
+with 80. With the rates measured on board B (78-token prefill ≈ 2.4 s,
+decode 8.6–9.6 tok/s) that is ≈ 4.3–5 s from the generate call to a
+complete answer, against ≈ 9.5 s for 64 tokens of a truncated description
+— an estimate from those rates, not an end-to-end board measurement.
+
+## Decode: what did not pay
+
+- Two-stage head (`head_topk`, sign-bit copy of the head + exact rows for
+  the top K) extended to a Q8R4 head: the greedy output left the full
+  head's at the first decode token on 8/8 tiles. Stage-1 recall of the
+  true argmax on HF hidden states (512 positions): 54 % (K 256) – 60 %
+  (K 512) with moty's 3-bit activations, 97 % at best (8-bit, K 4096) —
+  the hidden states have strong outlier dimensions (median max/mean 14.5)
+  and a sign-bit copy of this head cannot rank them. Not kept.
+- The int8 decode path itself was not re-measured: board B is down and
+  board C is agent B's; a read-only THREADS_DECODE × pool-spin benchmark
+  (decode tok/s and CPU seconds per generate) is with agent B.
+
+## VL-aware GPTQ: ready, waiting for calibration tiles
+
+`tools/ref/pack_r4.py` calibrates on image sequences of a split-off decoder
+(`--image-token 49152 --calib-tiles <dir> --calib-prompt <ids>`, image
+positions masked out of the Hessians; `--calib ""` for tiles only). The
+code path is checked; the tiles must not be the 8 evaluation tiles and
+have not been delivered yet.

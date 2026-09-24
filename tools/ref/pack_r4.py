@@ -113,6 +113,8 @@ def main():
     ap.add_argument("--calib"); ap.add_argument("--tokens", type=int, default=2048)
     ap.add_argument("--q8", default="")
     ap.add_argument("--calib-tiles", default=""); ap.add_argument("--calib-prompt", default="")
+    ap.add_argument("--image-token", type=int, default=None,
+                    help="placeholder id for --calib-tiles when the snapshot is a plain causal LM (a split-off VLM decoder)")
     ap.add_argument("--variants", default="",
                     help="dir=glob,glob;dir2=glob...: several containers in one pass (int4 codes computed once)")
     a = ap.parse_args()
@@ -141,7 +143,7 @@ def main():
     H = {}
     if a.method == "gptq":
         tok = AutoTokenizer.from_pretrained(a.snap)
-        ids = tok(open(a.calib).read(), return_tensors="pt").input_ids[:, :a.tokens]
+        ids = tok(open(a.calib).read(), return_tensors="pt").input_ids[:, :a.tokens] if a.calib else None   # --calib "": tiles only
         acc = {}; keep = {"m": None}             # token positions that enter H
         def hook(name):
             def f(mod, inp, out):
@@ -154,8 +156,9 @@ def main():
             if p: tiles += sorted(os.path.join(p, f) for f in os.listdir(p) if f.endswith(".f32")) if os.path.isdir(p) else [p]
         seqs = []
         if tiles:                                  # f32 greedy answers first, hooks not yet attached
-            lm = model.model.language_model; emb = lm.get_input_embeddings(); head = model.lm_head
-            img_tok = model.config.image_token_id; D = emb.weight.shape[1]
+            lm = getattr(model.model, "language_model", model.model)    # VL wrapper, or a plain causal LM
+            emb = lm.get_input_embeddings(); head = model.lm_head
+            img_tok = a.image_token if a.image_token is not None else model.config.image_token_id; D = emb.weight.shape[1]
             pj = json.load(open(a.calib_prompt)); pids = torch.tensor(pj["ids"] if isinstance(pj, dict) else pj)
             def embeds(t, rows):
                 e = emb(t.unsqueeze(0))[0].clone(); e[t == img_tok] = rows; return e.unsqueeze(0)
@@ -167,14 +170,14 @@ def main():
                     out = lm(inputs_embeds=emb(torch.tensor([[t]])), past_key_values=out.past_key_values, use_cache=True)
                 seqs.append((torch.cat([pids, torch.tensor(ans)]), rows))
         hs = [m.register_forward_hook(hook(n)) for n, m in targets.items()]
-        model(ids)
+        if ids is not None: model(ids)
         for seq, rows in seqs:
             keep["m"] = seq != img_tok
             head(lm(inputs_embeds=embeds(seq, rows)).last_hidden_state)
         keep["m"] = None
         [h.remove() for h in hs]
         H = {n: (s[1] / s[0]).float() for n, s in acc.items()}
-        print(f"calibration: {ids.shape[1]} tokens of {a.calib}" + (f" + {len(seqs)} tiles (text positions)" if seqs else ""), flush=True)
+        print(f"calibration: {ids.shape[1] if ids is not None else 0} tokens of {a.calib or '(no text)'}" + (f" + {len(seqs)} tiles (text positions)" if seqs else ""), flush=True)
     def canon(name):              # moty's engine-side name (Q8_TENSORS globs match these)
         return "model." + name[len("model.language_model."):] if name.startswith("model.language_model.") else name
     cache = {}                                     # (name, bits) -> (codes bytes, scale bytes)

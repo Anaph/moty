@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include "moty.h"
 #if defined(__GLIBC__)
@@ -37,6 +38,10 @@ static long meminfo_kb(const char *key) {
 }
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static double t_first;
+static double cpu_s(void) {
+    struct rusage r; getrusage(RUSAGE_SELF, &r);
+    return r.ru_utime.tv_sec + r.ru_stime.tv_sec + (r.ru_utime.tv_usec + r.ru_stime.tv_usec) * 1e-6;
+}
 static int on_token(void *u, int32_t t, const char *piece, int n) {
     (void)t;
     if (t_first == 0) t_first = now();
@@ -96,10 +101,11 @@ int main(int argc, char **argv) {
         if (getenv("CYCLE_GAP_MS")) {                  /* stands for the caller's own work between open and generate (an NPU encoder) */
             long ms = atol(getenv("CYCLE_GAP_MS")); struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L }; nanosleep(&ts, NULL);
         }
-        double t_gen = now();
+        double t_gen = now(), c_gen = cpu_s();
         int itok = argc > 9 ? atoi(argv[9]) : moty_model_image_token(h);
         rc = moty_generate(h, ids, k, rows, nrows, itok, &s, on_token, c == 0 ? (void *)1 : NULL, &st);
         if (c == 0) printf("\n");
+        double cpu_gen = cpu_s() - c_gen;                 /* CPU seconds of the generate: cores actually used */
         long rss_open = status_kb("VmRSS:"), thr = status_kb("Threads:");
         long rss_anon = status_kb("RssAnon:"), rss_file = status_kb("RssFile:");   /* file pages: clean, reclaimable */
         if (rc) { fprintf(stderr, "generate: %d %s\n", rc, moty_last_error(h)); return 1; }
@@ -114,7 +120,8 @@ int main(int argc, char **argv) {
 #if defined(__GLIBC__) && (__GLIBC__ > 2 || __GLIBC_MINOR__ >= 33)
         { struct mallinfo2 mi = mallinfo2(); printf("heap in use %zu B, arena %zu B | ", mi.uordblks, mi.arena); }
 #endif
-        printf("cycle %d: TTFT cold %.2f s, warm %.2f s | ", c, t_first - t_open, t_first - t_gen);
+        printf("cycle %d: TTFT cold %.2f s, warm %.2f s | cpu %.2f s over %.2f s | ", c, t_first - t_open, t_first - t_gen,
+               cpu_gen, st.prefill_s + st.decode_s);
         printf("load %.2f s | prefill %d tok %.2f s (%.1f tok/s) | decode %d tok %.2f s (%.2f tok/s) | "
                "RSS open %ld kB (anon %ld, file %ld), closed %ld kB, released %ld kB | threads open %ld, released %ld | MemAvailable %ld kB\n",
                load, st.prompt_tokens, st.prefill_s, st.prompt_tokens / st.prefill_s, st.new_tokens, st.decode_s,
