@@ -471,3 +471,49 @@ On board B (4 threads, decode on 3, container load; medians of 2):
 Q4R4 PPL 39.7 / 81.3 % and GPTQ + Q8R4 layers 0–1 PPL 34.8 / 86.2 % — the
 same recommendation as for LFM2.5-350M holds, with a smaller gap (this
 model loses far less to int4: 81 % vs 61.5 % top-1).
+
+### 5.10 LFM2.5-VL-450M end to end on one board: NPU encoder + moty
+
+Board B (RV1126B, its vision workload running), one 512×512 tile, prompt
+"Describe the image." (272 tokens, 256 image rows):
+
+1. `tools/rknn/rknn_encode` (librknnrt 2.3.2 via `dlopen`, not part of
+   moty's build) runs the vision tower + projector compiled for the NPU
+   (fp16; rknn-toolkit2 2.3.2 from an ONNX export of the HF modules, whose
+   f32 output matches HF's `get_image_features` to cosine 0.99999999; the
+   toolkit simulator gives cosine ≥ 0.993 vs HF). On the board its output
+   is bit-identical to the other team's NPU run of the same model; vs HF
+   f32: cosine mean 0.990, min 0.61 (fp16 on the NPU; see §5.9 for the
+   effect on answers).
+2. moty `lfm2` with `EMBEDS=` (the recommended GPTQ + Q8R4 container).
+
+`tools/rknn/vl_pipeline.sh`, two cold runs (each step a fresh process):
+
+| step | time |
+|---|---|
+| NPU encoder: init / encode | 1.8 s / 1.52 s (3.6 s wall for the step) |
+| LM: load / prefill 272 tokens | 3.2–3.9 s / 6.4–6.7 s |
+| time to first token, cold (encoder + LM load + prefill) | ≈ 13.5 s |
+| time to first token, LM already loaded | ≈ 8 s (encode + prefill) |
+| decode | 13.9–14.4 tok/s |
+| peak RSS of the LM | 327 MB |
+| MemAvailable while the encoder is loaded | −425 MB (DMA buffers; fully returned at process exit, not at `rknn_destroy`) |
+
+Run the encoder as its own process before the LM: together they would
+need ~750 MB on a ~1 GB board that also runs its own workload.
+
+The answer ("The image shows a cluttered desk with various electronic
+devices and cables. In the top left corner, there's a box labeled
+"GOTSCHLICH" …") describes the same scene as HF's ("… a cluttered
+workspace … a white cord with a black plug …"); teacher-forced on HF's
+64-token answer the board agrees on 55/64 tokens with the NPU rows (60/64
+with Q4R4, §5.9).
+
+**NPU sharing.** The board's own detector used the NPU at 0 % load during
+these runs (`/proc/rknpu/load`), so the encoder ran at full speed. To see
+what a busy detector would suffer, its model (960×544 input, 67–73
+ms/frame alone) was run at the same time as the VL encoder: detector mean
+73 → 125.5 ms per frame (+72 %, frames queue behind the encoder; best
+frame unchanged), VL encode 1522 → 1555 ms (+2 %). A deployment that needs
+steady detector latency should schedule the VL encoder between detector
+frames or accept ~1.5 s NPU pauses.

@@ -359,6 +359,8 @@ Documentation:
   scripts (greedy ids, logits, perplexity, int4 fake-quant)
 - [tools/a53/README.md](tools/a53/README.md) — measurement helpers for
   small ARM boards
+- [tools/rknn/README.md](tools/rknn/README.md) — optional Rockchip NPU
+  vision encoder in front of a moty text model (vision-language models)
 - [docs/gemma-plan.md](docs/gemma-plan.md) — engine review + the gemma
   improvement plan (bring-up on a real model, shared-attention migration,
   arena, VNNI int4, sliding-window KV)
