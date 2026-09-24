@@ -99,6 +99,30 @@ are fused get copied, their mapped pages are then released).
   stopped (`MOTY_STOP_LENGTH / EOS / CALLBACK / ABORT`).
 - Greedy by default (`temperature` 0); nucleus sampling with `temperature` > 0.
 
+### Lookahead decoding (v1.2, additive)
+`moty_sampling.draft` / `n_draft` / `draft_k`: token ids the answer is likely to
+repeat — for a camera node, the previous answer on the same scene. With greedy
+decoding, each step takes the tokens that followed the longest (≤ 3) suffix of
+the answer so far in `draft`, feeds the pending token and up to `draft_k` of
+them in ONE forward (engine op `verify`: logits of every position), keeps the
+proposals the model itself predicts and continues from its own next token.
+Every produced token goes through the same callback / EOS / budget checks.
+- `draft_k` 1–2 (default 2): the answer is bit-identical to plain greedy
+  decoding — a forward of up to 3 tokens runs the same per-token int8 kernels
+  as a decode step (checked: 7/7 answers identical on the board and on x86,
+  `tests/api_tests.c` Lookahead). `draft_k` ≥ 3 uses the 4-token GEMM tile,
+  whose float summation order differs: near-exact (6/7 identical on the board).
+- Engines: the qwen/Llama engine when every layer is full attention (a rejected
+  position is overwritten, attention reads the KV only up to each query);
+  engines with recurrent state (LFM2's conv, DeltaNet layers) ignore the draft
+  and decode token by token. Temperature > 0 ignores it too.
+- `moty_sampling.size`: the v1 size (`MOTY_SAMPLING_V1_SIZE`) is still
+  accepted; the draft is then off. The number of verification steps is logged
+  at `log_level` 2 ("lookahead: N verify steps, M proposals accepted").
+- Board B, VisionPsy int8, short-question contract, previous tile's answer as
+  draft: decode 1.43x faster at `threads_decode` 3, 1.22x at 2, ~10 % less
+  CPU per answer (docs/models/visionpsy-nano-460m.md).
+
 ### Abort
 `moty_abort(m)` sets a flag on the handle: a running `moty_generate` returns
 `MOTY_ERR_ABORTED` within one decode step or one prefill chunk
@@ -175,12 +199,15 @@ same tokens), continuation (4 + 8 tokens = 12 at once), abort from the
 callback and from another thread, sticky abort and clear, injection (rows,
 other rows, count mismatch), error paths (missing directory, unknown
 architecture, missing tensor mid-load, bad options, context overflow, bad
-ids, no tokenizer), cycles (RSS, threads).
+ids, no tokenizer), cycles (RSS, threads), lookahead (a tiny Llama
+snapshot, `tests/tiny_llama.h`: identical to plain greedy with the model's
+own answer, a shifted copy and garbage as drafts; budget, EOS, continuation
+after a lookahead call; LFM2 ignores the draft; v1-sized sampling struct).
 
 Sanitizers: on the Cortex-A53 board (GCC 12 runtimes, kernel with
 `mmap_rnd_bits` 18) the seven tests pass 10 of 10 runs under
 ThreadSanitizer and 10 of 10 under AddressSanitizer / LeakSanitizer with
-zero reports (built with `tests/api_run.c`, the gtest-free driver; build
+zero reports; with the lookahead test (eight tests) 3 of 3 and 3 of 3 (built with `tests/api_run.c`, the gtest-free driver; build
 line in its header). ThreadSanitizer found one race there — the pool's
 spin/pin settings written by each call while idle workers read them — now
 atomics. On an x86 host whose kernel randomizes mmap with 32 bits, GCC

@@ -19,6 +19,7 @@
  * final-norm/lm_head (e dello stash TTA) e ritorna NULL — i logits (e lo
  * stash) esistono solo per l'ultimo token del prompt, come non-chunked. */
 static int g_skip_logits = 0;
+static int g_all_logits = 0;   /* step() returns [S][vocab] logits (lookahead verification) */
 
 static float *step_chunked(Model *m, const int *ids, int S, int pos_base) {
     int C = g_prefill_chunk;

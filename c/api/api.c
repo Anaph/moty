@@ -35,6 +35,8 @@ struct moty_model {
     float *lo;
     moty_stats stats;
     moty_status rc;
+    int32_t *gen; int ng;               /* lookahead: the answer so far (suffix lookup in the draft) */
+    int la_steps, la_acc;               /* lookahead verification steps / accepted proposals (log level 2) */
 };
 
 static pthread_mutex_t g_api_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -212,15 +214,29 @@ moty_status moty_reset(moty_model *m) {
     return MOTY_OK;
 }
 
+/* one produced token: count, callback, stop and budget checks (shared by the
+ * plain and the lookahead decode); returns 1 when generation must stop */
+static int emit_tok(moty_model *m, const moty_sampling *s, moty_token_cb cb, void *user, int t, char *piece, int cap) {
+    m->stats.new_tokens++; m->pending = t;
+    if (m->gen) m->gen[m->ng++] = t;
+    int stop = !s->ignore_eos && m->ops->is_stop(m->inst, t);
+    int pl = cb && !stop ? m->ops->piece(m->inst, t, piece, cap) : 0;
+    if (cb && cb(user, t, piece, pl)) { m->stats.stop = MOTY_STOP_CALLBACK; return 1; }
+    if (stop) { m->stats.stop = MOTY_STOP_EOS; return 1; }
+    return (int)m->stats.new_tokens >= s->max_new_tokens;
+}
+
 moty_status moty_generate(moty_model *m, const int32_t *ids, int n, const float *embeds, int n_rows, int32_t embed_token,
                           const moty_sampling *sp, moty_token_cb cb, void *user, moty_stats *st) {
     if (!m || (!ids && n > 0) || n < 0 || n_rows < 0 || (embeds && n_rows == 0)) return MOTY_ERR_ARG;
     moty_sampling s; moty_sampling_init(&s);
     if (sp) {
-        if (sp->size != (int)sizeof s) { set_err(m->err, sizeof m->err, "moty_sampling.size mismatch"); return MOTY_ERR_ARG; }
-        s = *sp;
+        if (sp->size != (int)sizeof s && sp->size != MOTY_SAMPLING_V1_SIZE) {
+            set_err(m->err, sizeof m->err, "moty_sampling.size mismatch"); return MOTY_ERR_ARG; }
+        memcpy(&s, sp, (size_t)sp->size); s.size = (int)sizeof s;   /* fields added since keep their defaults */
     }
-    if (s.max_new_tokens < 0 || s.temperature < 0) { set_err(m->err, sizeof m->err, "bad sampling parameters"); return MOTY_ERR_ARG; }
+    if (s.max_new_tokens < 0 || s.temperature < 0 || s.n_draft < 0 || s.draft_k < 0 || (s.n_draft > 0 && !s.draft)) {
+        set_err(m->err, sizeof m->err, "bad sampling parameters"); return MOTY_ERR_ARG; }
     int V = m->ops->vocab(m->inst), ctx = m->ops->ctx(m->inst);
     int n_ph = 0;
     for (int i = 0; i < n; i++) {
@@ -268,20 +284,53 @@ moty_status moty_generate(moty_model *m, const int32_t *ids, int n, const float 
         moty_par_set_threads(thd);
         t0 = api_now();
         char piece[256];
-        for (int k = 0; m->lo && k < s.max_new_tokens; k++) {
+        /* lookahead (greedy + draft + an engine that can verify): each step feeds the
+         * pending token and up to draft_k proposed ones in one forward and keeps the
+         * proposals the model itself predicts; without it one token per step */
+        int la = s.draft && s.n_draft > 0 && s.temperature == 0 && m->ops->verify;
+        int dk = s.draft_k > 0 ? s.draft_k : 2;
+        m->ng = 0; m->la_steps = m->la_acc = 0;
+        if (la && !(m->gen = malloc(sizeof(int32_t) * (size_t)(s.max_new_tokens + 1)))) moty_fail_code(MOTY_FAIL_OOM, "OOM: lookahead");
+        int t = m->lo ? moty_pick_tok((Scratch *)m->ops->scratch(m->inst), m->lo, V) : -1;
+        if (m->lo) { moty_trk_free(m->lo); m->lo = NULL; }
+        while (t >= 0 && s.max_new_tokens > 0) {
             if (atomic_load(&m->abort)) break;
-            int t = moty_pick_tok((Scratch *)m->ops->scratch(m->inst), m->lo, V);
-            moty_trk_free(m->lo); m->lo = NULL;
-            m->stats.new_tokens++;
-            m->pending = t;                           /* not in the KV until stepped */
-            int stop = !s.ignore_eos && m->ops->is_stop(m->inst, t);
-            int pl = cb && !stop ? m->ops->piece(m->inst, t, piece, sizeof piece) : 0;
-            if (cb && cb(user, t, piece, pl)) { m->stats.stop = MOTY_STOP_CALLBACK; break; }
-            if (stop) { m->stats.stop = MOTY_STOP_EOS; break; }
-            if (k == s.max_new_tokens - 1) break;
+            if (emit_tok(m, &s, cb, user, t, piece, sizeof piece)) break;
+            int prop[16], np2 = 0, budget = s.max_new_tokens - (int)m->stats.new_tokens;
+            if (la && budget > 0) {                    /* the tokens after the longest (<= 3) answer suffix found in the draft */
+                int kmax = dk < 15 ? dk : 15; if (kmax > budget) kmax = budget;
+                for (int len = m->ng < 3 ? m->ng : 3; len > 0 && !np2; len--)
+                    for (int j = 0; j + len < s.n_draft && !np2; j++) {
+                        if (memcmp(s.draft + j, m->gen + m->ng - len, sizeof(int32_t) * (size_t)len)) continue;
+                        while (np2 < kmax && j + len + np2 < s.n_draft) { prop[np2] = s.draft[j + len + np2]; np2++; }
+                    }
+            }
+            if (np2 > 0) {
+                int seq[17]; seq[0] = t; memcpy(seq + 1, prop, sizeof(int) * (size_t)np2);
+                m->lo = m->ops->verify(m->inst, seq, np2 + 1, m->n_past);
+                if (m->lo) {                           /* m->lo: freed by the call's cleanup if a check longjmps */
+                    int a = 0, stopped = 0;
+                    m->n_past++; m->pending = -1;          /* t is in the KV now */
+                    for (; a < np2; a++) {
+                        int y = moty_pick_tok((Scratch *)m->ops->scratch(m->inst), m->lo + (size_t)a * V, V);
+                        if (y != prop[a]) { t = y; break; }
+                        if (emit_tok(m, &s, cb, user, y, piece, sizeof piece)) { stopped = 1; break; }
+                        m->n_past++; m->pending = -1;      /* an accepted proposal is in the KV */
+                    }
+                    if (!stopped && a == np2) t = moty_pick_tok((Scratch *)m->ops->scratch(m->inst), m->lo + (size_t)np2 * V, V);
+                    moty_trk_free(m->lo); m->lo = NULL;
+                    m->la_steps++; m->la_acc += a;
+                    if (stopped) break;
+                    continue;
+                }
+            }
             m->lo = m->ops->step(m->inst, t, m->n_past);
             m->n_past++; m->pending = -1;
+            t = moty_pick_tok((Scratch *)m->ops->scratch(m->inst), m->lo, V);
+            moty_trk_free(m->lo); m->lo = NULL;
         }
+        if (la && m->opt.log_level >= 2)
+            api_log(2, "lookahead: %d verify steps, %d proposals accepted, %d tokens", m->la_steps, m->la_acc, (int)m->stats.new_tokens);
         m->stats.decode_s = api_now() - t0;
         if (atomic_load(&m->abort)) { m->rc = MOTY_ERR_ABORTED; m->stats.stop = MOTY_STOP_ABORT; }
     } else {
@@ -290,6 +339,7 @@ moty_status moty_generate(moty_model *m, const int32_t *ids, int n, const float 
         if (m->opt.log_level >= 1) api_log(1, "generate: %s", m->trap.msg);
     }
     if (m->lo) { moty_trk_free(m->lo); m->lo = NULL; }
+    free(m->gen); m->gen = NULL;
     moty_track_set(prevt); moty_trap_disarm(prev);
     if (m->rc == MOTY_OK) moty_track_merge(&m->track, &m->call);   /* allocations meant to persist */
     else moty_track_free_all(&m->call);                            /* the failed call's temporaries */

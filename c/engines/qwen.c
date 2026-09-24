@@ -104,6 +104,11 @@ static void qwen_fuse(Model *m);
 #define ENGINE_POST_INIT(m)       do { lora_load(m); qwen_fuse(m); } while (0)
 #define ENGINE_MICRO 1            /* step() sa girare con embed NULL (gather per riga) */
 /* library (runtime/engine_api.h): Qwen3 / Qwen2 / Llama-family dense (MiniCPM5-1B is "llama") */
+/* lookahead verification (engine_api.h verify): the decode math per position
+ * is kept only when nothing but full attention is stateful and the head is the
+ * plain one (no shortlist, no online adapter, no TTA, all layers resident) */
+#define ENGINE_VERIFY_OK(m) qwen_verify_ok(m)
+static int qwen_verify_ok(Model *m);
 #define ENGINE_API_ID qwen
 #define ENGINE_API_TYPES "qwen3", "qwen2", "llama"
 
@@ -376,6 +381,11 @@ static void lora_load(Model *m) {
 /* q/k/v and gate/up of resident Q4R4 layers -> one matrix each (see
  * moty_mat_fuse_rows). Layers with LoRA adapters keep separate projections
  * (the adapters are applied per matrix); gated attention keeps its split. */
+static int qwen_verify_ok(Model *m) {
+    for (int i = 0; i < m->c.n_layers; i++) if (m->c.ltype[i] == LT_LINEAR || m->L[i].lo) return 0;
+    return !m->base.head_sl && !m->lm_lora.r && g_tta.mode == TTA_OFF && !g_micro && m->base.n_resident == m->c.n_layers;
+}
+
 static void qwen_fuse(Model *m) {
     for (int i = 0; i < m->c.n_layers && i < m->base.n_resident && !g_micro; i++) {
         Layer *l = &m->L[i];
@@ -707,6 +717,14 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
      * niente final-norm/lm_head/stash TTA (validi solo per l'ultimo token) */
     if (g_skip_logits) { free(x); free(nrm); free(tmp); return NULL; }
     OP_T(t_h);
+    if (g_all_logits) {                /* lookahead verification: every position, the full head */
+        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, m->base.final_norm, D, c->eps);
+        float *lg = falloc((int64_t)S * c->vocab);
+        mat_apply(lg, nrm, &m->base.lm_head, S);
+        OP_ACC(OP_LM_HEAD, t_h);
+        free(x); free(nrm); free(tmp);
+        return lg;
+    }
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->base.final_norm, D, c->eps);
     if ((g_tta.mode == TTA_CACHE || g_tta.mode == TTA_LORA) && g_tta.alloc) {

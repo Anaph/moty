@@ -42,6 +42,10 @@ typedef struct MotyEngineOps {
     void  (*reset)(void *inst);
     int   (*encode)(void *inst, const char *text, int add_bos, int chat_template, int *ids, int cap);
     int   (*piece)(void *inst, int tok, char *buf, int cap);
+    /* one forward over ids[0..n) at positions pos.. returning malloc'd logits of
+     * EVERY position [n][vocab] (lookahead verification), or NULL when the engine
+     * cannot roll back rejected positions (recurrent state) or does not support it */
+    float *(*verify)(void *inst, const int *ids, int n, int pos);
 } MotyEngineOps;
 
 extern const MotyEngineOps moty_engine_lfm2;

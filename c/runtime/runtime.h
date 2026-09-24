@@ -352,6 +352,7 @@ static int eng_is_stop(void *p, int t) {
 static float *eng_prefill(void *p, const int *ids, int n, int pos, const float *rows, int n_rows, int inj_tok,
                           int chunk, const atomic_int *abort) {
     EngInst *e = p; Model *m = &e->m;
+    g_all_logits = 0;
     m->base.inj = rows; m->base.inj_n = rows ? n_rows : 0; m->base.inj_used = 0; m->base.inj_tok = rows ? inj_tok : -1;
     float *lo = NULL; int done = 0;
     if (chunk <= 0) chunk = n;
@@ -366,7 +367,23 @@ static float *eng_prefill(void *p, const int *ids, int n, int pos, const float *
     m->base.inj = NULL; m->base.inj_n = 0; m->base.inj_tok = -1;
     return lo;
 }
-static float *eng_step(void *p, int tok, int pos) { return step(&((EngInst *)p)->m, &tok, 1, pos); }
+static float *eng_step(void *p, int tok, int pos) { g_all_logits = 0; return step(&((EngInst *)p)->m, &tok, 1, pos); }
+/* ENGINE_VERIFY_OK(m): the engine's step honours g_all_logits and a rejected
+ * position is harmless (attention reads the KV only up to each query's own
+ * position; nothing recurrent to roll back) */
+static float *eng_verify(void *p, const int *ids, int n, int pos) {
+#ifdef ENGINE_VERIFY_OK
+    EngInst *e = p;
+    if (!ENGINE_VERIFY_OK(&e->m)) return NULL;
+    g_all_logits = 1;
+    float *lo = step(&e->m, ids, n, pos);
+    g_all_logits = 0;
+    return lo;
+#else
+    (void)p; (void)ids; (void)n; (void)pos;
+    return NULL;
+#endif
+}
 static void *eng_scratch(void *p) { return &((EngInst *)p)->m.base.scr; }
 static void eng_reset(void *p) { EngInst *e = p; e->m.base.kv_len = 0; e->m.base.inj_used = 0; state_reset(&e->m); }
 static int eng_encode(void *p, const char *text, int add_bos, int chat, int *ids, int cap) {
@@ -393,7 +410,8 @@ static int eng_piece(void *p, int tok, char *buf, int cap) {
 #define ENG_STR(x) ENG_STR_(x)
 const MotyEngineOps ENG_OPS_NAME(ENGINE_API_ID) = {
     ENG_STR(ENGINE_API_ID), eng_accepts, eng_open, eng_close, eng_vocab, eng_hidden, eng_ctx, eng_image_token,
-    eng_has_tok, eng_bos, eng_is_stop, eng_prefill, eng_step, eng_scratch, eng_reset, eng_encode, eng_piece
+    eng_has_tok, eng_bos, eng_is_stop, eng_prefill, eng_step, eng_scratch, eng_reset, eng_encode, eng_piece,
+    eng_verify
 };
 
 /* ---------- the command-line one-shot through the public API ---------- */

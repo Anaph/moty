@@ -169,3 +169,43 @@ End to end, the short-question contract (86-id prompt, `max_new_tokens`
 complete answer on all 8 tiles (prefill 2.56–2.75 s, 17–25 tokens), against
 ~9 s for 64 tokens of the description prompt.
 
+
+## One answer end to end, and lookahead decoding
+
+Board B, brownai running, int8 container, the short-question contract
+(86 ids with 64 image rows, stop at EOS, `max_new_tokens` 48), 4 threads
+for the prefill; two passes over the 8 evaluation tiles (`la_check`, the
+API as a node uses it). Per stage:
+
+| stage | plain | with lookahead (`draft_k` 2) |
+|---|---|---|
+| open (container v2, mmap, page cache) | 0.17–0.20 s | same |
+| prefill, 86 tokens | 2.52–2.92 s (one outlier 3.55 s) | same |
+| decode 17–25 tokens, `threads_decode` 3 | 1.65–2.50 s | 1.04–2.01 s |
+| decode, `threads_decode` 2 | 1.81–2.72 s | 1.38–2.41 s |
+
+Lookahead (docs/api.md, `moty_sampling.draft`): the draft is the previous
+answer on the same scene (here: the previous tile's answer, frames ~2.5 min
+apart). Sums over 7 tiles (the first has no previous answer):
+
+| `threads_decode` | plain decode | `draft_k` 2 | answers identical | `draft_k` 3 | identical | CPU per answer (plain → `draft_k` 2) |
+|---|---|---|---|---|---|---|
+| 3 | 13.60 / 13.82 s | 9.82 / 9.68 s (1.38–1.43x) | 7/7, 7/7 | 8.20 / 8.30 s | 6/7 | 105.2 → 94.4 s (−10 %) |
+| 2 | 15.08 / 14.86 s | 12.20 / 12.14 s (1.22–1.24x) | 7/7, 7/7 | 10.64 / 10.66 s | 6/7 | 97.9 → 89.3 s (−9 %) |
+
+`draft_k` 2 keeps the answers bit-identical (a 3-token forward runs the decode
+kernels); `draft_k` 3 is faster but changed 1 of 7 answers (t02, the 4-token
+GEMM tile's float order). Recommended for a camera node: pass the previous
+answer as `draft` with `draft_k` 2; with `threads_decode` 2 (≈ 1.7 cores
+during decode) the decode then runs at about the plain 3-thread speed.
+
+Measured cost of one forward after the 86-token prompt (int8, 3 threads):
+1 token 99–103 ms, 3 tokens 168–180 ms, 4 tokens 181–185 ms, 5 tokens
+217–221 ms, 9 tokens 351–365 ms — the weights are read once per forward,
+so a few extra positions cost little. A separate small draft model does not
+apply here: it would not see the image rows.
+
+What is left: the prefill is now the largest stage (≈ 55–60 % of an answer
+after the open); its int8 GEMM runs near what the tile allows on the cores
+the detector leaves free, and coarser activation scales cost quality
+(docs/performance.md 5.15, 5.16).

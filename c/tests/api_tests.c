@@ -10,6 +10,7 @@
 #include <time.h>
 #include "api/moty.h"
 #include "tiny_lfm2.h"
+#include "tiny_llama.h"
 
 #define CHECK(cond) do { if (!(cond)) { \
     fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #cond); return 1; } } while (0)
@@ -256,5 +257,81 @@ int ap_cycles(void) {
         (void)r; (void)base;
 #endif
     }
+    return 0;
+}
+
+/* lookahead decoding (moty_sampling.draft): with draft_k <= 2 the answer is
+ * identical to plain greedy whatever the draft (the model's own answer, a
+ * shifted copy, garbage); the budget, the stop at EOS and a continuation
+ * after a lookahead call behave as without it; an engine that cannot verify
+ * (LFM2: recurrent conv state) ignores the draft; a v1-sized struct works */
+static const char *tl_dir(void) {
+    static char d[600];
+    if (!d[0]) { snprintf(d, sizeof d, "%s", tst_dir("moty_api_llama")); tl_write_dir(d); }
+    return d;
+}
+static moty_status la_gen(moty_model *h, const int32_t *ids, int n, int ntok, int eos, const int32_t *draft, int nd, int k, Col *c,
+                          moty_stats *st) {
+    moty_sampling s; moty_sampling_init(&s);
+    s.max_new_tokens = ntok; s.ignore_eos = !eos; s.draft = draft; s.n_draft = nd; s.draft_k = k;
+    c->h = h;
+    return moty_generate(h, ids, n, NULL, 0, -1, &s, col_cb, c, st);
+}
+static int la_steps_logged;
+static void la_log(void *u, int level, const char *msg) {
+    (void)u; (void)level; int n = 0;
+    if (sscanf(msg, "lookahead: %d verify steps", &n) == 1) la_steps_logged += n;
+}
+int ap_lookahead(void) {
+    static const int32_t ids[5] = {1, 7, 11, 3, 29};
+    const char *dirs[2] = { tl_dir(), ap_dir() };
+    for (int e = 0; e < 2; e++) {                        /* e = 0: Llama (verifies), 1: LFM2 (falls back) */
+        moty_model *h = ap_open(dirs[e], 256);
+        CHECK(h);
+        Col ref = {0};
+        moty_reset(h); CHECK(la_gen(h, ids, 5, 24, 0, NULL, 0, 0, &ref, NULL) == MOTY_OK); CHECK(ref.n == 24);
+        int32_t garbage[24], shifted[24];
+        for (int i = 0; i < 24; i++) { garbage[i] = (i * 13 + 5) % 40; shifted[i] = ref.toks[(i + 3) % 24]; }
+        const int32_t *drafts[3] = { ref.toks, shifted, garbage };
+        for (int d = 0; d < 3; d++) for (int k = 1; k <= 2; k++) {
+            Col c = {0};
+            moty_reset(h); CHECK(la_gen(h, ids, 5, 24, 0, drafts[d], 24, k, &c, NULL) == MOTY_OK);
+            CHECK(c.n == 24 && !memcmp(c.toks, ref.toks, sizeof(int32_t) * 24));
+        }
+        {                                               /* the Llama engine really verifies; LFM2 never */
+            moty_options o; moty_options_init(&o); o.threads = 2; o.ctx = 256; o.log_level = 2;
+            moty_model *h2 = NULL; char err[256]; Col c = {0};
+            CHECK(moty_model_open(dirs[e], &o, &h2, err, sizeof err) == MOTY_OK);
+            moty_set_log(la_log, NULL); la_steps_logged = 0;
+            CHECK(la_gen(h2, ids, 5, 24, 0, ref.toks, 24, 2, &c, NULL) == MOTY_OK);
+            moty_set_log(NULL, NULL);
+            CHECK(e == 0 ? la_steps_logged > 0 && la_steps_logged < 24 : la_steps_logged == 0);
+            moty_model_close(h2);
+        }
+        Col c4 = {0};                                   /* k = 4: the 4-token tile, near-exact: runs, full budget */
+        moty_reset(h); CHECK(la_gen(h, ids, 5, 24, 0, ref.toks, 24, 4, &c4, NULL) == MOTY_OK); CHECK(c4.n == 24);
+        Col b5 = {0};                                   /* budget: exactly max_new_tokens */
+        moty_reset(h); CHECK(la_gen(h, ids, 5, 5, 0, ref.toks, 24, 2, &b5, NULL) == MOTY_OK);
+        CHECK(b5.n == 5 && !memcmp(b5.toks, ref.toks, sizeof(int32_t) * 5));
+        Col pe = {0}, le = {0}; moty_stats sp, sl;       /* stop at EOS: the same tokens and reason */
+        moty_reset(h); CHECK(la_gen(h, ids, 5, 40, 1, NULL, 0, 0, &pe, &sp) == MOTY_OK);
+        moty_reset(h); CHECK(la_gen(h, ids, 5, 40, 1, ref.toks, 24, 2, &le, &sl) == MOTY_OK);
+        CHECK(pe.n == le.n && !memcmp(pe.toks, le.toks, sizeof(int32_t) * (size_t)pe.n) && sp.stop == sl.stop);
+        Col c1 = {0}, c2 = {0};                         /* continuation: 10 with a draft + 14 more = the plain 24 */
+        moty_reset(h);
+        CHECK(la_gen(h, ids, 5, 10, 0, ref.toks, 24, 2, &c1, NULL) == MOTY_OK);
+        CHECK(la_gen(h, NULL, 0, 14, 0, NULL, 0, 0, &c2, NULL) == MOTY_OK);
+        CHECK(c1.n == 10 && c2.n == 14 && !memcmp(c1.toks, ref.toks, 40) && !memcmp(c2.toks, ref.toks + 10, 56));
+        moty_model_close(h);
+    }
+    moty_model *h = ap_open(tl_dir(), 256);             /* argument checks, v1-sized struct */
+    CHECK(h);
+    moty_sampling s; moty_sampling_init(&s); s.max_new_tokens = 4; s.n_draft = 3;   /* n_draft without draft */
+    CHECK(moty_generate(h, ids, 5, NULL, 0, -1, &s, NULL, NULL, NULL) == MOTY_ERR_ARG);
+    moty_sampling_init(&s); s.draft_k = -1;
+    CHECK(moty_generate(h, ids, 5, NULL, 0, -1, &s, NULL, NULL, NULL) == MOTY_ERR_ARG);
+    moty_sampling v1; moty_sampling_init(&v1); v1.size = MOTY_SAMPLING_V1_SIZE; v1.max_new_tokens = 4; v1.n_draft = 99;
+    moty_reset(h); CHECK(moty_generate(h, ids, 5, NULL, 0, -1, &v1, NULL, NULL, NULL) == MOTY_OK);
+    moty_model_close(h);
     return 0;
 }

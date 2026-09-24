@@ -60,7 +60,16 @@ typedef struct {
     uint64_t seed;              /* 0 = keep the sampler's current state */
     int      max_new_tokens;    /* default 64 */
     int      ignore_eos;        /* 1: always generate max_new_tokens */
+    /* --- v1.2 (additive: a caller built against v1 passes the smaller size) --- */
+    const int32_t *draft;       /* lookahead decoding, greedy only (temperature 0): token ids the answer is
+                                 * likely to repeat (e.g. the previous answer on the same scene); each step
+                                 * verifies up to draft_k tokens that followed the current suffix in `draft`
+                                 * in ONE forward. NULL = off. Read only during the call. */
+    int      n_draft;
+    int      draft_k;           /* tokens proposed per step (0 = 2). 1-2: the output is bit-identical to plain
+                                 * greedy decoding; >= 3 uses the 4-token GEMM tile (near-exact, docs/api.md) */
 } moty_sampling;
+#define MOTY_SAMPLING_V1_SIZE ((int)offsetof(moty_sampling, draft))
 void moty_sampling_init(moty_sampling *s);
 
 typedef struct {

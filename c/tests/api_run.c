@@ -10,11 +10,11 @@
 #include <stdio.h>
 #include <string.h>
 int ap_lifecycle(void); int ap_continuation(void); int ap_abort_callback(void); int ap_abort_thread(void);
-int ap_inject(void); int ap_errors(void); int ap_cycles(void);
+int ap_inject(void); int ap_errors(void); int ap_cycles(void); int ap_lookahead(void);
 int main(int argc, char **argv) {
     struct { const char *n; int (*f)(void); } t[] = { {"Lifecycle", ap_lifecycle}, {"Continuation", ap_continuation},
         {"AbortCallback", ap_abort_callback}, {"AbortThread", ap_abort_thread}, {"Inject", ap_inject},
-        {"Errors", ap_errors}, {"Cycles", ap_cycles} };
+        {"Errors", ap_errors}, {"Cycles", ap_cycles}, {"Lookahead", ap_lookahead} };
     int fail = 0;
     for (unsigned i = 0; i < sizeof t / sizeof *t; i++) {
         if (argc > 1 && strcmp(argv[1], t[i].n)) continue;

@@ -8,7 +8,7 @@ int ap_abort_callback(void);
 int ap_abort_thread(void);
 int ap_inject(void);
 int ap_errors(void);
-int ap_cycles(void);
+int ap_cycles(void); int ap_lookahead(void);
 }
 
 TEST(Api, Lifecycle)       { EXPECT_EQ(ap_lifecycle(), 0); }
@@ -18,3 +18,4 @@ TEST(Api, AbortThread)     { EXPECT_EQ(ap_abort_thread(), 0); }
 TEST(Api, Inject)          { EXPECT_EQ(ap_inject(), 0); }
 TEST(Api, Errors)          { EXPECT_EQ(ap_errors(), 0); }
 TEST(Api, Cycles)          { EXPECT_EQ(ap_cycles(), 0); }
+TEST(Api, Lookahead)       { EXPECT_EQ(ap_lookahead(), 0); }
