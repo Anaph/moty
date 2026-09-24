@@ -96,7 +96,7 @@ int main(int argc, char **argv) {
         int k = nf ? nf : moty_tokenize(h, text, 1, 1, ids, 2048);
         if (nf) memcpy(ids, fids, sizeof(int32_t) * (size_t)nf);
         if (k < 0) { fprintf(stderr, "tokenize: %s\n", moty_last_error(h)); return 1; }
-        moty_sampling s; moty_sampling_init(&s); s.max_new_tokens = ngen; s.ignore_eos = 1;
+        moty_sampling s; moty_sampling_init(&s); s.max_new_tokens = ngen; s.ignore_eos = !getenv("CYCLE_EOS");   /* CYCLE_EOS=1: stop at end of turn */
         moty_stats st;
         if (getenv("CYCLE_GAP_MS")) {                  /* stands for the caller's own work between open and generate (an NPU encoder) */
             long ms = atol(getenv("CYCLE_GAP_MS")); struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L }; nanosleep(&ts, NULL);

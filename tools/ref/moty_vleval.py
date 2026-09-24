@@ -4,8 +4,8 @@
       HF f32 greedy answers (64 tokens) of the VL snapshot on each tile's rows
   moty_vleval.py run  <prompt_ids.json> <refs.json> <moty lfm2 binary> <container> [threads]
       per tile: leading tokens of moty's greedy answer equal to the reference
-      (TOKENS=1, IGNORE_EOS) and teacher-forced top-1 over the 64 answer
-      positions (PPL mode), the rows injected with EMBEDS=; one summary line,
+      (TOKENS=1, IGNORE_EOS) and teacher-forced top-1 over the answer
+      positions (PPL mode; 64, or fewer when a reference ended at EOS), the rows injected with EMBEDS=; one summary line,
       per-tile numbers in moty_<container>.json
 
 Tiles: raw little-endian f32 [N][hidden] image rows (e.g. NPU encoder output).
@@ -56,22 +56,25 @@ if IMG is not None: env0["EMBEDS_TOKEN"] = IMG
 res = {}
 for f, ans in refs.items():
     env = dict(env0, EMBEDS=f, PROMPT_IDS=P, NGEN="64", IGNORE_EOS="1", TOKENS="1")
-    err = subprocess.run([binp], env=env, capture_output=True, text=True).stderr
+    err = subprocess.run([binp], env=env, capture_output=True, text=True, errors="replace").stderr
     toks = []
     for line in err.splitlines():                     # the dumped ids: a line of integers
         p = line.split()
         if len(p) >= 32 and all(x.lstrip("-").isdigit() for x in p): toks = [int(x) for x in p]
     lead = 0
-    while lead < min(len(toks), 64) and toks[lead] == ans[lead]: lead += 1
+    L = min(len(ans), 64)                             # a reference that ended at EOS is shorter
+    while lead < min(len(toks), L) and toks[lead] == ans[lead]: lead += 1
     with tempfile.TemporaryDirectory() as d:
         pj = os.path.join(d, "p.json"); am = os.path.join(d, "am")
         json.dump({"ids": pids + ans, "argmax": [], "ppl": 0}, open(pj, "w"))
-        subprocess.run([binp], env=dict(env0, EMBEDS=f, PPL=pj, PPL_OUT=am), capture_output=True, text=True)
+        subprocess.run([binp], env=dict(env0, EMBEDS=f, PPL=pj, PPL_OUT=am), capture_output=True, text=True, errors="replace")
         a = [int(x) for x in open(am).read().split()]
     k = len(pids) - 1
-    tf = sum(a[k + i] == ans[i] for i in range(64))
-    res[os.path.basename(f)] = {"lead": lead, "tf": tf, "n": len(toks), "toks": toks}
+    tf = sum(a[k + i] == ans[i] for i in range(L))
+    res[os.path.basename(f)] = {"lead": lead, "tf": tf, "L": L, "n": len(toks), "toks": toks}
 lead = [r["lead"] for r in res.values()]; tf = [r["tf"] for r in res.values()]
-print(f"{os.path.basename(snap):22s} tiles {len(res)}  lead mean {sum(lead)/len(lead):5.1f}/64 min {min(lead)} full {sum(x == 64 for x in lead)}  "
-      f"teacher-forced {sum(tf)/len(tf)/64*100:5.1f}%  (dumped {min(r['n'] for r in res.values())} tokens min)", flush=True)
+Ls = [r["L"] for r in res.values()]; ref_len = f"/{Ls[0]}" if len(set(Ls)) == 1 else f" (refs {min(Ls)}-{max(Ls)} tokens)"
+print(f"{os.path.basename(snap):22s} tiles {len(res)}  lead mean {sum(lead)/len(lead):5.1f}{ref_len} min {min(lead)} "
+      f"full {sum(r['lead'] == r['L'] for r in res.values())}  "
+      f"teacher-forced {sum(tf)/sum(Ls)*100:5.1f}%  (dumped {min(r['n'] for r in res.values())} tokens min)", flush=True)
 json.dump(res, open(f"moty_{os.path.basename(os.path.normpath(snap))}.json", "w"), indent=1)
