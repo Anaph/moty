@@ -188,6 +188,13 @@ int ap_errors(void) {
     CHECK(moty_model_open(ap_dir(), &bad, &h, err, sizeof err) == MOTY_ERR_ARG);
     moty_options_init(&bad); bad.qbits = 3;
     CHECK(moty_model_open(ap_dir(), &bad, &h, err, sizeof err) == MOTY_ERR_ARG);
+    moty_options_init(&bad); bad.mmap_weights = 3;
+    CHECK(moty_model_open(ap_dir(), &bad, &h, err, sizeof err) == MOTY_ERR_ARG);
+    /* a caller built against v1 passes the v1 size: fields added since keep their defaults */
+    moty_options v1; moty_options_init(&v1); v1.log_level = 0; v1.size = MOTY_OPTIONS_V1_SIZE; v1.mmap_weights = 99;
+    CHECK(moty_model_open(ap_dir(), &v1, &h, err, sizeof err) == MOTY_OK); moty_model_close(h);
+    moty_options_init(&bad); bad.size = MOTY_OPTIONS_V1_SIZE + 2;
+    CHECK(moty_model_open(ap_dir(), &bad, &h, err, sizeof err) == MOTY_ERR_ARG);
     h = ap_open(ap_dir(), 16); CHECK(h);
     int32_t big[40] = {0}; int32_t oob[2] = {1, LV};
     moty_sampling s; moty_sampling_init(&s); s.max_new_tokens = 8;

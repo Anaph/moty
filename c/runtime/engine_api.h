@@ -17,6 +17,7 @@ typedef struct {
     int log_level;                                           /* 2: print the load banner */
     const char *q8_tensors;
     void **inst_out;          /* set to the instance as soon as it exists: a failed open closes it */
+    int mmap;                 /* moty_options.mmap_weights */
 } MotyEngineOpen;
 
 typedef struct MotyEngineOps {

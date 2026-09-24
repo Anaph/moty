@@ -17,6 +17,9 @@
 #include <sys/stat.h>
 #include "util/json.h"
 #include "util/compat.h"
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 
 /* tetto sulla dimensione dell'header safetensors: gli header reali sono piccoli
  * (KB..pochi MB). Un file crafted che dichiara un hlen enorme causerebbe una
@@ -30,6 +33,7 @@ typedef struct {
     int64_t nbytes;
     int     dtype;     /* 0=BF16 1=F16 2=F32 */
     int64_t numel;
+    int     used;      /* read/expected/mapped by the loader (SAVE_PACKED writes only these) */
 } st_tensor;
 
 typedef struct {
@@ -43,6 +47,8 @@ typedef struct {
                            * (GLM: 256 expert x 78 layer x 3 x 2) la scansione lineare
                            * costava decine di secondi/token (misurato sul primo run reale) */
     int        hcap;
+    void      *maps[512];   /* read-only mappings of the shard files (st_map), NULL = none yet */
+    int64_t    maplen[512];
 } shards;
 #define ST_MAX_SHARDS 512
 
@@ -113,9 +119,20 @@ static int st_open_fd(shards *S, const char *path) {
     return fd;
 }
 
+/* g_st_map: 0 = never map (pread copies), 1 = map pre-packed tensors and
+ * use them in place (default), 2 = also populate the mapping at once
+ * (MAP_POPULATE: the whole file read during open, no page faults later) */
+static int g_st_map = 1;
+
 /* close the shard files (the library's model close; the heap parts of S are
- * released with the rest of the model's allocations) */
+ * released with the rest of the model's allocations) and their mappings */
 static void st_close_fds(shards *S) {
+#ifndef _WIN32
+    for (int i = 0; i < S->nfd; i++) {
+        if (S->maps[i] && S->maps[i] != (void *)-1) munmap(S->maps[i], (size_t)S->maplen[i]);
+        S->maps[i] = NULL; S->maplen[i] = 0;
+    }
+#endif
     for (int i = 0; i < S->nfd; i++) {
         if (S->fds[i] >= 0) close(S->fds[i]);
         if (S->dfds[i] >= 0) close(S->dfds[i]);
@@ -181,7 +198,7 @@ static void st_index_file(shards *S, const char *path) {
         if (S->n == S->cap) { S->cap *= 2; S->t = realloc(S->t, S->cap*sizeof(st_tensor)); }
         st_tensor *t = &S->t[S->n++];
         t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
-        t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
+        t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel; t->used = 0;
     }
     json_free(root);   /* i nomi sono gia' strdup'ati nei st_tensor */
     free(hdr);
@@ -266,6 +283,7 @@ static int st_has(shards *S, const char *name) { return st_find(S, name) != NULL
 static st_tensor *st_expect(shards *S, const char *name, int64_t expect) {
     st_tensor *t = st_find(S, name);
     if (!t) { moty_fail_code(MOTY_FAIL_FORMAT, "missing tensor: %s\n", name); }
+    t->used = 1;
     if (expect > 0 && t->numel != expect) {
         moty_fail_code(MOTY_FAIL_FORMAT, "tensor %s: numel %lld != atteso %lld (layout diverso?)\n",
                 name, (long long)t->numel, (long long)expect);
@@ -294,9 +312,44 @@ static int st_dtype(shards *S, const char *name) {
 
 /* legge i byte GREZZI di un tensore (nessuna conversione di dtype): per i pesi gia'
  * quantizzati int4/int8 del nostro container (dtype U8). drop=1 -> fadvise DONTNEED. */
+/* the tensor's bytes inside a read-only mapping of its file, or NULL (no
+ * mmap on this platform, mapping failed, g_st_map 0, or the data is not
+ * `align`-aligned): the caller then reads a copy. The mapping lives until
+ * st_close_fds; its pages are file-backed and clean — the kernel can drop
+ * and re-read them under memory pressure instead of swapping or killing. */
+static const void *st_map(shards *S, const char *name, int align) {
+#ifdef _WIN32
+    (void)S; (void)name; (void)align; return NULL;
+#else
+    st_tensor *t = st_find(S, name);
+    if (!t || !g_st_map) return NULL;
+    t->used = 1;
+    int i = 0;
+    while (i < S->nfd && S->fds[i] != t->fd) i++;
+    if (i == S->nfd) return NULL;
+    if (!S->maps[i]) {
+        struct stat sb;
+        void *p = MAP_FAILED;
+        if (fstat(t->fd, &sb) == 0 && sb.st_size > 0) {
+            int fl = MAP_PRIVATE;
+#ifdef MAP_POPULATE
+            if (g_st_map == 2) fl |= MAP_POPULATE;
+#endif
+            p = mmap(NULL, (size_t)sb.st_size, PROT_READ, fl, t->fd, 0);
+        }
+        S->maps[i] = p == MAP_FAILED ? (void *)-1 : p;
+        S->maplen[i] = p == MAP_FAILED ? 0 : (int64_t)sb.st_size;
+    }
+    if (S->maps[i] == (void *)-1) return NULL;
+    const char *q = (const char *)S->maps[i] + t->off;
+    return ((uintptr_t)q % (uintptr_t)align) ? NULL : q;
+#endif
+}
+
 static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { moty_fail_code(MOTY_FAIL_FORMAT, "missing tensor: %s\n", name); }
+    t->used = 1;
     if (pread(t->fd, out, t->nbytes, t->off) != t->nbytes) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", "pread raw", strerror(errno)); }
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
 }
@@ -307,6 +360,7 @@ static void st_read_raw(shards *S, const char *name, void *out, int drop) {
 static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int64_t n_elems, float *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { moty_fail_code(MOTY_FAIL_FORMAT, "missing tensor: %s\n", name); }
+    t->used = 1;
     if (t->dtype == 3) { moty_fail_code(MOTY_FAIL_FORMAT, "tensor %s: slice read su dtype U8 non supportata\n", name); }
     if (t->dtype >= ST_DTYPE_QBLOCK) {
         /* formati a blocchi: la fetta deve essere allineata ai blocchi. I

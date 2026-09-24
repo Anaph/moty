@@ -203,18 +203,6 @@ static void sgb_value(SgbCtx *C, jval *sc, int depth){
     else sgb_fail(C, t);
 }
 
-static void sgb_free_jval(jval *v){
-    if (!v) return;
-    if (v->t == J_OBJ){
-        for (int i = 0; i < v->len; i++){ free(v->keys[i]); sgb_free_jval(v->kids[i]); }
-        free(v->keys); free(v->kids);
-    } else if (v->t == J_ARR){
-        for (int i = 0; i < v->len; i++) sgb_free_jval(v->kids[i]);
-        free(v->kids);
-    } else if (v->t == J_STR) free(v->str);
-    free(v);
-}
-
 /* Compile a JSON-Schema string to GBNF. Returns a malloc'd GBNF text (caller
  * frees) or NULL with a message in err (if err != NULL). */
 static char *schema_to_gbnf(const char *schema_json, char *err, int errsz){
@@ -235,7 +223,7 @@ static char *schema_to_gbnf(const char *schema_json, char *err, int errsz){
     if (C.use_int)
         sgb_put(&C, "jint ::= \"-\"? ( \"0\" | [1-9] [0-9]* )\n");
 
-    sgb_free_jval(sc);
+    json_free(sc);
     if (C.fail || !C.s){
         if (err) snprintf(err, errsz, "%s", C.err[0] ? C.err : "schema: compile failed");
         free(C.s); return NULL;

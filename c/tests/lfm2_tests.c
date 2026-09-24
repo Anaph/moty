@@ -305,3 +305,48 @@ int lt_packed_roundtrip(void) {
     free(la); free(lb);
     return 0;
 }
+
+/* container v2 (SAVE_PACKED after the fusion) used in place through mmap:
+ * the int8 table and the fused q/k/v, w1/w3 matrices are views of the
+ * mapping (no copy), the unused tensor is dropped, and the logits equal the
+ * source model's and a copied (MMAP=0) load's bit for bit */
+static int lt_in_map(const Model *m, const void *p) {
+    for (int i = 0; i < m->S.nfd; i++)
+        if (m->S.maps[i] && m->S.maps[i] != (void *)-1 && (const char *)p >= (const char *)m->S.maps[i]
+            && (const char *)p < (const char *)m->S.maps[i] + m->S.maplen[i]) return 1;
+    return 0;
+}
+int lt_packed_v2_mmap(void) {
+    const char *dir = tst_dir("lfm2_tiny_v2src");
+    lt_extra_unused = 1; lt_write_dir_w(dir, 1); lt_extra_unused = 0;
+    char src[512]; snprintf(src, sizeof src, "%s", dir);
+    const char *pk = tst_dir("lfm2_tiny_v2");
+    int save = g_q4fmt, smap = g_st_map; g_q4fmt = 1;
+    Model a; model_init(&a, src, 4); lfm2_fuse(&a);
+    CHECK(a.L[1].qkv.fmt == WF_Q4R4 && a.L[1].qkv.borrowed == 0);          /* a copy of heap blocks */
+    model_save_packed(&a, src, pk);
+    shards S; memset(&S, 0, sizeof S); st_init(&S, pk);
+    CHECK(st_dtype(&S, "model.embed_tokens.weight") == 3 && st_nbytes(&S, "model.embed_tokens.weight.qs") == LV*4);
+    CHECK(!st_has(&S, "model.vision_tower.patch_embedding.weight"));
+    st_tensor *tq = st_find(&S, "model.layers.1.self_attn.q_proj.weight"), *tk = st_find(&S, "model.layers.1.self_attn.k_proj.weight");
+    CHECK(tq && tk && tq->off + tq->nbytes <= tk->off && tk->off == tq->off + tq->nbytes && tq->off % 64 == 0);
+    st_close_fds(&S);
+    g_st_map = 1;
+    Model b; model_init(&b, pk, 4); lfm2_fuse(&b);
+    CHECK(b.base.embed_q && lt_in_map(&b, b.base.embed_q) && lt_in_map(&b, b.base.embed_qs));
+    CHECK(b.L[1].q.borrowed == 2 && lt_in_map(&b, b.L[1].q.q4) && lt_in_map(&b, b.L[1].q.s16));
+    g_st_map = 0;
+    Model c; model_init(&c, pk, 4); lfm2_fuse(&c);
+    CHECK(!c.base.embed_q || !lt_in_map(&c, c.base.embed_q));
+    int T = 8;
+    float *la = calloc((size_t)T*LV, sizeof(float)), *lb = calloc((size_t)T*LV, sizeof(float)), *lc = calloc((size_t)T*LV, sizeof(float));
+    kv_alloc(&a, 16); kv_alloc(&b, 16); kv_alloc(&c, 16);
+    lt_engine_logits(&a, 3, T, la); lt_engine_logits(&b, 3, T, lb); lt_engine_logits(&c, 3, T, lc);
+    CHECK(!memcmp(la + 2*LV, lb + 2*LV, (size_t)(T-2)*LV*sizeof(float)));
+    CHECK(!memcmp(lb, lc, (size_t)T*LV*sizeof(float)));
+    st_close_fds(&b.S);
+    CHECK(b.S.maps[0] == NULL);
+    g_q4fmt = save; g_st_map = smap;
+    free(la); free(lb); free(lc);
+    return 0;
+}

@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <stdint.h>
 #include "nn/fail.h"          /* moty_fail: library calls return, the CLI exits */
 
 typedef enum { J_NULL, J_BOOL, J_NUM, J_STR, J_ARR, J_OBJ } jtype;
@@ -16,28 +17,52 @@ typedef struct jval {
     jtype t;
     double num;            /* J_NUM */
     int    boolean;        /* J_BOOL */
-    char  *str;            /* J_STR (NUL-terminata, malloc indipendente) */
+    char  *str;            /* J_STR (NUL-terminated, in the tree's arena) */
     /* array: figli in [0..len); oggetto: chiavi[] e figli[] in parallelo */
     struct jval **kids;
     char        **keys;    /* solo per J_OBJ */
     int           len;
+    struct jarena *arena;  /* the root only: every node, string and array of the tree */
 } jval;
+
+/* A tree's memory comes from a chain of 1 MB blocks (a tokenizer.json is
+ * ~500k nodes: one malloc each cost more than the parse itself, and inside
+ * a library open every allocation is also recorded by the open tracker) */
+typedef struct jarena { struct jarena *next; size_t used, cap; } jarena;
 
 typedef struct {
     const char *s;
     int         depth;     /* annidamento corrente: bound contro lo stack-overflow
                             * da JSON malevolo tipo [[[[...]]]] (discesa ricorsiva) */
+    jarena     *a;
 } jparser;
+
+static void *j_alloc(jparser *p, size_t n) {
+    n = (n + 15) & ~(size_t)15;
+    if (!p->a || p->a->used + n > p->a->cap) {
+        size_t cap = n > ((size_t)1 << 20) ? n : ((size_t)1 << 20);
+        jarena *a = (jarena *)malloc(sizeof(jarena) + 16 + cap);
+        if (!a) moty_fail_code(MOTY_FAIL_OOM, "json: OOM (%zu bytes)", cap);
+        a->next = p->a; a->used = 0; a->cap = cap; p->a = a;
+    }
+    char *base = (char *)(p->a + 1); base += (16 - (uintptr_t)base % 16) % 16;
+    void *r = base + p->a->used; p->a->used += n;
+    return r;
+}
 
 /* tetto di annidamento: gli header safetensors / config sono piatti (profondita'
  * ~3). 1024 e' larghissimo per input legittimi e ben sotto il limite di stack. */
 #define J_MAX_DEPTH 1024
 
-/* ogni stringa ha la sua allocazione: un buffer condiviso con realloc
- * sposterebbe la memoria invalidando i puntatori gia' emessi */
-static char *j_dup(const char *b, int n) {
-    char *d = (char *)malloc(n + 1);
+static char *j_dup(jparser *p, const char *b, int n) {
+    char *d = (char *)j_alloc(p, (size_t)n + 1);
     memcpy(d, b, n); d[n] = 0;
+    return d;
+}
+/* grow an arena array: the old block stays in the arena (freed with the tree) */
+static void *j_grow(jparser *p, void *old, int n, int cap, size_t esz) {
+    void *d = j_alloc(p, (size_t)cap * esz);
+    if (old) memcpy(d, old, (size_t)n * esz);
     return d;
 }
 
@@ -58,8 +83,9 @@ static char *slurp_file(const char *path, long *out_n) {
 
 static void j_ws(jparser *p) { while (*p->s && isspace((unsigned char)*p->s)) p->s++; }
 
-static jval *j_new(jtype t) {
-    jval *v = (jval *)calloc(1, sizeof(jval));
+static jval *j_new(jparser *p, jtype t) {
+    jval *v = (jval *)j_alloc(p, sizeof(jval));
+    memset(v, 0, sizeof *v);
     v->t = t; return v;
 }
 
@@ -100,17 +126,17 @@ static char *j_parse_str_raw(jparser *p) {
     }
     #undef J_PUT
     if (*p->s == '"') p->s++;
-    return j_dup(tmp, n);
+    return j_dup(p, tmp, n);
 }
 
 static jval *j_parse_val(jparser *p) {
     j_ws(p);
     char c = *p->s;
-    if (c == '"') { jval *v = j_new(J_STR); v->str = j_parse_str_raw(p); return v; }
+    if (c == '"') { jval *v = j_new(p, J_STR); v->str = j_parse_str_raw(p); return v; }
     if (c == '{') {
-        if (++p->depth > J_MAX_DEPTH) { p->depth--; return j_new(J_NULL); }
-        p->s++; jval *v = j_new(J_OBJ);
-        int cap = 8; v->keys = malloc(cap * sizeof(char*)); v->kids = malloc(cap * sizeof(jval*));
+        if (++p->depth > J_MAX_DEPTH) { p->depth--; return j_new(p, J_NULL); }
+        p->s++; jval *v = j_new(p, J_OBJ);
+        int cap = 8; v->keys = j_grow(p, NULL, 0, cap, sizeof(char*)); v->kids = j_grow(p, NULL, 0, cap, sizeof(jval*));
         j_ws(p);
         if (*p->s == '}') { p->s++; p->depth--; return v; }
         for (;;) {
@@ -118,7 +144,7 @@ static jval *j_parse_val(jparser *p) {
             char *key = j_parse_str_raw(p);
             j_ws(p); if (*p->s == ':') p->s++;
             jval *val = j_parse_val(p);
-            if (v->len == cap) { cap *= 2; v->keys = realloc(v->keys, cap*sizeof(char*)); v->kids = realloc(v->kids, cap*sizeof(jval*)); }
+            if (v->len == cap) { cap *= 2; v->keys = j_grow(p, v->keys, v->len, cap, sizeof(char*)); v->kids = j_grow(p, v->kids, v->len, cap, sizeof(jval*)); }
             v->keys[v->len] = key; v->kids[v->len] = val; v->len++;
             j_ws(p);
             if (*p->s == ',') { p->s++; continue; }
@@ -129,14 +155,14 @@ static jval *j_parse_val(jparser *p) {
         return v;
     }
     if (c == '[') {
-        if (++p->depth > J_MAX_DEPTH) { p->depth--; return j_new(J_NULL); }
-        p->s++; jval *v = j_new(J_ARR);
-        int cap = 8; v->kids = malloc(cap * sizeof(jval*));
+        if (++p->depth > J_MAX_DEPTH) { p->depth--; return j_new(p, J_NULL); }
+        p->s++; jval *v = j_new(p, J_ARR);
+        int cap = 8; v->kids = j_grow(p, NULL, 0, cap, sizeof(jval*));
         j_ws(p);
         if (*p->s == ']') { p->s++; p->depth--; return v; }
         for (;;) {
             jval *val = j_parse_val(p);
-            if (v->len == cap) { cap *= 2; v->kids = realloc(v->kids, cap*sizeof(jval*)); }
+            if (v->len == cap) { cap *= 2; v->kids = j_grow(p, v->kids, v->len, cap, sizeof(jval*)); }
             v->kids[v->len++] = val;
             j_ws(p);
             if (*p->s == ',') { p->s++; continue; }
@@ -146,29 +172,25 @@ static jval *j_parse_val(jparser *p) {
         p->depth--;
         return v;
     }
-    if (c == 't') { p->s += 4; jval *v = j_new(J_BOOL); v->boolean = 1; return v; }
-    if (c == 'f') { p->s += 5; jval *v = j_new(J_BOOL); v->boolean = 0; return v; }
-    if (c == 'n') { p->s += 4; return j_new(J_NULL); }
+    if (c == 't') { p->s += 4; jval *v = j_new(p, J_BOOL); v->boolean = 1; return v; }
+    if (c == 'f') { p->s += 5; jval *v = j_new(p, J_BOOL); v->boolean = 0; return v; }
+    if (c == 'n') { p->s += 4; return j_new(p, J_NULL); }
     /* numero */
-    { char *end; double d = strtod(p->s, &end); p->s = end; jval *v = j_new(J_NUM); v->num = d; return v; }
+    { char *end; double d = strtod(p->s, &end); p->s = end; jval *v = j_new(p, J_NUM); v->num = d; return v; }
 }
 
 /* API */
 static jval *json_parse(const char *text) {
-    jparser p = { text, 0 };
-    return j_parse_val(&p);
+    jparser p = { text, 0, NULL };
+    jval *v = j_parse_val(&p);
+    v->arena = p.a;
+    return v;
 }
 
-/* libera ricorsivamente un albero jval: ogni stringa e ogni nodo hanno la
- * PROPRIA malloc (j_dup/j_new — il campo arena di jparser e' storico e resta
- * sempre NULL), quindi il free e' una discesa semplice senza double-free. */
+/* frees a tree returned by json_parse (its arena blocks) */
 static void json_free(jval *v) {
     if (!v) return;
-    free(v->str);
-    for (int i = 0; i < v->len; i++) json_free(v->kids[i]);
-    if (v->keys) { for (int i = 0; i < v->len; i++) free(v->keys[i]); free(v->keys); }
-    free(v->kids);
-    free(v);
+    for (jarena *a = v->arena, *n; a; a = n) { n = a->next; free(a); }
 }
 
 static jval *json_get(jval *o, const char *key) {

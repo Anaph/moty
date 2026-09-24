@@ -54,6 +54,8 @@ int main(int argc, char **argv) {
     int ngen = argc > 6 ? atoi(argv[6]) : 64;
     if (argc > 7) o.pool_spin_us = atoi(argv[7]);
     o.ctx = 1024;
+    if (getenv("CYCLE_LOG")) o.log_level = atoi(getenv("CYCLE_LOG"));   /* 2: load banner + open phases */
+    if (getenv("CYCLE_MMAP")) o.mmap_weights = atoi(getenv("CYCLE_MMAP")); /* 0 copy, 1 map, 2 map + populate */
     static int32_t fids[2048]; int nf = 0;
     if (argc > 8) {
         FILE *f = fopen(argv[8], "r"); if (!f) { perror(argv[8]); return 1; }
@@ -91,11 +93,15 @@ int main(int argc, char **argv) {
         if (k < 0) { fprintf(stderr, "tokenize: %s\n", moty_last_error(h)); return 1; }
         moty_sampling s; moty_sampling_init(&s); s.max_new_tokens = ngen; s.ignore_eos = 1;
         moty_stats st;
+        if (getenv("CYCLE_GAP_MS")) {                  /* stands for the caller's own work between open and generate (an NPU encoder) */
+            long ms = atol(getenv("CYCLE_GAP_MS")); struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L }; nanosleep(&ts, NULL);
+        }
         double t_gen = now();
         int itok = argc > 9 ? atoi(argv[9]) : moty_model_image_token(h);
         rc = moty_generate(h, ids, k, rows, nrows, itok, &s, on_token, c == 0 ? (void *)1 : NULL, &st);
         if (c == 0) printf("\n");
         long rss_open = status_kb("VmRSS:"), thr = status_kb("Threads:");
+        long rss_anon = status_kb("RssAnon:"), rss_file = status_kb("RssFile:");   /* file pages: clean, reclaimable */
         if (rc) { fprintf(stderr, "generate: %d %s\n", rc, moty_last_error(h)); return 1; }
         double load = moty_model_load_s(h);
         moty_model_close(h);
@@ -110,9 +116,9 @@ int main(int argc, char **argv) {
 #endif
         printf("cycle %d: TTFT cold %.2f s, warm %.2f s | ", c, t_first - t_open, t_first - t_gen);
         printf("load %.2f s | prefill %d tok %.2f s (%.1f tok/s) | decode %d tok %.2f s (%.2f tok/s) | "
-               "RSS open %ld kB, closed %ld kB, released %ld kB | threads open %ld, released %ld | MemAvailable %ld kB\n",
+               "RSS open %ld kB (anon %ld, file %ld), closed %ld kB, released %ld kB | threads open %ld, released %ld | MemAvailable %ld kB\n",
                load, st.prompt_tokens, st.prefill_s, st.prompt_tokens / st.prefill_s, st.new_tokens, st.decode_s,
-               st.new_tokens / st.decode_s, rss_open, rss_close, status_kb("VmRSS:"), thr, status_kb("Threads:"),
+               st.new_tokens / st.decode_s, rss_open, rss_anon, rss_file, rss_close, status_kb("VmRSS:"), thr, status_kb("Threads:"),
                meminfo_kb("MemAvailable:"));
         fflush(stdout);
     }

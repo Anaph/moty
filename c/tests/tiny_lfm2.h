@@ -21,6 +21,7 @@ static void lt_norm_w(const char *name, int n) {           /* 1 + small noise */
 
 /* wrap = 1: the layout of a multimodal checkpoint (LFM2-VL): config under
  * text_config, tensors under "model.language_model." */
+static int lt_extra_unused = 0;          /* 1: also a tensor the engine never reads (a VL vision tower) */
 static void lt_write_dir_w(const char *dir, int wrap);
 static void lt_write_dir(const char *dir) { lt_write_dir_w(dir, 0); }
 static void lt_write_dir_w(const char *dir, int wrap) {
@@ -64,6 +65,7 @@ static void lt_write_dir_w(const char *dir, int wrap) {
         #undef AT
         #undef ATN
     }
+    if (lt_extra_unused) tst_add("model.vision_tower.patch_embedding.weight", "[16,32]", 16*LD, 0.4f, 0);
     tst_write(dir);
 }
 

@@ -49,11 +49,31 @@ container (`tools/ref/pack_r4.py`, `SAVE_PACKED=`) keeps its own int4/int8
 layout; an HF snapshot is quantized at open (`qbits` 4 or 8). `qbits` is not
 used for a pre-packed container.
 
+### Container v2 (fast open)
+`SAVE_PACKED=` writes format `moty-q4r4` version 2, made to be used in place
+through a read-only `mmap` (`mmap_weights`, below):
+- the token embedding as moty keeps it (I8 table + F32 per-row scales
+  `<name>.qs`), instead of the bf16/f32 table every open re-quantized;
+- the codes of the matrices an engine fuses (q/k/v, gate/up) back to back,
+  their scales likewise: the fused matrix is a view of the mapping;
+- only the tensors the engine reads (a VL snapshot's vision tower is
+  dropped); 64-byte aligned.
+
+Upgrade any container (v1 from `pack_r4.py` or an older `SAVE_PACKED`):
+
+```
+SNAP=<v1 dir> QBITS=4 Q4FMT=r4 SAVE_PACKED=<v2 dir> ./qwen     # or ./lfm2
+```
+
+Generation is bit-identical (checked: 64/64 ids, v1/v2 x copy/map, VisionPsy
+and LFM2.5-VL). v1 containers keep loading (mapped too; the tensors that
+are fused get copied, their mapped pages are then released).
+
 ## Calls
 
 | call | |
 |---|---|
-| `moty_options_init`, `moty_sampling_init` | fill defaults (and the `size` ABI guard) |
+| `moty_options_init`, `moty_sampling_init` | fill defaults (and the `size` ABI guard: `moty_options` accepts its v1 size, `MOTY_OPTIONS_V1_SIZE`; fields added since keep their defaults) |
 | `moty_model_open` / `moty_model_close` | a handle owns weights, KV cache, tokenizer, open files |
 | `moty_model_vocab / hidden / ctx / image_token / n_past / load_s` | model facts; `hidden` = width of injected rows |
 | `moty_tokenize(m, text, add_bos, chat_template, ids, cap)` | text → ids; special tokens written in the text are recognized as HF does (the LFM2.5-VL prompt `<\|image_start\|>` + 256 × `<image>` + `<\|image_end\|>Describe the image.` with the chat template gives HF's 272 ids exactly) |
@@ -112,9 +132,20 @@ file open.
   workers; the next call starts them again.
 
 ## Memory
-- A handle's persistent blocks of 256 KiB or more (weights, KV cache, scratch
-  arenas) are `mmap`ed and `munmap`ed at close, so the memory goes back to the
-  OS instead of glibc's heap. Everything the handle allocated during open is
+- `mmap_weights` (default 1, v1.1): the packed weights of a container are
+  used in place in a read-only private mapping of `model.safetensors`, not
+  copied. They are clean file pages: RSS counts them, but under memory
+  pressure the kernel can drop them (and re-read them from flash if touched)
+  instead of the process holding the same bytes as anonymous memory, and
+  open no longer holds two copies (page cache + heap) at once. `2`
+  populates the mapping during open (the whole file read up front, no page
+  faults in the first prefill; measured slower and larger, docs/performance.md
+  5.15); `0` copies as before. Board B, VisionPsy int8: open 0.2 s instead of
+  6.1–6.4 s, RSS during a generate 20 MB anonymous + 375 MB file instead of
+  449 MB anonymous.
+- A handle's persistent blocks of 256 KiB or more (KV cache, scratch
+  arenas, copied weights) are `mmap`ed and `munmap`ed at close, so the memory goes back to the
+  OS instead of glibc's heap; the weight mapping is unmapped at close. Everything the handle allocated during open is
   recorded (`nn/fail.h` open tracker) and freed at close.
 - The kernels' scratch buffers are process-wide (reused by every call, sized
   by the largest prompt so far); `moty_release_scratch()` frees them.

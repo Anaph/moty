@@ -4,6 +4,11 @@
 #ifndef RT_MODEL_LOAD_H
 #define RT_MODEL_LOAD_H
 
+/* open phases (MotyCommon.load_ph): where the seconds of a model open go */
+enum { LP_INDEX, LP_SMALL, LP_EMBED, LP_HEAD, LP_LAYERS, LP_FUSE, LP_TOK, LP_KV, LP_N };
+static const char *const lp_name[LP_N] = { "index", "small", "embed", "head", "layers", "fuse", "tokenizer", "kv" };
+#define LP_MARK(m, ph, t) do { double _t = now_s(); (m)->base.load_ph[ph] += _t - (t); (t) = _t; } while (0)
+
 /* ---------- caricamento pesi ---------- */
 static float *load_t(Model *m, const char *name, int64_t expect) {
     st_tensor *t = st_expect(&m->S, name, expect);
@@ -88,10 +93,14 @@ static void load_mat_r4(Model *m, Mat *w, const char *name, const char *pname, i
             moty_fail_code(MOTY_FAIL_FORMAT, "[" ENGINE_TAG "] %s: packed R4 size mismatch (O=%d I=%d)\n", name, O, I);
         }
     } else gb = r4_wants_q8(pname) ? 128 : 64;
+    w->O = O; w->I = I; w->fmt = gb == 128 ? WF_Q8R4 : WF_Q4R4;
+    if (packed) {                                   /* pre-packed container: used in place (mmap) */
+        const void *q = st_map(&m->S, name, 1), *d = st_map(&m->S, sn, 2);
+        if (q && d) { w->q4 = (uint8_t *)q; w->s16 = (uint16_t *)d; w->borrowed = 2; return; }
+    }
     w->q4 = balloc((int64_t)O4*nb*gb, name);
     w->s16 = balloc((int64_t)O4*nb*4*sizeof(uint16_t), name);
-    w->O = O; w->I = I; w->fmt = gb == 128 ? WF_Q8R4 : WF_Q4R4;
-    if (packed) {                                   /* pre-packed container: raw read */
+    if (packed) {                                   /* no mapping: raw read */
         st_read_raw(&m->S, name, w->q4, 0);
         st_read_raw(&m->S, sn, w->s16, 0);
         return;
@@ -189,10 +198,26 @@ static void quantize_from_disk(Model *m, const char *name, int8_t *q, float *qs,
     }
 }
 
+/* a container (SAVE_PACKED, format moty-r4 v2) stores the table as moty
+ * keeps it: I8 "model.embed_tokens.weight" [V*D] + F32 ".qs" [V] */
+static int embed_is_q8(Model *m) {
+    return st_has(&m->S, "model.embed_tokens.weight.qs") && st_dtype(&m->S, "model.embed_tokens.weight") == 3;
+}
+
 /* embed int8 per riga (QBITS=8): la tabella non passa MAI intera per la RAM */
 static int g_embed_chunk_rows = 0;      /* 0 = auto; i test lo stringono */
 static void load_embed_q8(Model *m) {
     Cfg *c = &m->c; int D = c->hidden; int64_t V = c->vocab;
+    if (embed_is_q8(m)) {                         /* pre-quantized: in place (mmap) or one raw read */
+        const char *en = "model.embed_tokens.weight", *sn = "model.embed_tokens.weight.qs";
+        if (st_nbytes(&m->S, en) != V*D || st_nbytes(&m->S, sn) != V*4)
+            moty_fail_code(MOTY_FAIL_FORMAT, "[" ENGINE_TAG "] %s: int8 table size mismatch (vocab %lld, hidden %d)\n", en, (long long)V, D);
+        const void *q = st_map(&m->S, en, 1), *qs = st_map(&m->S, sn, 4);
+        if (q && qs) { m->base.embed_q = (int8_t *)q; m->base.embed_qs = (float *)qs; return; }
+        m->base.embed_q = balloc(V*D, "embed int8"); m->base.embed_qs = falloc(V);
+        st_read_raw(&m->S, en, m->base.embed_q, 0); st_read_raw(&m->S, sn, m->base.embed_qs, 0);
+        return;
+    }
     st_expect(&m->S, "model.embed_tokens.weight", V*D);
     m->base.embed_q  = balloc(V*D, "embed int8");
     m->base.embed_qs = falloc(V);
@@ -373,6 +398,7 @@ static void stream_scratch_alloc(Model *m) {
 static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_bytes, int ctx_hint) {
     memset(m, 0, sizeof(*m));
     m->base.qbits = qbits;
+    double tp = now_s();
     /* GGUF: l'indice va costruito PRIMA del config (i metadati SONO il config) */
     if (g_gguf) gguf_index(&m->S, &g_gguf_meta, g_gguf);
     load_cfg(&m->c, snap);
@@ -386,9 +412,13 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
     m->base.lm_tied = c->tie_emb || !st_has(&m->S, "lm_head.weight");
     m->L = calloc(c->n_layers, sizeof(Layer));
     /* 1) parte piccola SEMPRE residente (hook: norme, vettori, stati, PLE...) */
+    LP_MARK(m, LP_INDEX, tp);
     load_small(m);
+    LP_MARK(m, LP_SMALL, tp);
     /* micro-RSS: nessun peso residente, embed compreso (gather per riga nello
      * step del motore); ogni Mat diventa un descrittore streamato. */
+    if (g_micro && embed_is_q8(m))
+        moty_fail_code(MOTY_FAIL_FORMAT, "[" ENGINE_TAG "] MICRO=1 needs an f32/bf16 embedding table (this container stores it int8)\n");
     if (g_micro) { model_init_micro(m); m->base.load_s = now_s() - t0; return; }
     /* QBITS!=0 copre anche l'embed, ma SEMPRE a int8 (anche con QBITS=4):
      * l'lm_head e' il GEMV piu' sensibile alla quantizzazione e l'int4 li'
@@ -401,9 +431,12 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
     if (g_embed_disk && m->base.lm_tied && !head_q4r4) {
         moty_fail_code(MOTY_FAIL_FORMAT, "[" ENGINE_TAG "] EMBED=disk con lm_head legato richiede QBITS=4 Q4FMT=r4\n");
     }
+    if (g_embed_disk && embed_is_q8(m))
+        moty_fail_code(MOTY_FAIL_FORMAT, "[" ENGINE_TAG "] EMBED=disk: this container's table is int8 in place (mmap) already\n");
     if (g_embed_disk) st_expect(&m->S, "model.embed_tokens.weight", (int64_t)c->vocab*D);
-    else if (m->base.qbits > 0 || moty_getenv("EMBED_Q8")) load_embed_q8(m);  /* qbits=-1 (native): f32 embed */
+    else if (m->base.qbits > 0 || moty_getenv("EMBED_Q8") || embed_is_q8(m)) load_embed_q8(m);  /* qbits=-1 (native): f32 embed */
     else m->base.embed = load_t(m, "model.embed_tokens.weight", (int64_t)c->vocab*D);
+    LP_MARK(m, LP_EMBED, tp);
     if (m->base.lm_tied) {
         mat_reset_storage(&m->base.lm_head);
         m->base.lm_head.O = c->vocab; m->base.lm_head.I = D;
@@ -429,6 +462,7 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
     } else {
         load_mat_bits(m, &m->base.lm_head, "lm_head.weight", c->vocab, D, m->base.qbits);
     }
+    LP_MARK(m, LP_HEAD, tp);
     /* 2) budget -> quanti layer di matrici stanno residenti */
     m->base.n_resident = budget_bytes > 0 ? budget_resident(m, budget_bytes, ctx_hint)
                                      : c->n_layers;
@@ -445,16 +479,25 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
         }
     }
     if (m->base.n_resident < c->n_layers) stream_scratch_alloc(m);
+    LP_MARK(m, LP_LAYERS, tp);
     m->base.load_s = now_s() - t0;
 }
 
-/* ---------- SAVE_PACKED=<dir>: write a pre-packed Q4R4 container ----------
- * A safetensors snapshot (moty container convention, cf. olmoe/glm "name.qs"):
- * every resident WF_Q4R4 (WF_Q8R4) matrix as U8 (I8) "<name>" (its 4-row blocks) + F16
- * "<name>.s16"; the lm_head as "lm_head.weight" (+.s16), also when tied; all
- * other tensors copied byte for byte with their dtype (flattened shape).
- * config/tokenizer files are copied. Loading it with QBITS=4 skips the
- * bf16 read + quantization (load_mat_q4r4 raw path). */
+/* ---------- SAVE_PACKED=<dir>: write a pre-packed container (moty-q4r4 v2) ----------
+ * A safetensors file (moty container convention, cf. olmoe/glm "name.qs"):
+ * every resident WF_Q4R4 (WF_Q8R4) matrix as U8 (I8) "<name>" (its 4-row
+ * blocks) + F16 "<name>.s16"; the lm_head as "lm_head.weight" (+.s16), also
+ * when tied. v2 (made to be used in place through mmap, docs/api.md):
+ *   - the token embedding as moty keeps it: I8 "model.embed_tokens.weight"
+ *     + F32 "model.embed_tokens.weight.qs" (per-row scale), not the bf16/f32
+ *     table that every open re-quantized;
+ *   - the codes of the matrices the engine fuses (q/k/v, gate/up: one
+ *     buffer after moty_mat_fuse_rows) written back to back, their scales
+ *     likewise, so the fused matrix is a view of the mapping (no copy);
+ *   - only the tensors the loader read (a VL snapshot's vision tower is
+ *     dropped); other tensors copied byte for byte with their dtype.
+ * Data 64-byte aligned. config/tokenizer files are copied. A v1 container
+ * (and pack_r4.py output) still loads; SAVE_PACKED from it upgrades it. */
 #ifdef _WIN32
 #include <direct.h>
 #define rt_mkdir(p) _mkdir(p)
@@ -472,69 +515,117 @@ static int pk_name_is(Model *m, const char *sname, Mat **out) {
     }
     return 0;
 }
+static int64_t pk_qbytes(const Mat *w) { return (int64_t)(w->O + 3) / 4 * (w->I / 32) * (w->fmt == WF_Q8R4 ? 128 : 64); }
+static int64_t pk_sbytes(const Mat *w) { return (int64_t)(w->O + 3) / 4 * (w->I / 32) * 8; }
 static void model_save_packed(Model *m, const char *snap, const char *dir) {
     if (g_gguf || m->base.qbits != 4 || !g_q4fmt || m->base.n_resident < m->c.n_layers) {
         moty_fail_code(MOTY_FAIL_FORMAT, "[" ENGINE_TAG "] SAVE_PACKED: needs SNAP=, QBITS=4 Q4FMT=r4, all layers resident\n");
     }
     rt_mkdir(dir);
-    typedef struct { char name[256]; const char *dt; int64_t n, bytes; const void *mem; int src; } PkT;
-    int cap = 2 * m->S.n + 4, nt = 0;               /* a packed matrix -> 2 entries */
+    typedef struct { char name[256]; const char *dt; int64_t n, bytes; const void *mem; int src, glue; } PkT;   /* glue: no padding before it */
+    int cap = 2 * m->S.n + 8, nt = 0;
     PkT *t = calloc(cap, sizeof(PkT));
+    typedef struct { char name[256]; Mat *w; int done; } PkM;
+    PkM *pm = calloc(m->S.n + 1, sizeof(PkM)); int np = 0;
     static const char *dtn[4] = { "BF16", "F16", "F32", "U8" };
     int head_done = 0;
+    /* 1) plain tensors (what the loader read), in file order */
     for (int i = 0; i < m->S.n; i++) {
         st_tensor *st = &m->S.t[i]; Mat *w;
         if (pk_name_is(m, st->name, &w)) {
-            int64_t nb = w->I / 32, O4 = (w->O + 3) / 4, gb = w->fmt == WF_Q8R4 ? 128 : 64;
-            snprintf(t[nt].name, 256, "%s", st->name); t[nt].dt = gb == 128 ? "I8" : "U8";
-            t[nt].n = t[nt].bytes = O4*nb*gb; t[nt].mem = w->q4; t[nt].src = -1; nt++;
-            snprintf(t[nt].name, 256, "%s.s16", st->name); t[nt].dt = "F16"; t[nt].n = O4*nb*4; t[nt].bytes = O4*nb*8; t[nt].mem = w->s16; t[nt].src = -1; nt++;
+            snprintf(pm[np].name, 256, "%s", st->name); pm[np++].w = w;
             if (!strcmp(st->name, "lm_head.weight")) head_done = 1;
-        } else {
-            if (st->dtype > 3) { moty_fail_code(MOTY_FAIL_FORMAT, "SAVE_PACKED: %s: block dtype unsupported\n", st->name); }
-            snprintf(t[nt].name, 256, "%s", st->name); t[nt].dt = dtn[st->dtype]; t[nt].n = st->numel;
-            t[nt].bytes = st->nbytes; t[nt].mem = NULL; t[nt].src = i; nt++;
+            continue;
         }
+        if (!st->used) continue;
+        { size_t L = strlen(st->name); if (L > 4 && !strcmp(st->name + L - 4, ".s16")) continue; }   /* a packed matrix's scales */
+        char cb[512]; const char *cn = st_canon(st->name, cb, sizeof cb);                      /* VL: model.language_model.X */
+        if (!strcmp(cn, "model.embed_tokens.weight.qs")) continue;                                  /* written with the table */
+        if (!strcmp(cn, "model.embed_tokens.weight") && m->base.embed_q && !m->base.embed) {
+            int64_t V = m->c.vocab, D = m->c.hidden;
+            snprintf(t[nt].name, 256, "%s", st->name); t[nt].dt = "I8"; t[nt].n = t[nt].bytes = V*D; t[nt].mem = m->base.embed_q; t[nt].src = -1; nt++;
+            snprintf(t[nt].name, 256, "%s.qs", st->name); t[nt].dt = "F32"; t[nt].n = V; t[nt].bytes = V*4; t[nt].mem = m->base.embed_qs; t[nt].src = -1; nt++;
+            continue;
+        }
+        if (st->dtype > 3) { moty_fail_code(MOTY_FAIL_FORMAT, "SAVE_PACKED: %s: block dtype unsupported\n", st->name); }
+        snprintf(t[nt].name, 256, "%s", st->name); t[nt].dt = dtn[st->dtype]; t[nt].n = st->numel;
+        t[nt].bytes = st->nbytes; t[nt].mem = NULL; t[nt].src = i; nt++;
     }
     if (!head_done && (m->base.lm_head.fmt == WF_Q4R4 || m->base.lm_head.fmt == WF_Q8R4)) {  /* tied head */
-        Mat *w = &m->base.lm_head; int64_t nb = w->I / 32, O4 = (w->O + 3) / 4, gb = w->fmt == WF_Q8R4 ? 128 : 64;
-        snprintf(t[nt].name, 256, "lm_head.weight"); t[nt].dt = gb == 128 ? "I8" : "U8";
-        t[nt].n = t[nt].bytes = O4*nb*gb; t[nt].mem = w->q4; t[nt].src = -1; nt++;
-        snprintf(t[nt].name, 256, "lm_head.weight.s16"); t[nt].dt = "F16"; t[nt].n = O4*nb*4; t[nt].bytes = O4*nb*8; t[nt].mem = w->s16; t[nt].src = -1; nt++;
+        snprintf(pm[np].name, 256, "lm_head.weight"); pm[np++].w = &m->base.lm_head;
     }
+    /* 2) packed matrices: groups whose codes are back to back in memory (a
+     * fused buffer) stay back to back; codes of every group first, then the
+     * scales in the same order */
+    int *ord = calloc(np + 1, sizeof(int)), *glue = calloc(np + 1, sizeof(int)); int no = 0;
+    for (int i = 0; i < np; i++) {
+        if (pm[i].done) continue;
+        int grp[64], g = 1; grp[0] = i; pm[i].done = 1;
+        for (int grew = 1; grew && g < 64; ) {
+            grew = 0;
+            for (int j = 0; j < np && g < 64; j++) {
+                if (pm[j].done) continue;
+                const Mat *f = pm[grp[0]].w, *l = pm[grp[g-1]].w, *w = pm[j].w;
+                if (w->q4 == l->q4 + pk_qbytes(l)) { grp[g++] = j; pm[j].done = 1; grew = 1; }
+                else if (w->q4 + pk_qbytes(w) == f->q4) { memmove(grp + 1, grp, g * sizeof(int)); grp[0] = j; g++; pm[j].done = 1; grew = 1; }
+            }
+        }
+        for (int k = 0; k < g; k++) { glue[no] = k > 0; ord[no++] = grp[k]; }
+    }
+    for (int k = 0; k < no; k++) {
+        Mat *w = pm[ord[k]].w;
+        snprintf(t[nt].name, 256, "%s", pm[ord[k]].name); t[nt].dt = w->fmt == WF_Q8R4 ? "I8" : "U8";
+        t[nt].n = t[nt].bytes = pk_qbytes(w); t[nt].mem = w->q4; t[nt].src = -1; t[nt].glue = glue[k]; nt++;
+    }
+    for (int k = 0; k < no; k++) {
+        Mat *w = pm[ord[k]].w;
+        snprintf(t[nt].name, 256, "%s.s16", pm[ord[k]].name); t[nt].dt = "F16";
+        t[nt].n = pk_sbytes(w) / 2; t[nt].bytes = pk_sbytes(w); t[nt].mem = w->s16; t[nt].src = -1; t[nt].glue = glue[k]; nt++;
+    }
+    free(ord); free(glue); free(pm);
+    /* header; each tensor starts on a 64-byte boundary of the file, except the
+     * members of a fused group after the first (back to back: one view) */
     int64_t hcap = 256 + (int64_t)nt * 400; char *hdr = malloc(hcap); int64_t hl = 0, off = 0;
-    hl += snprintf(hdr + hl, hcap - hl, "{\"__metadata__\":{\"format\":\"moty-q4r4\"}");
+    int64_t *at = calloc(nt + 1, sizeof(int64_t));
+    hl += snprintf(hdr + hl, hcap - hl, "{\"__metadata__\":{\"format\":\"moty-q4r4\",\"version\":\"2\"}");
     for (int i = 0; i < nt; i++) {
+        if (!t[i].glue) off = (off + 63) & ~(int64_t)63;
+        at[i] = off;
         hl += snprintf(hdr + hl, hcap - hl, ",\"%s\":{\"dtype\":\"%s\",\"shape\":[%lld],\"data_offsets\":[%lld,%lld]}",
                        t[i].name, t[i].dt, (long long)t[i].n, (long long)off, (long long)(off + t[i].bytes));
         off += t[i].bytes;
     }
     hl += snprintf(hdr + hl, hcap - hl, "}");
-    while (hl % 8) hdr[hl++] = ' ';                                /* data 8-byte aligned */
+    while ((8 + hl) % 64) hdr[hl++] = ' ';                          /* data section 64-byte aligned */
     char path[2048]; snprintf(path, sizeof path, "%s/model.safetensors", dir);
     FILE *f = fopen(path, "wb"); if (!f) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", path, strerror(errno)); }
     uint64_t h64 = (uint64_t)hl;
     fwrite(&h64, 8, 1, f); fwrite(hdr, 1, hl, f);
-    void *buf = NULL; int64_t bcap = 0;
+    void *buf = NULL; int64_t bcap = 0, pos = 0; static const char zero[64];
     for (int i = 0; i < nt; i++) {
-        if (t[i].mem) { if (fwrite(t[i].mem, 1, t[i].bytes, f) != (size_t)t[i].bytes) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", "write", strerror(errno)); } continue; }
-        if (t[i].bytes > bcap) {                   /* local buffer: not grow(), which registers statics */
-            void *nb = realloc(buf, (size_t)t[i].bytes);
-            if (!nb) moty_fail_code(MOTY_FAIL_OOM, "OOM save copy (%lld byte)", (long long)t[i].bytes);
-            buf = nb; bcap = t[i].bytes;
+        if (at[i] > pos) { fwrite(zero, 1, (size_t)(at[i] - pos), f); pos = at[i]; }
+        const void *src = t[i].mem;
+        if (!src) {
+            if (t[i].bytes > bcap) {               /* local buffer: not grow(), which registers statics */
+                void *nb = realloc(buf, (size_t)t[i].bytes);
+                if (!nb) moty_fail_code(MOTY_FAIL_OOM, "OOM save copy (%lld byte)", (long long)t[i].bytes);
+                buf = nb; bcap = t[i].bytes;
+            }
+            st_read_raw(&m->S, m->S.t[t[i].src].name, buf, 1);
+            src = buf;
         }
-        st_read_raw(&m->S, m->S.t[t[i].src].name, buf, 1);
-        if (fwrite(buf, 1, t[i].bytes, f) != (size_t)t[i].bytes) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", "write", strerror(errno)); }
+        if (fwrite(src, 1, t[i].bytes, f) != (size_t)t[i].bytes) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", "write", strerror(errno)); }
+        pos += t[i].bytes;
     }
-    fclose(f); free(buf); free(hdr);
-    static const char *aux[] = { "config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json", "special_tokens_map.json" };
+    fclose(f); free(buf); free(hdr); free(at);
+    static const char *aux[] = { "config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json", "special_tokens_map.json", "chat_template.jinja" };
     for (size_t k = 0; k < sizeof aux / sizeof aux[0]; k++) {
         char src[2048], dst[2048]; snprintf(src, sizeof src, "%s/%s", snap, aux[k]); snprintf(dst, sizeof dst, "%s/%s", dir, aux[k]);
         long n; char *d = NULL; FILE *fs = fopen(src, "rb"); if (!fs) continue; fclose(fs);
         d = slurp_file(src, &n);
         FILE *fd = fopen(dst, "wb"); if (!fd) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", dst, strerror(errno)); } fwrite(d, 1, n, fd); fclose(fd); free(d);
     }
-    fprintf(stderr, "[" ENGINE_TAG "] SAVE_PACKED: %d tensors, %.1f MB -> %s\n", nt, off / 1048576.0, path);
+    fprintf(stderr, "[" ENGINE_TAG "] SAVE_PACKED: %d tensors, %.1f MB -> %s (moty-q4r4 v2)\n", nt, off / 1048576.0, path);
 }
 
 static void model_init(Model *m, const char *snap, int qbits) {

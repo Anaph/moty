@@ -143,12 +143,14 @@ static int engine_main(int argc, char **argv) {
     int ngen = e.ngen, maxctx = e.maxctx, templ = e.templ;
 
     Model m;
+    if (getenv("MMAP")) g_st_map = atoi(getenv("MMAP"));   /* 0 copy, 1 map pre-packed tensors (default), 2 + populate */
     model_init_ex(&m, snap, e.qbits, e.budget, maxctx);
-    const char *savep = getenv("SAVE_PACKED");
-    if (savep && *savep) { model_save_packed(&m, snap, savep); return 0; }
     banner(&m);
     /* banner precede il ramo REF: l'hook gira UNA volta per entrambi i percorsi */
     ENGINE_POST_INIT(&m);
+    /* after the fusion: the writer keeps each fused group's codes back to back */
+    const char *savep = getenv("SAVE_PACKED");
+    if (savep && *savep) { model_save_packed(&m, snap, savep); return 0; }
     if (m.c.max_pos > 0 && maxctx > m.c.max_pos) maxctx = m.c.max_pos;
 
     /* EMBEDS=<file>: raw little-endian f32 rows [N][hidden] that replace the
@@ -294,12 +296,14 @@ static void *eng_open(const char *dir, const MotyEngineOpen *o) {
     if (o->inst_out) *o->inst_out = e;
     g_gguf = NULL; g_micro = 0; g_qgroup = 32;
     g_kv_bits = o->kv_bits; g_embed_disk = o->embed_disk; g_head_topk = 0;
-    g_q4fmt = o->q4fmt; g_q8_tensors = o->q8_tensors; g_prefill_chunk = 0;
+    g_q4fmt = o->q4fmt; g_q8_tensors = o->q8_tensors; g_prefill_chunk = 0; g_st_map = o->mmap;
     g_nstop = 0;                                   /* this TU's stop list: filled below, copied */
     model_init_ex(&e->m, dir, o->qbits, 0, o->ctx);
     const char *why = ENGINE_API_CHECK(&e->m);
     if (why) moty_fail_code(MOTY_FAIL_FORMAT, "%s", why);
+    double tp = now_s();
     ENGINE_POST_INIT(&e->m);
+    LP_MARK(&e->m, LP_FUSE, tp);
     e->ctx = o->ctx;
     if (e->m.c.max_pos > 0 && e->ctx > e->m.c.max_pos) e->ctx = e->m.c.max_pos;
     if (o->head_topk > 0 && moty_nn_head_sl_build(&e->head_sl, &e->m.base.lm_head, o->head_topk))
@@ -307,6 +311,7 @@ static void *eng_open(const char *dir, const MotyEngineOpen *o) {
     char p[2048]; snprintf(p, sizeof p, "%s/tokenizer.json", dir);
     FILE *tf = fopen(p, "rb");
     if (tf) { fclose(tf); tok_load(&e->T, p); e->has_tok = 1; stops_seed(&e->m, &e->T); }
+    LP_MARK(&e->m, LP_TOK, tp);
     for (int i = 0; i < e->m.c.n_eos; i++) stop_add(e->m.c.eos[i]);
     for (int i = 0; i < g_nstop && e->nstop < 16; i++) e->stops[e->nstop++] = g_stop[i];
     g_nstop = 0;
@@ -318,7 +323,13 @@ static void *eng_open(const char *dir, const MotyEngineOpen *o) {
     if (cr) json_free(cr);
     free(cb);
     kv_alloc(&e->m, e->ctx);
-    if (o->log_level >= 2) banner(&e->m);
+    LP_MARK(&e->m, LP_KV, tp);
+    if (o->log_level >= 2) {
+        banner(&e->m);
+        char lb[256]; int n = 0;
+        for (int i = 0; i < LP_N; i++) n += snprintf(lb + n, sizeof lb - n, " %s %.2f", lp_name[i], e->m.base.load_ph[i]);
+        fprintf(stderr, "[" ENGINE_TAG "] open phases (s):%s\n", lb);
+    }
     return e;
 }
 static void eng_close(void *p) {
@@ -402,6 +413,7 @@ static int cli_api_oneshot(void) {
     o.ctx = cli_env_int("CTX", 4096); o.qbits = cli_env_int("QBITS", 4); o.kv_bits = cli_env_int("KV_BITS", 0);
     o.embed_disk = getenv("EMBED") && !strcmp(getenv("EMBED"), "disk");
     o.head_topk = cli_env_int("HEAD_TOPK", 0); o.prefill_chunk = cli_env_int("PREFILL_CHUNK", 0);
+    o.mmap_weights = cli_env_int("MMAP", 1);
     o.log_level = 2;
     moty_model *h; char err[512];
     moty_status rc = moty_model_open_with(&ENG_OPS_NAME(ENGINE_API_ID), NULL, snap, &o, &h, err, sizeof err);

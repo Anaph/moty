@@ -19,7 +19,10 @@ typedef struct Mat { int fmt;             /* WF_F32/WF_I8/WF_I4/WF_I4G/WF_I2/WF_
                      float *f; int8_t *q; float *qs; int O, I;
                      uint8_t *q4; int gs;  /* WF_Q8R4: its int8 codes live in q4 too */
                      uint16_t *s16;       /* WF_Q4R4/Q8R4: f16 group scales [O/4][I/32][4] */
-                     const void *sh; const char *sname; } Mat;
+                     const void *sh; const char *sname;
+                     int borrowed;        /* q4/s16 point into memory the Mat does not own, never
+                                           * freed: 1 a fused parent's buffer, 2 a read-only file mapping */
+                   } Mat;
 
 /* M3: implementazioni in nn/mat.c (libmoty-nn) */
 typedef void (*MotyMatStreamFn)(float *y, const float *x, const struct Mat *w, int S);
@@ -55,6 +58,7 @@ typedef struct MotyCommon {
     int8_t *stream_q; float *stream_qs;              /* QBITS=8: layer streamato int8 */
     Scratch scr, bscr;   /* P5: kernel scratch (reset/kernel) e stream (reset/step) */
     double load_s;
+    double load_ph[8];   /* open phases, seconds (rt_model_load.h LP_*): printed at log level 2 */
 } MotyCommon;
 
 #define MODEL_COMMON_FIELDS \
@@ -67,7 +71,7 @@ static inline void mat_reset_storage(Mat *w) {
     w->fmt = WF_F32;
     w->f = NULL; w->q = NULL; w->qs = NULL;
     w->q4 = NULL; w->gs = 0; w->s16 = NULL;
-    w->sh = NULL; w->sname = NULL;
+    w->sh = NULL; w->sname = NULL; w->borrowed = 0;
 }
 
 

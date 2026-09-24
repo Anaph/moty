@@ -709,3 +709,75 @@ the matching prefix of the text recipe (42.0 vs 11.2 tokens in moty), at
 text-only use of LFM2.5-350M §5.8 stands. `pack_r4.py --calib-tiles` (VL
 calibration: text positions of image sequences) is kept for further
 studies; `tools/ref/hf_vl_rows.py` makes calibration tiles from images.
+
+### 5.15 Time to first token in the library: open without copies
+
+A per-cycle host (the brownai VLM node: open → generate with image rows →
+close, every analysis) pays the model open on every request. Measured on
+board B (RV1126B, brownai running) through the API exactly that way
+(`api/examples/moty_cycle.c`: 4 threads, decode on 3, 64 new tokens; "cold"
+= the container's pages evicted from the page cache first, only that file;
+2 repetitions each, ranges).
+
+Where an open went (per-phase times, `log_level` 2 / `CYCLE_LOG=2`), v1
+containers, copy: VisionPsy int8 6.1–6.4 s = embedding 1.6 s (every open
+read the f32 table and quantized it again) + layers 3.1 s (copy into fresh
+anonymous memory — also with the file in page cache) + fusion 0.4 s (q/k/v
+and gate/up copied again) + tokenizer 0.6 s (one malloc per JSON node).
+
+Changes: pre-packed tensors used in place through a read-only `mmap`
+(`moty_options.mmap_weights`, default 1); container v2 from `SAVE_PACKED`
+(int8 embedding stored, fused groups back to back so the fusion is a view,
+unused tensors dropped: VisionPsy 574 → 432 MB, LFM2.5-VL 609 → 354 MB);
+the JSON tree in an arena. Generation is bit-identical (64/64 ids, v1/v2 ×
+copy/map, both models).
+
+| | open | TTFT incl. open, file cold | TTFT incl. open, file in page cache | peak RSS |
+|---|---|---|---|---|
+| VisionPsy int8, v1 copy (before) | 6.1–6.4 s | 8.5–8.9 s | 8.5–8.9 s | 466 MB |
+| VisionPsy int8, v2 mmap | 0.18–0.20 s | 4.8–5.3 s | 2.6–2.75 s | 392 MB |
+| LFM2.5-VL RTN Q4R4 + Q8 head, l10-15, v1 copy (before) | 3.8–5.5 s | 10.2–12.1 s | — | 398 MB |
+| LFM2.5-VL, v2 mmap | 0.22–0.26 s | 8.2–9.6 s | 6.6–7.5 s | 297 MB |
+
+What remains is the prefill (VisionPsy 78 tokens ~2.4 s, LFM2.5-VL 272
+tokens ~6.3–7.3 s) and, cold, reading the file from flash (~2.2 s for
+432 MB). A node that hashes the container for its signature check just
+before the open reads the file anyway: its open then sees the page-cache
+column.
+
+Tried, not kept:
+- `mmap_weights = 2` (MAP_POPULATE): cold 5.9–6.0 s vs 4.8–5.3 s, RSS 446 vs
+  392 MB (the whole int8 embedding becomes resident).
+- `MADV_WILLNEED` after mapping, to overlap the flash reads with the
+  caller's own work: with a 1.5 s gap between open and generate the
+  prefill still took 4.6–5.0 s cold — no background readahead happened.
+- Int8 prefill tile: the Q8R4 4-row × 4-token tile runs 4.0–4.1 GMAC/s on
+  one A53 core (hot caches, exact int sums). A variant that transposes and
+  widens each group once and uses by-element `SMLAL` int16 (no reduction
+  tree) was exact but slower: 3.4 GMAC/s. `prefill_chunk` 64 vs 0 and 4 vs
+  3 threads: no difference beyond the ±20 % noise of the running detector.
+  The end-to-end int8 prefill (~10 GMAC/s on 4 cores) is near what the tile
+  allows on the cores brownai leaves free.
+
+Memory. Mapped weights are clean file pages, not anonymous memory (RSS
+during a generate, board B):
+
+| | RSS | anonymous | file (clean, reclaimable) |
+|---|---|---|---|
+| VisionPsy int8, copy | 450 MB | 449 MB | 0.8 MB |
+| VisionPsy int8, mmap | 395 MB | 20 MB | 375 MB |
+| LFM2.5-VL, copy | 369 MB | 368 MB | 0.8 MB |
+| LFM2.5-VL, mmap | 300 MB | 23 MB | 278 MB |
+
+The board has no swap, so anonymous memory can only be freed by the
+process; clean file pages the kernel can drop at any time and re-read on
+the next access. A copying open also held each file twice while it ran
+(page cache + the anonymous copy). For contiguous allocations (the RGA's
+CMA region, 48 MB on board B, lent to movable pages while unused) the
+kernel must empty CMA pages: clean file pages are dropped, anonymous ones
+must be migrated, which needs free memory elsewhere. With the weights
+mapped, ~400 MB of the model moves from the second kind to the first. That
+makes CMA reclaim easier; it does not guarantee it (the 132 failures were
+not reproduced here). The price: under pressure the kernel may drop weight
+pages between cycles, and the next prefill re-reads them from flash (the
+cold column).

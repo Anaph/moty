@@ -67,6 +67,7 @@ void moty_options_init(moty_options *o) {
     o->size = sizeof *o; o->qbits = 4; o->log_level = 1;
     o->prefill_chunk = 64;          /* bounds abort latency: 0.86 s measured on a Cortex-A53 */
     o->pool_spin_us = 1000; o->pin_threads = 1;
+    o->mmap_weights = 1;
 }
 void moty_sampling_init(moty_sampling *s) {
     memset(s, 0, sizeof *s);
@@ -95,11 +96,14 @@ moty_status moty_model_open_with(const MotyEngineOps *ops, const MotyEngineOps *
     *out = NULL;
     moty_options o; moty_options_init(&o);
     if (opt) {
-        if (opt->size != (int)sizeof o) { set_err(err, err_len, "moty_options.size mismatch (moty_options_init?)"); return MOTY_ERR_ARG; }
-        o = *opt;
+        /* any published version of the struct: fields it lacks keep their defaults */
+        if (opt->size != (int)sizeof o && opt->size != MOTY_OPTIONS_V1_SIZE) {
+            set_err(err, err_len, "moty_options.size mismatch (moty_options_init?)"); return MOTY_ERR_ARG; }
+        memcpy(&o, opt, (size_t)opt->size); o.size = (int)sizeof o;
     }
     if (o.qbits != 4 && o.qbits != 8) { set_err(err, err_len, "qbits must be 4 or 8"); return MOTY_ERR_ARG; }
     if (o.kv_bits != 0 && o.kv_bits != 8) { set_err(err, err_len, "kv_bits must be 0 or 8"); return MOTY_ERR_ARG; }
+    if (o.mmap_weights < 0 || o.mmap_weights > 2) { set_err(err, err_len, "mmap_weights must be 0, 1 or 2"); return MOTY_ERR_ARG; }
     if (o.threads < 0 || o.threads_decode < 0 || o.ctx < 0 || o.head_topk < 0 || o.prefill_chunk < 0 || o.pool_spin_us < 0) {
         set_err(err, err_len, "negative option"); return MOTY_ERR_ARG; }
     if (!o.ctx) o.ctx = 4096;
@@ -122,7 +126,7 @@ moty_status moty_model_open_with(const MotyEngineOps *ops, const MotyEngineOps *
 #else
                           0,
 #endif
-                          o.log_level, NULL, &m->inst };
+                          o.log_level, NULL, &m->inst, o.mmap_weights };
     pthread_mutex_lock(&g_api_mu);
     moty_par_set_threads(o.threads ? o.threads : moty_par_procs());
     moty_par_config(o.pool_spin_us, o.pin_threads);

@@ -45,7 +45,12 @@ typedef struct {
                            * it sleeps (default 1000; 0 = sleep at once: ~0 CPU when idle, slower decode) */
     int pin_threads;      /* 1 (default): workers pinned one per CPU, the calling thread pinned for
                            * the duration of a call and its affinity restored; 0: no pinning */
+    /* --- v1.1 (additive: a caller built against v1 passes the smaller size) --- */
+    int mmap_weights;     /* pre-packed containers: 1 (default) use the weights in place through a
+                           * read-only mapping (no copy; clean file pages the kernel can reclaim),
+                           * 2 = also read the whole file during open (MAP_POPULATE), 0 = copy */
 } moty_options;
+#define MOTY_OPTIONS_V1_SIZE ((int)offsetof(moty_options, mmap_weights))
 void moty_options_init(moty_options *o);
 
 typedef struct {
