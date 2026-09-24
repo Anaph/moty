@@ -218,7 +218,7 @@ static void st_init_file(shards *S, const char *path) {
     st_hash_build(S);
 }
 
-static st_tensor *st_find(shards *S, const char *name) {
+static st_tensor *st_find_exact(shards *S, const char *name) {
     if (S->hidx) {
         uint64_t h = st_hash(name) & (S->hcap - 1);
         while (S->hidx[h] >= 0) {
@@ -230,6 +230,23 @@ static st_tensor *st_find(shards *S, const char *name) {
     }
     for (int i = 0; i < S->n; i++) if (!strcmp(S->t[i].name, name)) return &S->t[i];
     return NULL;
+}
+/* multimodal HF checkpoints (…ForConditionalGeneration: LFM2-VL, Llava,
+ * Qwen-VL, …) keep the text backbone under "model.language_model.": an
+ * engine asking for "model.X" gets "model.language_model.X" when only that
+ * exists (config.json's text_config is read the same way, runtime.h) */
+static st_tensor *st_find(shards *S, const char *name) {
+    st_tensor *t = st_find_exact(S, name);
+    if (t || strncmp(name, "model.", 6)) return t;
+    char alt[512];
+    if (snprintf(alt, sizeof alt, "model.language_model.%s", name + 6) >= (int)sizeof alt) return NULL;
+    return st_find_exact(S, alt);
+}
+/* the engine-side name of a snapshot tensor ("model.language_model.X" -> "model.X") */
+static const char *st_canon(const char *name, char *buf, size_t n) {
+    if (strncmp(name, "model.language_model.", 21)) return name;
+    snprintf(buf, n, "model.%s", name + 21);
+    return buf;
 }
 static int st_has(shards *S, const char *name) { return st_find(S, name) != NULL; }
 

@@ -131,6 +131,29 @@ static int engine_main(int argc, char **argv) {
     ENGINE_POST_INIT(&m);
     if (m.c.max_pos > 0 && maxctx > m.c.max_pos) maxctx = m.c.max_pos;
 
+    /* EMBEDS=<file>: raw little-endian f32 rows [N][hidden] that replace the
+     * token embedding at every EMBEDS_TOKEN position of the prompt, in order
+     * (e.g. projected image features of a vision-language model; default
+     * token: the snapshot config's image_token_id) */
+    const char *embp = getenv("EMBEDS");
+    if (embp && *embp) {
+        long nbytes = 0; char *eb = slurp_file(embp, &nbytes);
+        int D = m.c.hidden;
+        if (!eb || nbytes <= 0 || nbytes % ((long)D * 4)) {
+            fprintf(stderr, "[" ENGINE_TAG "] EMBEDS %s: need N x %d little-endian f32 (%ld bytes)\n", embp, D, nbytes); return 1;
+        }
+        m.base.inj = (const float *)eb; m.base.inj_n = (int)(nbytes / ((long)D * 4)); m.base.inj_used = 0;
+        m.base.inj_tok = getenv("EMBEDS_TOKEN") ? atoi(getenv("EMBEDS_TOKEN")) : -1;
+        if (m.base.inj_tok < 0 && snap) {           /* multimodal config: image_token_id at the root */
+            char cp[2048]; snprintf(cp, sizeof cp, "%s/config.json", snap);
+            char *cb = slurp_file(cp, NULL); jval *cr = cb ? json_parse(cb) : NULL;
+            jval *it = cr ? json_get(cr, "image_token_id") : NULL;
+            if (it && it->t == J_NUM) m.base.inj_tok = (int)it->num;
+            if (cr) json_free(cr); free(cb);
+        }
+        if (m.base.inj_tok < 0) { fprintf(stderr, "[" ENGINE_TAG "] EMBEDS: set EMBEDS_TOKEN=<placeholder id>\n"); return 1; }
+        fprintf(stderr, "[" ENGINE_TAG "] EMBEDS: %d rows for token %d\n", m.base.inj_n, m.base.inj_tok);
+    }
     const char *refpath = getenv("REF");
     if (refpath) return run_ref(&m, refpath);
     const char *pplpath = getenv("PPL");
@@ -159,6 +182,20 @@ static int engine_main(int argc, char **argv) {
     int *hist = malloc(maxctx * sizeof(int));
     char *buf = malloc(1<<16);
 
+    /* PROMPT_IDS=<json {"ids":[...]}>: a ready token sequence (e.g. a
+     * processor's expansion of text + image placeholders), no template */
+    const char *pids = getenv("PROMPT_IDS");
+    if (pids && *pids) {
+        char *jb = slurp_file(pids, NULL); jval *jr = jb ? json_parse(jb) : NULL;
+        int k = 0; int *ids = jr ? read_int_array(jr, "ids", &k) : NULL;
+        if (!ids || k <= 0 || k + 2 > maxctx) { fprintf(stderr, "[" ENGINE_TAG "] PROMPT_IDS %s: need {\"ids\":[...]} within CTX\n", pids); return 1; }
+        memcpy(hist, ids, k * sizeof(int));
+        int cur = ngen; if (k + cur + 1 > maxctx) cur = maxctx - k - 1;
+        int stopped;
+        gen_turn(&m, &T, hist, 0, k, cur, 1, &stopped);
+        printf("\n");
+        return 0;
+    }
     const char *prompt = getenv("PROMPT");
     if (prompt) {                                   /* one-shot */
         int bl = templ ? build_turn(buf, 1<<16, prompt)

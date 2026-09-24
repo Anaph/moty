@@ -24,8 +24,13 @@ static void lt_norm_w(const char *name, int n) {           /* 1 + small noise */
     for (int i = 0; i < n; i++) w[i] += 1.f;
 }
 
-static void lt_write_dir(const char *dir) {
-    tst_write_text(dir, "config.json",
+/* wrap = 1: the layout of a multimodal checkpoint (LFM2-VL): config under
+ * text_config, tensors under "model.language_model." */
+static void lt_write_dir_w(const char *dir, int wrap);
+static void lt_write_dir(const char *dir) { lt_write_dir_w(dir, 0); }
+static void lt_write_dir_w(const char *dir, int wrap) {
+    char cfg[2048];
+    snprintf(cfg, sizeof cfg, "%s%s%s", wrap ? "{\"model_type\":\"lfm2_vl\",\"image_token_id\":38,\"text_config\":" : "",
         "{\"architectures\":[\"Lfm2ForCausalLM\"],\"model_type\":\"lfm2\","
         "\"hidden_size\":32,\"num_hidden_layers\":4,\"num_attention_heads\":4,"
         "\"num_key_value_heads\":2,\"intermediate_size\":100,"
@@ -33,15 +38,17 @@ static void lt_write_dir(const char *dir) {
         "\"vocab_size\":40,\"norm_eps\":1e-05,\"conv_L_cache\":3,\"conv_bias\":false,"
         "\"rope_parameters\":{\"rope_theta\":10000.0,\"rope_type\":\"default\"},"
         "\"tie_embedding\":true,\"eos_token_id\":7,\"max_position_embeddings\":256,"
-        "\"layer_types\":[\"conv\",\"full_attention\",\"conv\",\"full_attention\"]}");
+        "\"layer_types\":[\"conv\",\"full_attention\",\"conv\",\"full_attention\"]}", wrap ? "}" : "");
+    tst_write_text(dir, "config.json", cfg);
     tst_reset(11);
     char nm[128];
-    tst_add("model.embed_tokens.weight", "[40,32]", LV*LD, 1.0f, 0);
-    lt_norm_w("model.embedding_norm.weight", LD);
+    const char *pf = wrap ? "model.language_model." : "model.";
+    snprintf(nm, sizeof nm, "%sembed_tokens.weight", pf); tst_add(nm, "[40,32]", LV*LD, 1.0f, 0);
+    snprintf(nm, sizeof nm, "%sembedding_norm.weight", pf); lt_norm_w(nm, LD);
     for (int i = 0; i < LL; i++) {
         #define AT(suffix, shape, numel, sc) \
-            do { snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); tst_add(nm,shape,numel,sc,0); } while(0)
-        #define ATN(suffix, n) do { snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); lt_norm_w(nm,n); } while(0)
+            do { snprintf(nm,sizeof(nm),"%slayers.%d." suffix,pf,i); tst_add(nm,shape,numel,sc,0); } while(0)
+        #define ATN(suffix, n) do { snprintf(nm,sizeof(nm),"%slayers.%d." suffix,pf,i); lt_norm_w(nm,n); } while(0)
         ATN("operator_norm.weight", LD);
         ATN("ffn_norm.weight", LD);
         if (lt_is_attn[i]) {
@@ -290,6 +297,47 @@ int lt_mixed_roundtrip(void) {
     lt_engine_logits(&a, 3, T, la); lt_engine_logits(&b, 3, T, lb);
     CHECK(!memcmp(la + 2*LV, lb + 2*LV, (size_t)(T-2)*LV*sizeof(float)));
     g_q4fmt = save; g_q8_tensors = save8;
+    free(la); free(lb);
+    return 0;
+}
+
+/* a multimodal wrapper (text_config + "model.language_model." names) loads
+ * the same text model: identical logits */
+int lt_vl_wrapped(void) {
+    const char *d0 = tst_dir("lfm2_tiny_plain"), *d1 = tst_dir("lfm2_tiny_vlwrap");
+    lt_write_dir_w(d0, 0); lt_write_dir_w(d1, 1);
+    char s0[512], s1[512]; snprintf(s0, sizeof s0, "%s", d0); snprintf(s1, sizeof s1, "%s", d1);
+    Model a, b; model_init(&a, s0, 0); model_init(&b, s1, 0);
+    CHECK(b.c.n_layers == a.c.n_layers && b.c.vocab == a.c.vocab && b.base.lm_tied);
+    int T = 6;
+    float *la = calloc((size_t)T*LV, sizeof(float)), *lb = calloc((size_t)T*LV, sizeof(float));
+    kv_alloc(&a, 16); kv_alloc(&b, 16);
+    lt_engine_logits(&a, 3, T, la); lt_engine_logits(&b, 3, T, lb);
+    CHECK(!memcmp(la + 2*LV, lb + 2*LV, (size_t)(T-2)*LV*sizeof(float)));
+    free(la); free(lb);
+    return 0;
+}
+
+/* EMBEDS: rows injected at placeholder positions replace the token
+ * embedding. Injecting token X's own embedding row at a placeholder gives
+ * exactly the logits of the prompt with X there. */
+int lt_embed_inject(void) {
+    const char *dir = tst_dir("lfm2_tiny_inject");
+    lt_write_dir(dir);
+    char src[512]; snprintf(src, sizeof src, "%s", dir);
+    enum { NP = 6, P = 38 };
+    Model a, b; model_init(&a, src, 0); model_init(&b, src, 0);
+    int ids[NP], idp[NP];
+    for (int i = 0; i < NP; i++) ids[i] = idp[i] = lt_ids[i];
+    idp[1] = P; idp[4] = P;                        /* two placeholders, consumed in order */
+    float rows[2*LD];
+    memcpy(rows, a.base.embed + (int64_t)ids[1]*LD, LD*sizeof(float));
+    memcpy(rows + LD, a.base.embed + (int64_t)ids[4]*LD, LD*sizeof(float));
+    b.base.inj = rows; b.base.inj_n = 2; b.base.inj_used = 0; b.base.inj_tok = P;
+    kv_alloc(&a, 16); kv_alloc(&b, 16);
+    float *la = step(&a, ids, NP, 0), *lb = step(&b, idp, NP, 0);
+    CHECK(b.base.inj_used == 2);
+    CHECK(!memcmp(la, lb, LV*sizeof(float)));
     free(la); free(lb);
     return 0;
 }

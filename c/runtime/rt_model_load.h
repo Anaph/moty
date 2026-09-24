@@ -438,7 +438,8 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
 #include <sys/stat.h>
 #define rt_mkdir(p) mkdir(p, 0755)
 #endif
-static int pk_name_is(Model *m, const char *name, Mat **out) {
+static int pk_name_is(Model *m, const char *sname, Mat **out) {
+    char cb[512]; const char *name = st_canon(sname, cb, sizeof cb);
     if (!strcmp(name, "lm_head.weight") && (m->base.lm_head.fmt == WF_Q4R4 || m->base.lm_head.fmt == WF_Q8R4)) { *out = &m->base.lm_head; return 1; }
     for (int i = 0; i < m->c.n_layers; i++) {
         MatRef r[MAX_LAYER_MATS]; int n = layer_matrefs(m, i, r);
@@ -521,6 +522,14 @@ static void model_init(Model *m, const char *snap, int qbits) {
  * open-coded in tre punti fra i due motori. */
 static void embed_row(Model *m, int id, float scale, float *dst) {
     int D = m->c.hidden;
+    if (m->base.inj && id == m->base.inj_tok) {     /* EMBEDS: the next external row, as is */
+        if (m->base.inj_used >= m->base.inj_n) {
+            fprintf(stderr, "[" ENGINE_TAG "] EMBEDS: more placeholder tokens (%d) than rows (%d)\n",
+                    m->base.inj_used + 1, m->base.inj_n); exit(1);
+        }
+        memcpy(dst, m->base.inj + (int64_t)m->base.inj_used++ * D, D*sizeof(float));
+        return;
+    }
     if (m->base.embed) {
         const float *er = m->base.embed + (int64_t)id*D;
         if (scale == 1.f) memcpy(dst, er, D*sizeof(float));
