@@ -11,7 +11,12 @@
 #define ENGINE_TAG "lfm2moe"
 #define ENGINE_MICRO 0
 #define ENGINE_EOT "<|im_end|>\n"
+/* library (runtime/engine_api.h): dense LFM2 / LFM2.5 and the LFM2-VL text backbone */
+#define ENGINE_API_ID lfm2
+#define ENGINE_API_TYPES "lfm2", "lfm2_vl"
+#define ENGINE_API_CHECK(m) ((m)->c.n_experts > 0 ? "LFM2-MoE is not served by the library (dense LFM2 only)" : NULL)
 
+#include "nn/track.h"   /* first: heap calls go through the open tracker */
 #include <stdio.h>
 #include <malloc.h>
 #include <stdlib.h>
@@ -143,7 +148,7 @@ static void load_small(Model *m) {
     int hd = c->head_dim;
     m->L = calloc(L, sizeof(Layer));
     g_lfm_hf = st_has(&m->S, "model.embedding_norm.weight");
-    char nm[128]; int cap = getenv("EXPERT_CACHE") ? atoi(getenv("EXPERT_CACHE")) : 0;
+    char nm[128]; int cap = moty_getenv("EXPERT_CACHE") ? atoi(moty_getenv("EXPERT_CACHE")) : 0;
     if (cap < 1) cap = c->n_experts;
     for (int i = 0; i < L; i++) {
         Layer *l = &m->L[i];
@@ -358,7 +363,7 @@ static void banner(Model *m) {
         m->base.load_s, rss_gb(), IDOT_KERNEL, F32_KERNEL);
 }
 
-#ifndef LFM2_TEST
+#if !defined(LFM2_TEST) && !defined(MOTY_NO_MAIN)   /* MOTY_NO_MAIN: libmoty */
 int main(int argc, char **argv) {
 #ifdef M_MMAP_THRESHOLD                    /* glibc: logits 512KB, niente mmap/munmap per token */
     mallopt(M_MMAP_THRESHOLD, 8*1024*1024);

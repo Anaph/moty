@@ -20,6 +20,8 @@
 /* OpenMP: header reale se compilato con -fopenmp, altrimenti stub inline a
  * un thread, cosi' i chiamanti (THREADS, scratch per-thread) non hanno
  * bisogno di #ifdef sparsi. Vive qui (fondazione) perche' gemm/att lo usano. */
+#include "nn/fail.h"           /* moty_fail, the open tracker (library calls) */
+#include "nn/track.h"          /* heap calls through the tracker wrappers */
 #include "nn/par.h"            /* the parallel loops: OpenMP or the MOTY_THREADPOOL pool */
 #ifdef _OPENMP
 #include <omp.h>
@@ -48,9 +50,13 @@ static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t
 typedef struct Scratch { char *raw; int off; char *base; int64_t cap, used; } Scratch;
 
 /* ---------- allocatori + arena: prototipi (nn/alloc.c) ---------- */
+/* grow: a buffer that lives as long as the process (a function-level static
+ * reused across calls): p and cap must point to STATIC storage — the first growth
+ * registers them and moty_release_scratch_all() frees and zeroes them. */
 void *moty_grow(void **p, int64_t *cap, int64_t need, size_t esz, const char *what);
 void *moty_balloc(int64_t n, const char *what);
 void *moty_bzalloc(int64_t n, const char *what);
+void  moty_bfree(void *p);                 /* free of a balloc'd block (open tracker aware) */
 static inline float *moty_falloc(int64_t n) { return (float *)moty_balloc(n*sizeof(float), "f32"); }
 
 void  moty_scr_reset(Scratch *s);

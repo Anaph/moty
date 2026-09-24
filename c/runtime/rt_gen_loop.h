@@ -36,7 +36,7 @@ static float *step_chunked(Model *m, const int *ids, int S, int pos_base) {
 /* ---------- ref.json (validazione) ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
-    if (!a) { fprintf(stderr, "ref.json: manca %s\n", key); exit(1); }
+    if (!a) { moty_fail_code(MOTY_FAIL_FORMAT, "ref.json: manca %s\n", key); }
     int *r = malloc(a->len * sizeof(int));
     for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
     *n_out = a->len; return r;
@@ -61,7 +61,7 @@ static int run_ref(Model *m, const char *refpath) {
     const char *lpath = getenv("REF_LOGITS");
     if (lpath && *lpath) {
         FILE *lf = fopen(lpath, "wb");
-        if (!lf || fwrite(logit, sizeof(float), m->c.vocab, lf) != (size_t)m->c.vocab) { perror(lpath); exit(1); }
+        if (!lf || fwrite(logit, sizeof(float), m->c.vocab, lf) != (size_t)m->c.vocab) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", lpath, strerror(errno)); }
         fclose(lf);
     }
     int len = np;

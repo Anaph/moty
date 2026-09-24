@@ -31,6 +31,13 @@ int  moty_par_tid(void);           /* 0 outside a region */
 int  moty_par_active(void);        /* inside a region */
 const char *moty_par_backend(void);
 
+/* pthread pool only (no-ops for OpenMP / serial): */
+void moty_par_config(long spin_us, int pin);   /* poll time after a region (0: sleep at once), pin workers */
+void moty_par_shutdown(void);                  /* join the workers; restarted on the next region */
+typedef struct { int pinned; unsigned char mask[128]; } MotyParCaller;
+void moty_par_enter(MotyParCaller *c);         /* pin the caller (tid 0) for a library call ... */
+void moty_par_leave(MotyParCaller *c);         /* ... and restore its affinity */
+
 /* the static split of [0, n) for thread t of nt (libgomp's: the first
  * n % nt threads get one more index) */
 static inline void moty_par_range(int64_t n, int t, int nt, int64_t *i0, int64_t *i1) {

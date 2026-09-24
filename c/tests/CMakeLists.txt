@@ -34,6 +34,7 @@ if(MOTY_THREADPOOL)                  # see c/CMakeLists.txt
 else()
   find_package(OpenMP)
 endif()
+find_package(Threads REQUIRED)       # nn/alloc.c (registries, the pool) uses pthreads in every build
 enable_testing()
 include(GoogleTest)
 set(ENGDIR ${CMAKE_CURRENT_SOURCE_DIR}/..)
@@ -46,14 +47,14 @@ set(MOTY_TEST_MARCH "" CACHE STRING "march per i sorgenti C dei test (es. native
 # delle librerie; standalone (cmake -S tests) se li costruisce come prima.
 if(NOT TARGET moty_hw)
 # libmoty-runtime (M4)
-add_library(moty_rt STATIC ../runtime/env.c ../runtime/kvcache.c)
+add_library(moty_rt STATIC ../runtime/env.c ../runtime/kvcache.c ../api/api.c)
 target_include_directories(moty_rt PRIVATE ${ENGDIR})
 target_link_libraries(moty_rt PRIVATE moty_core moty_hw)
 if(OpenMP_C_FOUND)
   target_link_libraries(moty_rt PRIVATE OpenMP::OpenMP_C)
 endif()
 if(MOTY_TEST_MARCH)
-  set_source_files_properties(../runtime/env.c ../runtime/kvcache.c PROPERTIES COMPILE_OPTIONS "-march=${MOTY_TEST_MARCH}")
+  set_source_files_properties(../runtime/env.c ../runtime/kvcache.c ../api/api.c PROPERTIES COMPILE_OPTIONS "-march=${MOTY_TEST_MARCH}")
 endif()
 
 # libmoty-hw (M1): la stessa implementazione unica dei kernel che usano i
@@ -71,6 +72,7 @@ set(MOTY_NN_SRCS ../nn/par.c ../nn/alloc.c ../nn/quant.c ../nn/mat.c ../nn/matmu
 add_library(moty_core STATIC ${MOTY_NN_SRCS})
 target_include_directories(moty_core PRIVATE ${ENGDIR})
 target_link_libraries(moty_core PRIVATE moty_hw)
+target_link_libraries(moty_core PUBLIC Threads::Threads)
 if(OpenMP_C_FOUND)
   target_link_libraries(moty_core PRIVATE OpenMP::OpenMP_C)
 endif()
@@ -130,6 +132,20 @@ moty_test(test_q4r4    q4r4_tests.c    q4r4_gtest.cc)
 moty_test(test_ops     ops_tests.c     ops_gtest.cc)
 moty_test(test_head    head_tests.c    head_gtest.cc)
 moty_test(test_par     par_tests.c     par_gtest.cc)
+# the library API: the lfm2 and qwen engines (main renamed) + the registry
+if(TARGET lfm2_obj)
+  set(MOTY_API_ENGINES $<TARGET_OBJECTS:lfm2_obj> $<TARGET_OBJECTS:qwen_obj>)
+else()
+  add_library(moty_test_engines OBJECT ../engines/lfm2.c ../engines/qwen.c)
+  target_include_directories(moty_test_engines PRIVATE ${ENGDIR})
+  set_source_files_properties(../engines/lfm2.c PROPERTIES COMPILE_DEFINITIONS main=lfm2_main)
+  set_source_files_properties(../engines/qwen.c PROPERTIES COMPILE_DEFINITIONS main=qwen_main)
+  if(OpenMP_C_FOUND)
+    target_link_libraries(moty_test_engines PRIVATE OpenMP::OpenMP_C)
+  endif()
+  set(MOTY_API_ENGINES $<TARGET_OBJECTS:moty_test_engines>)
+endif()
+moty_test(test_api     api_tests.c     api_gtest.cc ../api/registry.c ${MOTY_API_ENGINES})
 moty_test(test_gemma   gemma_tests.c   gemma_gtest.cc)
 moty_test(test_glm     glm_tests.c     glm_gtest.cc)
 
@@ -145,7 +161,7 @@ file(GENERATE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/prof_tests_on.c CONTENT "#defin
 # utility C pura (non un test ctest): parita' del tokenizer contro un corpus HF
 add_executable(tok_oracle tok_oracle.c)
 target_include_directories(tok_oracle PRIVATE ${ENGDIR})
-target_link_libraries(tok_oracle PRIVATE m)
+target_link_libraries(tok_oracle PRIVATE moty_core moty_hw m)   # tok.h reports errors via nn/fail.h
 
 # utility C pura (non un test ctest): micro-bench dei percorsi caldi
 add_executable(bench bench.c)

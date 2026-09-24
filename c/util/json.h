@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include "nn/fail.h"          /* moty_fail: library calls return, the CLI exits */
 
 typedef enum { J_NULL, J_BOOL, J_NUM, J_STR, J_ARR, J_OBJ } jtype;
 
@@ -44,11 +45,11 @@ static char *j_dup(const char *b, int n) {
  * libera). Tutti i consumatori di JSON su file passano da qui. */
 static char *slurp_file(const char *path, long *out_n) {
     FILE *f = fopen(path, "rb");
-    if (!f) { perror(path); exit(1); }
+    if (!f) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", path, strerror(errno)); }
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
     char *b = (char *)malloc(n + 1);
     if (!b || fread(b, 1, n, f) != (size_t)n) {
-        fprintf(stderr, "%s: lettura fallita\n", path); exit(1);
+        moty_fail_code(MOTY_FAIL_FORMAT, "%s: lettura fallita\n", path);
     }
     b[n] = 0; fclose(f);
     if (out_n) *out_n = n;

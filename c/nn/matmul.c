@@ -50,7 +50,7 @@ static void q8_f32_rows(void *c_, int64_t o0, int64_t o1, int tid) {
 
 void moty_matmul_q_s(float *y, const float *x, const int8_t *q, const float *scale, int S, int I, int O) {
     static int idot = -1;
-    if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
+    if (idot < 0) { const char *e = moty_getenv("IDOT"); idot = !(e && *e == '0'); }
     if (idot && I <= NN_QROW_MAX) {
         static int8_t *xi = NULL; static float *sx = NULL;
         static int64_t xcap = 0, scap = 0;
@@ -74,7 +74,7 @@ static void i4_f32_rows(void *c_, int64_t o0, int64_t o1, int tid);
 
 void moty_matmul_i4_s(float *y, const float *x, const uint8_t *q4, const float *scale, int S, int I, int O) {
     static int idot4 = -1;
-    if (idot4 < 0) { const char *e = getenv("IDOT4"); idot4 = e ? atoi(e) : 0; }
+    if (idot4 < 0) { const char *e = moty_getenv("IDOT4"); idot4 = e ? atoi(e) : 0; }
     if (idot4 && I <= NN_QROW_MAX) {
         static int8_t *xi = NULL; static float *sx = NULL;
         static int64_t xcap = 0, scap = 0;
@@ -168,7 +168,7 @@ void moty_matmul_i4_grouped_s(float *y, const float *x, const uint8_t *q4, const
 #if defined(__AVX512F__) && defined(__AVX512VNNI__)
     {
         static int idot4 = -1;
-        if (idot4 < 0) { const char *e = getenv("IDOT4"); idot4 = e ? atoi(e) : 0; }
+        if (idot4 < 0) { const char *e = moty_getenv("IDOT4"); idot4 = e ? atoi(e) : 0; }
         if (idot4 && gs == 32 && (I & 63) == 0 && I <= NN_QROW_MAX) {
             int ng = I / 32;
             static int8_t *xi = NULL; static int32_t *xg = NULL; static float *sx = NULL;

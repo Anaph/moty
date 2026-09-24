@@ -69,7 +69,7 @@ typedef struct {
 /* bump allocator sul pool (dimensionato esattamente da un passo di sizing:
  * lo sforamento e' un bug di conteggio, non una condizione di runtime) */
 static char *tk_pool_take(Tok *T, int64_t n){
-    if (T->pool_off + n > T->pool_len) { fprintf(stderr,"[tok] pool overflow (bug di sizing)\n"); exit(1); }
+    if (T->pool_off + n > T->pool_len) { moty_fail_code(MOTY_FAIL_FORMAT, "[tok] pool overflow (bug di sizing)\n"); }
     char *p = T->pool + T->pool_off; T->pool_off += n; return p;
 }
 static char *tk_pool_dup(Tok *T, const char *s, int n){   /* copia NUL-terminata */
@@ -135,7 +135,7 @@ static void tok_load(Tok *T, const char *path){
     jval *vocab=json_get(model,"vocab");
     jval *merges=json_get(model,"merges");
     jval *added=json_get(root,"added_tokens");
-    if(!vocab||!merges){ fprintf(stderr,"tokenizer.json: missing model.vocab/merges\n"); exit(1); }
+    if(!vocab||!merges){ moty_fail_code(MOTY_FAIL_FORMAT, "tokenizer.json: missing model.vocab/merges\n"); }
     /* modalita': byte_fallback=true e' la firma SentencePiece (assente/false su
      * GLM/Qwen byte-level) */
     jval *bf=json_get(model,"byte_fallback");
@@ -183,7 +183,7 @@ static void tok_load(Tok *T, const char *path){
         jval *pr=merges->kids[i];
         if(pr->t==J_STR){
             const char *sp=strchr(pr->str,' ');
-            if(!sp){ fprintf(stderr,"tokenizer.json: merge senza spazio: %s\n",pr->str); exit(1); }
+            if(!sp){ moty_fail_code(MOTY_FAIL_FORMAT, "tokenizer.json: merge senza spazio: %s\n",pr->str); }
             psz += (int64_t)strlen(pr->str);           /* ll+1+rl: lo spazio diventa NUL */
         } else {
             psz += (int64_t)strlen(pr->kids[0]->str) + 1 + strlen(pr->kids[1]->str);
@@ -192,7 +192,7 @@ static void tok_load(Tok *T, const char *path){
     if(added) for(int i=0;i<added->len;i++) psz += (int64_t)strlen(json_get(added->kids[i],"content")->str) + 1;
     T->pool_len=psz; T->pool_off=0;
     T->pool=malloc(psz > 0 ? psz : 1);
-    if(!T->pool){ fprintf(stderr,"[tok] OOM pool %lld\n",(long long)psz); exit(1); }
+    if(!T->pool){ moty_fail_code(MOTY_FAIL_OOM, "[tok] OOM pool %lld\n",(long long)psz); }
 
     /* vocab: stringa -> id  (capacita' potenza di 2, ~2-3x) */
     int vc=1; while(vc < vocab->len*2) vc<<=1;
@@ -276,12 +276,12 @@ static void tok_load_gguf(Tok *T, GgufMeta *M) {
     tk_build_bytemap(T);
     int64_t ml; const char *mdl = gguf_str(M, "tokenizer.ggml.model", &ml);
     if (!mdl || ml != 4 || memcmp(mdl, "gpt2", 4)) {
-        fprintf(stderr, "[tok] GGUF: tokenizer.ggml.model non 'gpt2' (solo byte-level BPE)\n"); exit(1);
+        moty_fail_code(MOTY_FAIL_FORMAT, "[tok] GGUF: tokenizer.ggml.model non 'gpt2' (solo byte-level BPE)\n");
     }
     T->mode = 0;
     garr toks, types, mrg;
     if (!gguf_arr(M, "tokenizer.ggml.tokens", &toks)) {
-        fprintf(stderr, "[tok] GGUF: manca tokenizer.ggml.tokens\n"); exit(1); }
+        moty_fail_code(MOTY_FAIL_FORMAT, "[tok] GGUF: manca tokenizer.ggml.tokens\n"); }
     int64_t nvoc = toks.left;
     int have_types  = gguf_arr(M, "tokenizer.ggml.token_type", &types);
     int have_merges = gguf_arr(M, "tokenizer.ggml.merges", &mrg);
@@ -292,7 +292,7 @@ static void tok_load_gguf(Tok *T, GgufMeta *M) {
     if (have_merges) { it = mrg; while (garr_next_str(&it, &l)) psz += l; }
     T->pool_len = psz; T->pool_off = 0;
     T->pool = malloc(psz > 0 ? psz : 1);
-    if (!T->pool) { fprintf(stderr, "[tok] OOM pool %lld\n", (long long)psz); exit(1); }
+    if (!T->pool) { moty_fail_code(MOTY_FAIL_OOM, "[tok] OOM pool %lld\n", (long long)psz); }
     T->n_ids = (int)nvoc;
     T->id2str = calloc(T->n_ids, sizeof(char*));
     T->id_added = calloc(T->n_ids, sizeof(int));
@@ -301,7 +301,7 @@ static void tok_load_gguf(Tok *T, GgufMeta *M) {
     int nsp = 0;
     for (int64_t id = 0; id < nvoc; id++) {
         const char *s = garr_next_str(&toks, &l);
-        if (!s) { fprintf(stderr, "[tok] GGUF: array tokens troncato\n"); exit(1); }
+        if (!s) { moty_fail_code(MOTY_FAIL_FORMAT, "[tok] GGUF: array tokens troncato\n"); }
         char *k = tk_pool_dup(T, s, (int)l);
         hm_put(&T->vocab, k, (int)l, (int)id);
         T->id2str[id] = k;
@@ -313,7 +313,7 @@ static void tok_load_gguf(Tok *T, GgufMeta *M) {
     if (have_merges) for (int64_t i = 0; i < nmerg; i++) {
         const char *s = garr_next_str(&mrg, &l);
         const char *sp = s ? memchr(s, ' ', l) : NULL;
-        if (!sp) { fprintf(stderr, "[tok] GGUF: merge senza spazio\n"); exit(1); }
+        if (!sp) { moty_fail_code(MOTY_FAIL_FORMAT, "[tok] GGUF: merge senza spazio\n"); }
         int ll = (int)(sp - s), rl = (int)(l - ll - 1);
         char *key = tk_pool_take(T, ll + 1 + rl);
         memcpy(key, s, ll); key[ll] = 0; memcpy(key+ll+1, sp+1, rl);

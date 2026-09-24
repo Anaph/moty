@@ -2,6 +2,7 @@
  * Firme moty_*; nn/nn_quant.h dichiara i prototipi + le macro legacy. */
 #include "nn/nn_quant.h"
 #include "nn/par.h"
+#include "nn/fail.h"
 #include <string.h>
 #include "hw/hw.h"
 
@@ -76,7 +77,7 @@ static void pack_int4_grouped_part(void *c_, int64_t o0, int64_t o1, int tid) {
 }
 
 void moty_pack_int4_grouped(const float *w, uint8_t *q4, float *scale, int O, int I, int gs) {
-    if (gs % 16) { fprintf(stderr, "pack_int4_grouped: gs=%d non multiplo di 16\n", gs); exit(1); }
+    if (gs % 16) { moty_fail_code(MOTY_FAIL_FORMAT, "pack_int4_grouped: gs=%d non multiplo di 16\n", gs); }
     PackJob c = { w, q4, scale, I, 4, gs };
     moty_par_for(O, 0, pack_int4_grouped_part, &c);
 }

@@ -21,6 +21,7 @@ make qwen       # just one engine
 make portable   # portable CPU baseline (x86-64-v3 / armv8-a / power8)
 make test       # test suite (GoogleTest via a separate CMake build path)
 make THREADPOOL=1   # no OpenMP runtime needed: moty's own pthread pool
+make clean && make THREADPOOL=1 libmoty.a   # the embeddable library (c/api/moty.h, docs/api.md)
 
 # CMake build of record (same sources, same libraries):
 cmake -B c/build -S c && cmake --build c/build -j       # portable tier
@@ -44,6 +45,11 @@ instead of running single-threaded. The dense kernels (matmuls, attention,
 conv, FFN, head, sampling, loading) use it; the MoE and DeltaNet regions
 and the glm/olmoe/qwenmoe/gemma engines' own regions run serially in that
 build.
+
+**Embedding moty in another program**: [docs/api.md](docs/api.md) — a C API
+(`c/api/moty.h`, `libmoty.a`) to open a model, run it on token ids or text
+with injected embedding rows, stream tokens through a callback, abort from
+another thread; no `exit()`, no environment, memory returned on close.
 
 The engines build with the C compiler alone. `make test` additionally needs
 cmake ≥ 3.24 and a C++ compiler for the GoogleTest harness (test logic itself

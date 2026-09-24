@@ -66,7 +66,7 @@ void moty_nn_conv_layer(const MotyConvView *cv, const float *x, int S, float *ou
     int vnni_in  = (wi->fmt == WF_I4G && gs == 32 && (D & 63) == 0);
     int vnni_out = (wo->fmt == WF_I4G && wo->gs == 32 && (D & 63) == 0);
     { static int conv_new = -1;
-      if (conv_new < 0) { const char *e = getenv("CONV_VNNI"); conv_new = e ? atoi(e) : 1; }
+      if (conv_new < 0) { const char *e = moty_getenv("CONV_VNNI"); conv_new = e ? atoi(e) : 1; }
       if (!conv_new) { vnni_in = 0; vnni_out = 0; } }
     if (!vnni_in || !vnni_out) {
         /* path legacy: proiezioni batched via mat_apply (2 fork/join) */

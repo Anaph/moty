@@ -22,7 +22,15 @@ set(MOTY_ARCH "" CACHE STRING "march (vuoto: portable; 'native': questa macchina
 
 # MOTY_THREADPOOL: no OpenMP runtime (a clang toolchain without libomp);
 # the parallel loops run on moty's own pthread pool (nn/par.c)
-option(MOTY_THREADPOOL "pthread pool instead of OpenMP" OFF)
+# MOTY_LIBRARY_ONLY: the embeddable library (libmoty, api/moty.h) is what the
+# consumer wants — the pthread pool is then the default (no libomp needed)
+option(MOTY_LIBRARY_ONLY "build for libmoty consumers (pthread pool by default, no tests)" OFF)
+if(MOTY_LIBRARY_ONLY)
+  set(_moty_tp_default ON)
+else()
+  set(_moty_tp_default OFF)
+endif()
+option(MOTY_THREADPOOL "pthread pool instead of OpenMP" ${_moty_tp_default})
 if(MOTY_THREADPOOL)
   set(OpenMP_C_FOUND FALSE)
   set(THREADS_PREFER_PTHREAD_FLAG ON)
@@ -75,9 +83,10 @@ set(MOTY_NN_SRCS nn/par.c nn/alloc.c nn/quant.c nn/mat.c nn/matmul.c nn/norm.c n
                  nn/attn_kernels.c nn/sample.c nn/attn.c nn/conv.c nn/ffn.c
                  nn/moe.c nn/head.c runtime/moecache.c io/tier.c)
 add_library(moty_nn STATIC ${MOTY_NN_SRCS})
-target_link_libraries(moty_nn PUBLIC moty_hw)
+find_package(Threads REQUIRED)       # nn/alloc.c (registries, the pool) uses pthreads in every build
+target_link_libraries(moty_nn PUBLIC moty_hw Threads::Threads)
 
-add_library(moty_rt STATIC runtime/env.c runtime/kvcache.c)
+add_library(moty_rt STATIC runtime/env.c runtime/kvcache.c api/api.c)
 target_link_libraries(moty_rt PUBLIC moty_nn moty_hw)
 
 # ---- motori: ogni engines/X.c con main rinominato, come nel Makefile ----
@@ -98,6 +107,23 @@ endfunction()
 foreach(e lfm2 qwenmoe qwen olmoe gemma glm)
   moty_engine(${e})
 endforeach()
+
+# ---- libmoty: the embeddable library (api/moty.h, docs/api.md) ----
+# one archive with the three layers, the lfm2 and qwen engines and the
+# registry that picks one by config.json model_type
+add_library(moty_lib_engines OBJECT engines/lfm2.c engines/qwen.c)
+target_compile_definitions(moty_lib_engines PRIVATE MOTY_NO_MAIN)       # no main in the library
+set_target_properties(moty_lib_engines PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_library(moty_lib STATIC ${MOTY_NN_SRCS} hw/hw.c runtime/env.c runtime/kvcache.c api/api.c api/registry.c
+            $<TARGET_OBJECTS:moty_lib_engines>)
+set_target_properties(moty_lib PROPERTIES OUTPUT_NAME moty POSITION_INDEPENDENT_CODE ON)
+target_include_directories(moty_lib INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/api> $<INSTALL_INTERFACE:include>)
+if(OpenMP_C_FOUND)
+  target_link_libraries(moty_lib PUBLIC OpenMP::OpenMP_C)
+endif()
+target_link_libraries(moty_lib PUBLIC m Threads::Threads)
+install(TARGETS moty_lib ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
+install(FILES api/moty.h DESTINATION include)
 
 add_executable(moty moty.c
   $<TARGET_OBJECTS:lfm2_obj> $<TARGET_OBJECTS:qwenmoe_obj>

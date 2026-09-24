@@ -37,11 +37,19 @@ int  moty_par_procs(void)        { return omp_get_num_procs(); }
 int  moty_par_tid(void)          { return omp_get_thread_num(); }
 int  moty_par_active(void)       { return omp_in_parallel(); }
 const char *moty_par_backend(void) { return "openmp"; }
+void moty_par_config(long spin_us, int pin) { (void)spin_us; (void)pin; }
+void moty_par_enter(MotyParCaller *c) { (void)c; }
+void moty_par_leave(MotyParCaller *c) { (void)c; }
+void moty_par_shutdown(void) {}
 
 #elif defined(MOTY_THREADPOOL)
 #include <pthread.h>
+#include <string.h>
+#include <errno.h>
+#include "nn/fail.h"
 #include <sched.h>
 #include <stdatomic.h>
+#include <time.h>
 
 #define PAR_MAX 64
 
@@ -54,6 +62,7 @@ const char *moty_par_backend(void) { return "openmp"; }
 #endif
 
 typedef struct {                    /* one cache line per worker */
+    pthread_t th;
     atomic_int sleeping;
     unsigned start_gen;             /* `gen` when the worker was created */
     pthread_mutex_t mu;
@@ -64,8 +73,10 @@ typedef struct {                    /* one cache line per worker */
 static struct {
     int want;                       /* team size of the next region */
     int started;                    /* workers running (tids 1..started) */
-    long spin;                      /* polls before a worker sleeps */
-    int pin;
+    atomic_long spin_us;            /* a worker polls this long after a region, then sleeps */
+    atomic_int pin;                 /* both set by each library call while idle workers read them */
+    int configured;
+    atomic_int quit;                /* moty_par_shutdown */
     /* the current region, published by `gen` */
     moty_par_fn fn; void *ctx; int64_t n; int chunk;
     atomic_int team;
@@ -118,27 +129,36 @@ static void run_share(int tid) {
     tl_in = 0;
 }
 
+static double par_now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e6 + t.tv_nsec * 1e-3; }
+
 static void *worker(void *arg) {
     int tid = (int)(intptr_t)arg;
     Worker *me = &P.w[tid];
-    if (P.pin) pin_to(tid);
+    if (atomic_load_explicit(&P.pin, memory_order_relaxed)) pin_to(tid);
     /* not atomic_load(&P.gen): the region that made the caller start this
      * worker may be published before the thread first runs */
     unsigned seen = me->start_gen;
     for (;;) {
         unsigned g = seen;
-        /* in the team: spin for the next region; out of it (THREADS_DECODE
-         * below THREADS): sleep at once, leaving the core to others */
-        if (tid < atomic_load_explicit(&P.team, memory_order_relaxed))
-            for (long i = 0; i < P.spin; i++) {
+        /* in the team: poll for the next region for spin_us, then sleep; out
+         * of it (THREADS_DECODE below THREADS): sleep at once, leaving the
+         * core to others. Asleep, a worker costs no CPU. */
+        long spin_us = atomic_load_explicit(&P.spin_us, memory_order_relaxed);
+        if (tid < atomic_load_explicit(&P.team, memory_order_relaxed) && spin_us > 0) {
+            double t0 = par_now_us();
+            for (long i = 1;; i++) {
                 g = atomic_load_explicit(&P.gen, memory_order_acquire);
-                if (g != seen) break;
+                if (g != seen || atomic_load_explicit(&P.quit, memory_order_relaxed)) break;
                 cpu_relax();
+                if (!(i & 63) && par_now_us() - t0 > spin_us) break;
             }
+        }
+        if (atomic_load(&P.quit)) return NULL;
         if (g == seen) {
             pthread_mutex_lock(&me->mu);
             atomic_store(&me->sleeping, 1);             /* seq_cst: pairs with the publisher */
             for (;;) {
+                if (atomic_load(&P.quit)) { atomic_store(&me->sleeping, 0); pthread_mutex_unlock(&me->mu); return NULL; }
                 g = atomic_load(&P.gen);
                 if (g != seen) { if (tid < atomic_load(&P.team)) break; seen = g; }
                 pthread_cond_wait(&me->cv, &me->mu);
@@ -155,24 +175,66 @@ static void *worker(void *arg) {
     return NULL;
 }
 
+static void par_defaults(void) {             /* command line: MOTY_POOL_SPIN_US / MOTY_POOL_PIN */
+    if (P.configured) return;
+    const char *e = moty_getenv("MOTY_POOL_SPIN_US");
+    atomic_store_explicit(&P.spin_us, e ? atol(e) : 1000, memory_order_relaxed);
+    e = moty_getenv("MOTY_POOL_PIN");
+    atomic_store_explicit(&P.pin, !(e && *e == '0'), memory_order_relaxed);
+    P.configured = 1;
+}
+void moty_par_config(long spin_us, int pin) {
+    atomic_store_explicit(&P.spin_us, spin_us < 0 ? 0 : spin_us, memory_order_relaxed);
+    atomic_store_explicit(&P.pin, pin, memory_order_relaxed);
+    P.configured = 1;
+}
+
 static void start_workers(int team) {
-    if (!P.spin) {
-        const char *e = getenv("MOTY_POOL_SPIN");
-        P.spin = e ? atol(e) : 200000;                  /* ~GOMP_SPINCOUNT of the OpenMP hot tune */
-        if (P.spin < 1) P.spin = 1;
-        e = getenv("MOTY_POOL_PIN");
-        P.pin = !(e && *e == '0');
-        if (P.pin) pin_to(0);                           /* caller = tid 0, like OMP_PROC_BIND=close */
-    }
+    par_defaults();
     for (int t = P.started + 1; t < team; t++) {
         Worker *w = &P.w[t];
         pthread_mutex_init(&w->mu, NULL); pthread_cond_init(&w->cv, NULL);
         w->start_gen = atomic_load(&P.gen);
-        pthread_t th; pthread_attr_t at; pthread_attr_init(&at);
-        if (pthread_create(&th, &at, worker, (void *)(intptr_t)t)) { perror("moty_par: pthread_create"); exit(1); }
-        pthread_detach(th); pthread_attr_destroy(&at);
+        if (pthread_create(&w->th, NULL, worker, (void *)(intptr_t)t))
+            moty_fail_code(MOTY_FAIL_OOM, "moty_par: pthread_create: %s", strerror(errno));
         P.started = t;
     }
+}
+
+/* join every worker (the library between requests: an idle process keeps no
+ * moty threads); the next region starts them again */
+void moty_par_shutdown(void) {
+    if (!P.started) return;
+    atomic_store(&P.quit, 1);
+    for (int t = 1; t <= P.started; t++) {
+        pthread_mutex_lock(&P.w[t].mu); pthread_cond_signal(&P.w[t].cv); pthread_mutex_unlock(&P.w[t].mu);
+    }
+    for (int t = 1; t <= P.started; t++) {
+        pthread_join(P.w[t].th, NULL);
+        pthread_mutex_destroy(&P.w[t].mu); pthread_cond_destroy(&P.w[t].cv);
+        atomic_store(&P.w[t].sleeping, 0);
+    }
+    P.started = 0;
+    atomic_store(&P.quit, 0);
+}
+
+/* the calling thread is tid 0 of every region: pinned to the first CPU of
+ * the process mask for the duration of a library call (like
+ * OMP_PROC_BIND=close), its own affinity restored afterwards */
+void moty_par_enter(MotyParCaller *c) {
+    par_defaults();
+    c->pinned = 0;
+#if defined(__linux__)
+    if (atomic_load_explicit(&P.pin, memory_order_relaxed) && pthread_getaffinity_np(pthread_self(), sizeof c->mask, (cpu_set_t *)c->mask) == 0) {
+        c->pinned = 1; pin_to(0);
+    }
+#endif
+}
+void moty_par_leave(MotyParCaller *c) {
+#if defined(__linux__)
+    if (c->pinned) pthread_setaffinity_np(pthread_self(), sizeof c->mask, (const cpu_set_t *)c->mask);
+#endif
+    c->pinned = 0;
 }
 
 void moty_par_for(int64_t n, int chunk, moty_par_fn fn, void *ctx) {
@@ -215,4 +277,8 @@ int  moty_par_procs(void)        { return 1; }
 int  moty_par_tid(void)          { return 0; }
 int  moty_par_active(void)       { return 0; }
 const char *moty_par_backend(void) { return "serial"; }
+void moty_par_config(long spin_us, int pin) { (void)spin_us; (void)pin; }
+void moty_par_enter(MotyParCaller *c) { (void)c; }
+void moty_par_leave(MotyParCaller *c) { (void)c; }
+void moty_par_shutdown(void) {}
 #endif

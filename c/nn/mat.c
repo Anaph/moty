@@ -26,7 +26,7 @@ int moty_mat_fuse_rows(Mat *dst, Mat *const *src, int n) {
     for (int i = 0; i < n; i++) {
         int64_t bq = (int64_t)src[i]->O/4*nb*gb, bd = (int64_t)src[i]->O/4*nb*4;
         memcpy(q + oq, src[i]->q4, bq); memcpy(d + od, src[i]->s16, bd*sizeof(uint16_t));
-        free(src[i]->q4); free(src[i]->s16);
+        moty_bfree(src[i]->q4); moty_bfree(src[i]->s16);
         src[i]->q4 = q + oq; src[i]->s16 = d + od;         /* views */
         oq += bq; od += bd;
     }

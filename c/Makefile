@@ -194,12 +194,24 @@ clean-engines:
 	rm -f moty lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o
 
 # ---- libmoty-runtime (M4): env/config + KV alloc, una copia ----
-RT_SRCS = runtime/env.c runtime/kvcache.c
-RT_DEPS = runtime/config.h runtime/kvcache.h
+RT_SRCS = runtime/env.c runtime/kvcache.c api/api.c
+RT_DEPS = runtime/config.h runtime/kvcache.h runtime/engine_api.h api/moty.h api/api_internal.h
 libmoty-runtime.a: $(RT_SRCS) $(RT_DEPS) libmoty-nn.a libmoty-hw.a
 	$(CC) $(CFLAGS) -c runtime/env.c -o runtime/env.o
 	$(CC) $(CFLAGS) -c runtime/kvcache.c -o runtime/kvcache.o
-	$(AR) rcs $@ runtime/env.o runtime/kvcache.o
+	$(CC) $(CFLAGS) -c api/api.c -o api/api.o
+	$(AR) rcs $@ runtime/env.o runtime/kvcache.o api/api.o
+
+# ---- libmoty: the embeddable library (api/moty.h, docs/api.md) ----
+# One archive: the three layers + the lfm2 and qwen engines + the registry.
+# Build it with the pthread pool (no OpenMP runtime needed):
+#   make clean && make THREADPOOL=1 libmoty.a
+libmoty.a: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/lfm2.c engines/qwen.c api/registry.c api/api_internal.h $(RUNTIME_H)
+	$(CC) $(CFLAGS) -DMOTY_NO_MAIN -c engines/lfm2.c -o api/lfm2_lib.o
+	$(CC) $(CFLAGS) -DMOTY_NO_MAIN -c engines/qwen.c -o api/qwen_lib.o
+	$(CC) $(CFLAGS) -c api/registry.c -o api/registry.o
+	rm -f $@
+	$(AR) rcs $@ hw/hw.o $(NN_CORE_SRCS:.c=.o) runtime/env.o runtime/kvcache.o api/api.o api/lfm2_lib.o api/qwen_lib.o api/registry.o
 
 HW_SRCS = hw/hw.c
 HW_DEPS = hw/hw.h hw/hw_impl.h hw/hw_avx512.h hw/hw_avx2.h hw/hw_neon.h \
@@ -336,7 +348,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f libmoty-nn.a libmoty-hw.a hw/hw.o nn/*.o runtime/moecache.o io/tier.o runtime/env.o runtime/kvcache.o moty lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o glm glm.exe olmoe olmoe.exe qwen qwen.exe gemma gemma.exe
+	rm -f libmoty.a api/*.o libmoty-nn.a libmoty-hw.a hw/hw.o nn/*.o runtime/moecache.o io/tier.o runtime/env.o runtime/kvcache.o moty lfm2.o qwenmoe.o gemma.o olmoe.o qwen.o glm.o glm glm.exe olmoe olmoe.exe qwen qwen.exe gemma gemma.exe
 	rm -rf $(TESTS_BUILD)
 	rm -rf $(TESTS_BUILD_NATIVE)
 	rm -f plugins/*.so

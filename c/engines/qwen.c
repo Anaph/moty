@@ -18,6 +18,7 @@
  *   TOKENS=1                          dump degli id generati su stderr
  */
 #define _GNU_SOURCE
+#include "nn/track.h"   /* first: heap calls go through the open tracker */
 #include "util/prof.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -102,6 +103,9 @@ static void lora_load(Model *m);
 static void qwen_fuse(Model *m);
 #define ENGINE_POST_INIT(m)       do { lora_load(m); qwen_fuse(m); } while (0)
 #define ENGINE_MICRO 1            /* step() sa girare con embed NULL (gather per riga) */
+/* library (runtime/engine_api.h): Qwen3 / Qwen2 / Llama-family dense (MiniCPM5-1B is "llama") */
+#define ENGINE_API_ID qwen
+#define ENGINE_API_TYPES "qwen3", "qwen2", "llama"
 
 #include "runtime/runtime.h"
 
@@ -124,16 +128,16 @@ static struct {
 static void tta_ensure(Model *m) {
     if (!g_tta.init) {
         g_tta.init = 1;
-        const char *e = getenv("TTA");
+        const char *e = moty_getenv("TTA");
         g_tta.mode = !e || !*e || !strcmp(e,"0") ? TTA_OFF
                    : !strcmp(e,"cache") ? TTA_CACHE
                    : !strcmp(e,"bias")  ? TTA_BIAS
                    : !strcmp(e,"lora")  ? TTA_LORA : TTA_OFF;
-        g_tta.n      = getenv("TTA_N")      ? atoi(getenv("TTA_N"))            : 2048;
-        g_tta.lr     = getenv("TTA_LR")     ? (float)atof(getenv("TTA_LR"))
+        g_tta.n      = moty_getenv("TTA_N")      ? atoi(moty_getenv("TTA_N"))            : 2048;
+        g_tta.lr     = moty_getenv("TTA_LR")     ? (float)atof(moty_getenv("TTA_LR"))
                                             : (g_tta.mode == TTA_LORA ? 1e-3f : 0.1f);
-        g_tta.lambda = getenv("TTA_LAMBDA") ? (float)atof(getenv("TTA_LAMBDA")) : 0.1f;
-        g_tta.theta  = getenv("TTA_THETA")  ? (float)atof(getenv("TTA_THETA"))  : 1.0f;
+        g_tta.lambda = moty_getenv("TTA_LAMBDA") ? (float)atof(moty_getenv("TTA_LAMBDA")) : 0.1f;
+        g_tta.theta  = moty_getenv("TTA_THETA")  ? (float)atof(moty_getenv("TTA_THETA"))  : 1.0f;
         if (g_tta.lambda < 0) g_tta.lambda = 0;
         if (g_tta.lambda > 0.5f) g_tta.lambda = 0.5f;   /* il cache non puo' dominare */
         if (g_tta.n < 1) g_tta.n = 1;
@@ -154,7 +158,7 @@ static void tta_ensure(Model *m) {
         if (g_tta.mode == TTA_LORA) {
             /* adattatore online sull'lm_head: A fissato casuale (deterministico),
              * B parte a zero -> no-op finche' non si osservano token */
-            int r = getenv("TTA_RANK") ? atoi(getenv("TTA_RANK")) : 4;
+            int r = moty_getenv("TTA_RANK") ? atoi(moty_getenv("TTA_RANK")) : 4;
             if (r < 1) r = 1;
             if (r > LORA_MAX_R) r = LORA_MAX_R;
             g_tta.lr_rank = r; g_tta.l_alpha = 2.f * r;
@@ -296,13 +300,13 @@ static int lora_slot(shards *LS, char *used, const char *base, Lora *lo, int I, 
     st_tensor *ta = st_find(LS, na);
     if (!ta) return 0;
     st_tensor *tb = st_find(LS, nb);
-    if (!tb) { fprintf(stderr, "[qwen] LoRA: %s presente ma manca %s\n", na, nb); exit(1); }
+    if (!tb) { moty_fail_code(MOTY_FAIL_FORMAT, "[qwen] LoRA: %s presente ma manca %s\n", na, nb); }
     if (I <= 0 || ta->numel % I) {
-        fprintf(stderr, "[qwen] LoRA: %s numel %lld incompatibile con I=%d\n", na, (long long)ta->numel, I); exit(1); }
+        moty_fail_code(MOTY_FAIL_FORMAT, "[qwen] LoRA: %s numel %lld incompatibile con I=%d\n", na, (long long)ta->numel, I); }
     int r = (int)(ta->numel / I);
     if (r < 1 || r > LORA_MAX_R || tb->numel != (int64_t)O*r) {
-        fprintf(stderr, "[qwen] LoRA: %s: rank %d fuori range [1,%d] oppure %s numel %lld != %d*%d\n",
-                na, r, LORA_MAX_R, nb, (long long)tb->numel, O, r); exit(1); }
+        moty_fail_code(MOTY_FAIL_FORMAT, "[qwen] LoRA: %s: rank %d fuori range [1,%d] oppure %s numel %lld != %d*%d\n",
+                na, r, LORA_MAX_R, nb, (long long)tb->numel, O, r); }
     lo->r = r;
     lo->alpha = alpha > 0 ? alpha : 2.0f*r;     /* default: alpha = 2r */
     lo->A = falloc(ta->numel); st_read_f32(LS, na, lo->A, 0);
@@ -314,10 +318,10 @@ static int lora_slot(shards *LS, char *used, const char *base, Lora *lo, int I, 
 /* legge LORA=<path> (file singolo o directory safetensors) e attacca gli
  * adattatori al modello. Fallisce RUMOROSAMENTE su tensori non riconosciuti. */
 static void lora_load(Model *m) {
-    const char *path = getenv("LORA");
+    const char *path = moty_getenv("LORA");
     if (!path || !*path) return;
     struct stat sb;
-    if (stat(path, &sb) != 0) { perror(path); exit(1); }
+    if (stat(path, &sb) != 0) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", path, strerror(errno)); }
     shards LS;
     if (S_ISDIR(sb.st_mode)) st_init(&LS, path);
     else st_init_file(&LS, path);
@@ -325,7 +329,7 @@ static void lora_load(Model *m) {
     float alpha = 0.f;                          /* 0 = non impostato -> default 2r per slot */
     st_tensor *tal = st_find(&LS, "lora.alpha");
     if (tal) {
-        if (tal->numel != 1) { fprintf(stderr, "[qwen] LoRA: lora.alpha deve essere scalare\n"); exit(1); }
+        if (tal->numel != 1) { moty_fail_code(MOTY_FAIL_FORMAT, "[qwen] LoRA: lora.alpha deve essere scalare\n"); }
         st_read_f32(&LS, "lora.alpha", &alpha, 0);
         used[tal - LS.t] = 1;
     }
@@ -350,7 +354,7 @@ static void lora_load(Model *m) {
         #undef SLOT
         if (got) {
             l->lo = calloc(1, sizeof(LoraLayer));
-            if (!l->lo) { fprintf(stderr, "[qwen] LoRA: OOM\n"); exit(1); }
+            if (!l->lo) { moty_fail_code(MOTY_FAIL_OOM, "[qwen] LoRA: OOM\n"); }
             *l->lo = tmp;
         }
     }
@@ -360,7 +364,7 @@ static void lora_load(Model *m) {
     int bad = 0;
     for (int i = 0; i < LS.n; i++)
         if (!used[i]) { fprintf(stderr, "[qwen] LoRA: tensore non riconosciuto: %s\n", LS.t[i].name); bad = 1; }
-    if (bad) exit(1);
+    if (bad) moty_fail_code(MOTY_FAIL_FORMAT, "[qwen] LoRA: unrecognized tensors in the adapter file");
     free(used);
     fprintf(stderr, "[qwen] LoRA: %d tensori, r=%d, alpha=%g, layer adattati:", nt, rload,
             alpha > 0 ? alpha : 2.0f*rload);
@@ -392,7 +396,7 @@ static void load_cfg(Cfg *c, const char *snap) {
     jval *prf = json_get(r,"partial_rotary_factor");
     c->rot = prf ? (int)(c->head_dim * prf->num + 0.5) : c->head_dim;
     if (c->rot < 2 || c->rot > c->head_dim || (c->rot & 1)) {
-        fprintf(stderr,"config: partial_rotary_factor incoerente (rot=%d, head_dim=%d)\n", c->rot, c->head_dim); exit(1);
+        moty_fail_code(MOTY_FAIL_FORMAT, "config: partial_rotary_factor incoerente (rot=%d, head_dim=%d)\n", c->rot, c->head_dim);
     }
     jval *lv = json_get(r,"linear_num_value_heads");
     c->lin_hv  = lv ? (int)lv->num : 0;
@@ -415,7 +419,7 @@ static void load_cfg(Cfg *c, const char *snap) {
     if (c->hybrid && (c->lin_hv<=0 || c->lin_hk<=0 || c->lin_dk<=0 || c->lin_dv<=0 ||
                       c->lin_dk>MAX_LIN_DV || c->lin_dv>MAX_LIN_DV ||
                       c->lin_hv % c->lin_hk || c->lin_conv<1 || c->lin_conv>8)) {
-        fprintf(stderr,"config: parametri linear_attention mancanti o incoerenti\n"); exit(1);
+        moty_fail_code(MOTY_FAIL_FORMAT, "config: parametri linear_attention mancanti o incoerenti\n");
     }
     json_free(root); free(buf);       /* Cfg non trattiene puntatori nel JSON */
 }
@@ -730,7 +734,7 @@ static void kv_alloc(Model *m, int max_t) {
 
 /* costruisce il turno chat Qwen3 (ChatML). THINK=0 pre-chiude il blocco think. */
 static int build_turn(char *buf, int cap, const char *user) {
-    int think = getenv("THINK") ? atoi(getenv("THINK")) : 0;
+    int think = moty_getenv("THINK") ? atoi(moty_getenv("THINK")) : 0;
     int bl = snprintf(buf, cap, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", user);
     if (!think) bl += snprintf(buf+bl, cap-bl, "<think>\n\n</think>\n\n");
     return bl;
@@ -752,7 +756,7 @@ static void banner(Model *m) {
 
 #include "qwen_train.h"
 
-#ifndef QWEN_TEST
+#if !defined(QWEN_TEST) && !defined(MOTY_NO_MAIN)   /* MOTY_NO_MAIN: libmoty */
 int main(int argc, char **argv) {
     /* TRAIN=<corpus.txt> -> fine-tuning LoRA (qwen_train.h) invece della generazione */
     if (getenv("TRAIN") && *getenv("TRAIN")) return train_main(argc, argv);

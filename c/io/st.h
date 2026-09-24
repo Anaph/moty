@@ -58,7 +58,7 @@ static int st_dtype_code(const char *s) {
     if (!strcmp(s, "F32"))  return 2;
     if (!strcmp(s, "U8"))   return 3;   /* dati quantizzati (int4 packed / int8) */
     if (!strcmp(s, "I8"))   return 3;
-    fprintf(stderr, "unsupported dtype: %s\n", s); exit(1);
+    moty_fail_code(MOTY_FAIL_FORMAT, "unsupported dtype: %s\n", s);
 }
 
 /* dtype >= ST_DTYPE_QBLOCK: formati GGUF a blocchi. La geometria sta qui;
@@ -100,7 +100,7 @@ static inline float f16_to_f32(uint16_t h) {
 static int st_open_fd(shards *S, const char *path) {
     for (int i = 0; i < S->nfd; i++) if (!strcmp(S->paths[i], path)) return S->fds[i];
     int fd = open(path, COMPAT_O_RDONLY);
-    if (fd < 0) { perror(path); exit(1); }
+    if (fd < 0) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", path, strerror(errno)); }
     S->paths[S->nfd] = strdup(path); S->fds[S->nfd] = fd;
 #ifdef O_DIRECT
     S->dfds[S->nfd] = open(path, COMPAT_O_RDONLY | O_DIRECT);   /* eager: lookup poi thread-safe */
@@ -111,6 +111,17 @@ static int st_open_fd(shards *S, const char *path) {
 #endif
     S->nfd++;
     return fd;
+}
+
+/* close the shard files (the library's model close; the heap parts of S are
+ * released with the rest of the model's allocations) */
+static void st_close_fds(shards *S) {
+    for (int i = 0; i < S->nfd; i++) {
+        if (S->fds[i] >= 0) close(S->fds[i]);
+        if (S->dfds[i] >= 0) close(S->dfds[i]);
+        S->fds[i] = S->dfds[i] = -1;
+    }
+    S->nfd = 0;
 }
 
 /* fd gemello O_DIRECT dello stesso file (bypassa la page cache: il buffered read su
@@ -125,25 +136,25 @@ static int st_direct_fd(shards *S, int fd) {
 static void st_index_file(shards *S, const char *path) {
     int fd = st_open_fd(S, path);
     struct stat sst;
-    if (fstat(fd, &sst) != 0) { perror("fstat shard"); exit(1); }
+    if (fstat(fd, &sst) != 0) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", "fstat shard", strerror(errno)); }
     int64_t fsz = (int64_t)sst.st_size;
     uint64_t hlen;
-    if (pread(fd, &hlen, 8, 0) != 8) { perror("pread hlen"); exit(1); }
+    if (pread(fd, &hlen, 8, 0) != 8) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", "pread hlen", strerror(errno)); }
     /* file malevolo/troncato: hlen deve stare nel file dopo gli 8 byte di
      * prefisso e sotto il tetto. Senza questo bound hlen+1 puo' andare in
      * overflow (malloc(0) e poi hdr[hlen]=0 fuori limiti) o forzare una
      * malloc gigante. */
     if (fsz < 8 || hlen > (uint64_t)(fsz - 8) || hlen > (uint64_t)ST_MAX_HEADER) {
-        fprintf(stderr, "%s: bad safetensors header length %llu (file %lld bytes)\n",
-                path, (unsigned long long)hlen, (long long)fsz); exit(1); }
+        moty_fail_code(MOTY_FAIL_FORMAT, "%s: bad safetensors header length %llu (file %lld bytes)\n",
+                path, (unsigned long long)hlen, (long long)fsz); }
     char *hdr = malloc(hlen + 1);
-    if (!hdr) { perror("malloc safetensors header"); exit(1); }
-    if (pread(fd, hdr, hlen, 8) != (ssize_t)hlen) { perror("pread hdr"); exit(1); }
+    if (!hdr) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", "malloc safetensors header", strerror(errno)); }
+    if (pread(fd, hdr, hlen, 8) != (ssize_t)hlen) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", "pread hdr", strerror(errno)); }
     hdr[hlen] = 0;
     int64_t data_start = 8 + (int64_t)hlen;
     jval *root = json_parse(hdr);
     if (!root || root->t != J_OBJ) {
-        fprintf(stderr, "%s: safetensors header is not a JSON object\n", path); exit(1); }
+        moty_fail_code(MOTY_FAIL_FORMAT, "%s: safetensors header is not a JSON object\n", path); }
     for (int i = 0; i < root->len; i++) {
         const char *name = root->keys[i];
         if (!strcmp(name, "__metadata__")) continue;
@@ -156,16 +167,16 @@ static void st_index_file(shards *S, const char *path) {
          * off->kids[0/1] oltre i limiti dell'array. */
         if (!dt || dt->t != J_STR || !off || off->t != J_ARR || off->len < 2 ||
             !shp || shp->t != J_ARR) {
-            fprintf(stderr, "%s: tensor '%s' has malformed dtype/data_offsets/shape\n",
-                    path, name); exit(1); }
+            moty_fail_code(MOTY_FAIL_FORMAT, "%s: tensor '%s' has malformed dtype/data_offsets/shape\n",
+                    path, name); }
         int64_t a0 = (int64_t)off->kids[0]->num, b0 = (int64_t)off->kids[1]->num;
         /* offset dichiarati dal file: non-negativi, ordinati e dentro al
          * file. Altrimenti nbytes=b0-a0 diventa negativo -> malloc((size_t))
          * gigante e la memcpy in st_read_f32 sfora il buffer del chiamante;
          * oppure off punta fuori dal file. */
         if (a0 < 0 || b0 < a0 || data_start + b0 > fsz) {
-            fprintf(stderr, "%s: tensor '%s' data_offsets [%lld,%lld] out of file bounds (%lld)\n",
-                    path, name, (long long)a0, (long long)b0, (long long)fsz); exit(1); }
+            moty_fail_code(MOTY_FAIL_FORMAT, "%s: tensor '%s' data_offsets [%lld,%lld] out of file bounds (%lld)\n",
+                    path, name, (long long)a0, (long long)b0, (long long)fsz); }
         int64_t numel = 1; for (int k = 0; k < shp->len; k++) numel *= (int64_t)shp->kids[k]->num;
         if (S->n == S->cap) { S->cap *= 2; S->t = realloc(S->t, S->cap*sizeof(st_tensor)); }
         st_tensor *t = &S->t[S->n++];
@@ -195,11 +206,11 @@ static void st_init(shards *S, const char *snap_dir) {
     /* raccoglie ordinatamente i nomi dei file shard */
     static char files[ST_MAX_SHARDS][1024]; int nf = 0;
     DIR *d = opendir(snap_dir); struct dirent *e;
-    if (!d) { perror(snap_dir); exit(1); }
+    if (!d) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", snap_dir, strerror(errno)); }
     while ((e = readdir(d))) {
         const char *dot = strrchr(e->d_name, '.');
         if (dot && !strcmp(dot, ".safetensors")) {  /* model.safetensors o model-0000N-of-... */
-            if (nf >= ST_MAX_SHARDS) { fprintf(stderr, "too many shards (>%d): raise ST_MAX_SHARDS\n", ST_MAX_SHARDS); exit(1); }
+            if (nf >= ST_MAX_SHARDS) { moty_fail_code(MOTY_FAIL_FORMAT, "too many shards (>%d): raise ST_MAX_SHARDS\n", ST_MAX_SHARDS); }
             snprintf(files[nf++], 1024, "%s/%s", snap_dir, e->d_name);
         }
     }
@@ -254,11 +265,10 @@ static int st_has(shards *S, const char *name) { return st_find(S, name) != NULL
  * punto che stampa il mismatch di forma — prima era open-coded in 5 posti. */
 static st_tensor *st_expect(shards *S, const char *name, int64_t expect) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) { moty_fail_code(MOTY_FAIL_FORMAT, "missing tensor: %s\n", name); }
     if (expect > 0 && t->numel != expect) {
-        fprintf(stderr, "tensor %s: numel %lld != atteso %lld (layout diverso?)\n",
+        moty_fail_code(MOTY_FAIL_FORMAT, "tensor %s: numel %lld != atteso %lld (layout diverso?)\n",
                 name, (long long)t->numel, (long long)expect);
-        exit(1);
     }
     return t;
 }
@@ -286,8 +296,8 @@ static int st_dtype(shards *S, const char *name) {
  * quantizzati int4/int8 del nostro container (dtype U8). drop=1 -> fadvise DONTNEED. */
 static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
-    if (pread(t->fd, out, t->nbytes, t->off) != t->nbytes) { perror("pread raw"); exit(1); }
+    if (!t) { moty_fail_code(MOTY_FAIL_FORMAT, "missing tensor: %s\n", name); }
+    if (pread(t->fd, out, t->nbytes, t->off) != t->nbytes) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", "pread raw", strerror(errno)); }
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
 }
 
@@ -296,22 +306,22 @@ static void st_read_raw(shards *S, const char *name, void *out, int drop) {
  * solo expert richiesto via pread del sotto-range, niente lettura dell'intero blocco. */
 static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int64_t n_elems, float *out, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
-    if (t->dtype == 3) { fprintf(stderr, "tensor %s: slice read su dtype U8 non supportata\n", name); exit(1); }
+    if (!t) { moty_fail_code(MOTY_FAIL_FORMAT, "missing tensor: %s\n", name); }
+    if (t->dtype == 3) { moty_fail_code(MOTY_FAIL_FORMAT, "tensor %s: slice read su dtype U8 non supportata\n", name); }
     if (t->dtype >= ST_DTYPE_QBLOCK) {
         /* formati a blocchi: la fetta deve essere allineata ai blocchi. I
          * chiamanti tagliano per righe e ggml impone ne0 %% blocco == 0,
          * quindi i confini di riga sono sempre allineati. */
         int be, bb;
         if (!st_qblock(t->dtype, &be, &bb) || !g_st_dequant_fn) {
-            fprintf(stderr, "tensor %s: dtype quantizzato senza geometria/hook\n", name); exit(1); }
+            moty_fail_code(MOTY_FAIL_FORMAT, "tensor %s: dtype quantizzato senza geometria/hook\n", name); }
         if (elem_off % be || n_elems % be) {
-            fprintf(stderr, "tensor %s: slice non allineata al blocco (%lld+%lld %% %d)\n",
-                    name, (long long)elem_off, (long long)n_elems, be); exit(1); }
+            moty_fail_code(MOTY_FAIL_FORMAT, "tensor %s: slice non allineata al blocco (%lld+%lld %% %d)\n",
+                    name, (long long)elem_off, (long long)n_elems, be); }
         int64_t boff = t->off + elem_off/be*bb, nb = n_elems/be*bb;
         void *raw = malloc(nb);
-        if (!raw) { fprintf(stderr, "OOM slice %s\n", name); exit(1); }
-        if (pread(t->fd, raw, nb, boff) != nb) { perror("pread qslice"); exit(1); }
+        if (!raw) { moty_fail_code(MOTY_FAIL_OOM, "OOM slice %s\n", name); }
+        if (pread(t->fd, raw, nb, boff) != nb) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", "pread qslice", strerror(errno)); }
         g_st_dequant_fn(t->dtype, raw, n_elems, out);
         free(raw);
         if (drop) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);
@@ -320,7 +330,7 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     int esz = (t->dtype == 2) ? 4 : 2;
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = malloc(nb);
-    if (pread(t->fd, raw, nb, boff) != nb) { perror("pread slice"); exit(1); }
+    if (pread(t->fd, raw, nb, boff) != nb) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", "pread slice", strerror(errno)); }
     if (t->dtype == 2) memcpy(out, raw, nb);
     else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
     else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
