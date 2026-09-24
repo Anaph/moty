@@ -4,6 +4,27 @@
 #include "util/prof.h"
 #include "nn/attn.h"
 
+/* scores + accumulation for (head, token) pairs [r0, r1), r = head*S + token */
+typedef struct {
+    const MotyAttnView *a; const float *q; float *ctx; int S, G, hd, li, pos_base, kv8; int64_t qw; float scale;
+} AttJob;
+static void att_part(void *c_, int64_t r0, int64_t r1, int tid) {
+    const AttJob *c = c_; const MotyAttnView *a = c->a; int hd = c->hd, li = c->li;
+    float *sc = a->att_sc + (int64_t)tid*a->max_t;       /* per-thread score row */
+    for (int64_t r = r0; r < r1; r++) {
+        int hh = (int)(r / c->S), s = (int)(r % c->S);
+        int kvh = hh / c->G, qpos = c->pos_base + s;
+        const float *qv = c->q + s*c->qw + (int64_t)hh*hd;
+        int64_t kvbase = (int64_t)kvh * a->max_t;
+        if (c->kv8) att_scores_i8(sc, qv, a->K8[li], a->Ks[li], kvbase, 0, qpos, hd, c->scale);
+        else        att_scores_f32(sc, qv, a->K[li], kvbase, 0, qpos, hd, c->scale);
+        softmax_row(sc, qpos+1);
+        float *cx = c->ctx + s*c->qw + (int64_t)hh*hd;
+        if (c->kv8) att_accum_i8(cx, sc, a->V8[li], a->Vs[li], kvbase, 0, qpos, hd);
+        else        att_accum_f32(cx, sc, a->V[li], kvbase, 0, qpos, hd);
+    }
+}
+
 /* coda comune: QK-norm + RoPE → KV store → scores/accum → (gate) → o_proj */
 static void attn_tail(const MotyAttnView *a, float *q, float *k, float *vv,
                       const float *x, int S, int pos_base, float *out, const float *gate) {
@@ -42,25 +63,35 @@ static void attn_tail(const MotyAttnView *a, float *q, float *k, float *vv,
     OP_T(t_at);
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = scr_take(a->scr, (int64_t)S*qw*4);
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int hh = 0; hh < H; hh++) for (int s = 0; s < S; s++) {
-        float *sc = a->att_sc + (int64_t)omp_get_thread_num()*a->max_t;
-        int kvh = hh / G, qpos = pos_base + s;
-        const float *qv = q + s*qw + (int64_t)hh*hd;
-        int64_t kvbase = (int64_t)kvh * a->max_t;
-        if (kv8) att_scores_i8(sc, qv, a->K8[li], a->Ks[li], kvbase, 0, qpos, hd, scale);
-        else     att_scores_f32(sc, qv, a->K[li], kvbase, 0, qpos, hd, scale);
-        softmax_row(sc, qpos+1);
-        float *cx = ctx + s*qw + (int64_t)hh*hd;
-        if (kv8) att_accum_i8(cx, sc, a->V8[li], a->Vs[li], kvbase, 0, qpos, hd);
-        else     att_accum_f32(cx, sc, a->V[li], kvbase, 0, qpos, hd);
-    }
+    AttJob aj = { a, q, ctx, S, G, hd, li, pos_base, kv8, qw, scale };
+    moty_par_for((int64_t)H*S, 0, att_part, &aj);
     if (gate)
         for (int64_t i = 0; i < (int64_t)S*qw; i++) ctx[i] *= 1.f/(1.f + expf(-gate[i]));
     OP_ACC(OP_ATTN_CORE, t_at);
     OP_T(t_o);
     mat_apply(out, ctx, a->o, S);
     OP_ACC(OP_O_PROJ, t_o);
+}
+
+/* q/k/v rows of one region on the VNNI path, r over [q rows | k rows | v rows] */
+typedef struct {
+    const MotyAttnView *a; float *q, *k, *vv; const int8_t *axi; const int32_t *axg; const float *asx;
+    int S, D; int64_t qw, kw, nk; int ng, rb;
+} QkvJob;
+static void qkv_vnni_part(void *c_, int64_t r0, int64_t r1, int tid) {
+    const QkvJob *c = c_; const MotyAttnView *a = c->a; int S = c->S, D = c->D, ng = c->ng, rb = c->rb;
+    int64_t qw = c->qw, kw = c->kw, nk = c->nk;
+    for (int64_t r = r0; r < r1; r++) {
+        int mi, o; int64_t s;
+        if (r < (int64_t)S*qw)       { mi = 0; s = r / qw;       o = (int)(r - s*qw); }
+        else if (r < (int64_t)S*qw+nk){ mi = 1; s = (r-S*qw)/kw;  o = (int)(r-S*qw - s*kw); }
+        else                          { mi = 2; s = (r-S*qw-nk)/kw;o = (int)(r-S*qw-nk - s*kw); }
+        const Mat *w = mi == 0 ? a->q : mi == 1 ? a->k : a->v;
+        float *dst = mi == 0 ? c->q : mi == 1 ? c->k : c->vv;
+        dst[(int64_t)s*(mi == 0 ? qw : kw) + o] =
+            c->asx[s] * dot_i4g8p(w->q4 + (int64_t)o*rb, w->qs + (int64_t)o*ng,
+                                  c->axi + (int64_t)s*D, c->axg + (int64_t)s*ng, D);
+    }
 }
 
 void moty_nn_attention(const MotyAttnView *a, const float *x, int S, int pos_base, float *out) {
@@ -107,18 +138,8 @@ void moty_nn_attention(const MotyAttnView *a, const float *x, int S, int pos_bas
                     axg[(int64_t)s*ng + g] = acc;
                 }
             }
-            #pragma omp parallel for schedule(static)
-            for (int64_t r = 0; r < tot; r++) {
-                int mi, o; int64_t s;
-                if (r < (int64_t)S*qw)       { mi = 0; s = r / qw;       o = (int)(r - s*qw); }
-                else if (r < (int64_t)S*qw+nk){ mi = 1; s = (r-S*qw)/kw;  o = (int)(r-S*qw - s*kw); }
-                else                          { mi = 2; s = (r-S*qw-nk)/kw;o = (int)(r-S*qw-nk - s*kw); }
-                const Mat *w = mi == 0 ? a->q : mi == 1 ? a->k : a->v;
-                float *dst = mi == 0 ? q : mi == 1 ? k : vv;
-                dst[(int64_t)s*(mi == 0 ? qw : kw) + o] =
-                    asx[s] * dot_i4g8p(w->q4 + (int64_t)o*rb, w->qs + (int64_t)o*ng,
-                                       axi + (int64_t)s*D, axg + (int64_t)s*ng, D);
-            }
+            QkvJob qj = { a, q, k, vv, axi, axg, asx, S, D, qw, kw, nk, ng, rb };
+            moty_par_for(tot, 0, qkv_vnni_part, &qj);
         } else {
             mat_apply(q, x, a->q, S);
             mat_apply(k, x, a->k, S);

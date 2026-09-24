@@ -20,7 +20,18 @@ option(MOTY_BUILD_TESTS "Costruisci la suite gtest (richiede C++)" ON)
 option(MOTY_PLUGINS "Abilita i motori out-of-tree (MOTY_PLUGIN=...)" OFF)
 set(MOTY_ARCH "" CACHE STRING "march (vuoto: portable; 'native': questa macchina)")
 
-find_package(OpenMP)
+# MOTY_THREADPOOL: no OpenMP runtime (a clang toolchain without libomp);
+# the parallel loops run on moty's own pthread pool (nn/par.c)
+option(MOTY_THREADPOOL "pthread pool instead of OpenMP" OFF)
+if(MOTY_THREADPOOL)
+  set(OpenMP_C_FOUND FALSE)
+  set(THREADS_PREFER_PTHREAD_FLAG ON)
+  find_package(Threads REQUIRED)
+  add_compile_definitions(MOTY_THREADPOOL)
+  link_libraries(Threads::Threads)
+else()
+  find_package(OpenMP)
+endif()
 if(OpenMP_C_FOUND)
   add_compile_options(${OpenMP_C_FLAGS})   # le pragma omp vivono nelle librerie
 endif()
@@ -60,7 +71,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 add_library(moty_hw STATIC hw/hw.c)
 target_link_libraries(moty_hw PUBLIC ${MOTY_OMPC})
 
-set(MOTY_NN_SRCS nn/alloc.c nn/quant.c nn/mat.c nn/matmul.c nn/norm.c nn/rope.c
+set(MOTY_NN_SRCS nn/par.c nn/alloc.c nn/quant.c nn/mat.c nn/matmul.c nn/norm.c nn/rope.c
                  nn/attn_kernels.c nn/sample.c nn/attn.c nn/conv.c nn/ffn.c
                  nn/moe.c nn/head.c runtime/moecache.c io/tier.c)
 add_library(moty_nn STATIC ${MOTY_NN_SRCS})

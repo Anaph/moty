@@ -16,7 +16,6 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
-#include <omp.h>
 
 #include "../nn/nn_alloc.h"
 #include "../util/simd.h"
@@ -90,7 +89,7 @@ static void at_ctx_init(AtCtx *ctx, int kv8, int grouped) {
     } else {
         ctx->m.base.K8[0] = NULL; ctx->m.base.V8[0] = NULL;
     }
-    int nth = omp_get_max_threads();
+    int nth = moty_par_threads();
     ctx->m.base.att_sc = calloc((size_t)nth*max_t, sizeof(float));
 }
 

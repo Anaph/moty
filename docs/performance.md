@@ -612,3 +612,35 @@ step reads one row (`EMBED=disk` keeps it out of RAM for MiniCPM5). llama.cpp's 
 RSS is lower for LFM2.5 (242 vs 300 MB) and higher for MiniCPM5 (686–707
 vs 556–565 MB). Loading: moty 3.3–4.2 s from the container;
 `llama-bench` does not report a load time (§5.2).
+
+### 5.13 Without OpenMP: the `THREADPOOL` build
+
+A toolchain without an OpenMP runtime (the board vendor's clang ships no
+target libomp: `-fopenmp` fails to link with `undefined symbol:
+__kmpc_fork_call`, reproduced with clang 18.1.6 via `zig cc`) used to
+build moty single-threaded. `make THREADPOOL=1` runs the same parallel
+loops on moty's own pthread pool (docs/architecture.md, "Parallel loops").
+
+Board B, LFM2.5-350M (GPTQ + Q8R4 layers 0–1 container), prompt 66 /
+decode 64 tokens, interleaved runs; "main" is the OpenMP binary of the
+tree before the change, "OpenMP" / "pool" the same tree built with gcc
+12.2 both ways (static), "clang pool" `zig cc` 0.13 (clang 18.1.6,
+`-mcpu=cortex-a53`, dynamic glibc, no libomp), prefill / decode tok/s:
+
+| threads | main | OpenMP | pool | clang pool | runs each |
+|---|---|---|---|---|---|
+| 1 | 13.6 / 7.59 | 13.7 / 7.66 | 14.2 / 8.56 | 15.0 / 8.60 | 3 |
+| 2 | 26.8 / 12.71 | 26.8 / 13.45 | 26.8 / 13.60 | 28.3 / 13.54 | 3 |
+| 3 | 39.1 / 15.02 | 38.9 / 15.58 | 38.8 / 15.68 | 41.0 / 15.88 | 3 |
+| 4 | 46.0 / 14.23 | 45.3 / 15.13 | 45.5 / 15.57 | 48.1 / 15.36 | 9 / 27 / 27 / 9 |
+| 4, `THREADS_DECODE=3` | 42.9 / 14.68 | 45.7 / 15.38 | 42.4 / 14.28 | 48.1 / 15.19 | 6 |
+
+Medians. On this board single runs at 4 threads scatter by ±15 % (the
+board's own workload shares the cores): over 27 runs each the pool and
+OpenMP are equal (prefill 45.5 vs 45.3, best 46.9 vs 46.6; decode 15.57
+vs 15.13); the 6-run `THREADS_DECODE=3` row is within that scatter (pool
+decode runs alternate 13.2–13.3 / 15.2–15.4 like OpenMP's 13.3–13.5 /
+15.3–15.8). The clang build is 4–6 % faster in prefill from code
+generation alone. Unpinned workers (`MOTY_POOL_PIN=0`) decode slower
+(14.04, 8 runs). The pool build does not re-exec itself (no OpenMP
+environment to seed).

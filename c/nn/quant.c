@@ -1,13 +1,17 @@
 /* quant.c — unica implementazione della quantizzazione (M2, libmoty-nn).
  * Firme moty_*; nn/nn_quant.h dichiara i prototipi + le macro legacy. */
 #include "nn/nn_quant.h"
+#include "nn/par.h"
 #include <string.h>
 #include "hw/hw.h"
 
-void moty_quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, int bits) {
-    int qmax = (1 << (bits - 1)) - 1;
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
+/* the packers below: rows [o0, o1) of w [O][I] */
+typedef struct { const float *w; void *q; float *scale; int I, bits, gs; } PackJob;
+
+static void quantize_rows_part(void *c_, int64_t o0, int64_t o1, int tid) {
+    const PackJob *c = c_; const float *w = c->w; int8_t *q = c->q; float *scale = c->scale; int I = c->I;
+    int qmax = (1 << (c->bits - 1)) - 1;
+    for (int o = (int)o0; o < (int)o1; o++) {
         const float *wr = w + (int64_t)o * I;
         float amax = 0.f; for (int i = 0; i < I; i++) { float a = fabsf(wr[i]); if (a > amax) amax = a; }
         float s = amax / qmax; if (s < 1e-8f) s = 1e-8f;
@@ -22,10 +26,15 @@ void moty_quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, i
     }
 }
 
-void moty_pack_int4(const float *w, uint8_t *q4, float *scale, int O, int I) {
+void moty_quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, int bits) {
+    PackJob c = { w, q, scale, I, bits, 0 };
+    moty_par_for(O, 0, quantize_rows_part, &c);
+}
+
+static void pack_int4_part(void *c_, int64_t o0, int64_t o1, int tid) {
+    const PackJob *c = c_; const float *w = c->w; uint8_t *q4 = c->q; float *scale = c->scale; int I = c->I;
     int rb = (I+1)/2;
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
+    for (int o = (int)o0; o < (int)o1; o++) {
         const float *wr = w + (int64_t)o*I; float amax = 0;
         for (int i = 0; i < I; i++) { float a = fabsf(wr[i]); if (a > amax) amax = a; }
         float s = amax/7.f; if (s < 1e-8f) s = 1e-8f; scale[o] = s;
@@ -39,11 +48,15 @@ void moty_pack_int4(const float *w, uint8_t *q4, float *scale, int O, int I) {
     }
 }
 
-void moty_pack_int4_grouped(const float *w, uint8_t *q4, float *scale, int O, int I, int gs) {
-    if (gs % 16) { fprintf(stderr, "pack_int4_grouped: gs=%d non multiplo di 16\n", gs); exit(1); }
-    int rb = (I+1)/2, ng = (I+gs-1)/gs;
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
+void moty_pack_int4(const float *w, uint8_t *q4, float *scale, int O, int I) {
+    PackJob c = { w, q4, scale, I, 4, 0 };
+    moty_par_for(O, 0, pack_int4_part, &c);
+}
+
+static void pack_int4_grouped_part(void *c_, int64_t o0, int64_t o1, int tid) {
+    const PackJob *c = c_; const float *w = c->w; uint8_t *q4 = c->q; float *scale = c->scale;
+    int I = c->I, gs = c->gs, rb = (I+1)/2, ng = (I+gs-1)/gs;
+    for (int o = (int)o0; o < (int)o1; o++) {
         const float *wr = w + (int64_t)o*I;
         uint8_t *qr = q4 + (int64_t)o*rb;
         float *scl = scale + (int64_t)o*ng;
@@ -62,10 +75,16 @@ void moty_pack_int4_grouped(const float *w, uint8_t *q4, float *scale, int O, in
     }
 }
 
-void moty_pack_int2(const float *w, uint8_t *q2, float *scale, int O, int I, int bits) {
-    int qmax = (1 << (bits - 1)) - 1, rb = (I+3)/4;
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
+void moty_pack_int4_grouped(const float *w, uint8_t *q4, float *scale, int O, int I, int gs) {
+    if (gs % 16) { fprintf(stderr, "pack_int4_grouped: gs=%d non multiplo di 16\n", gs); exit(1); }
+    PackJob c = { w, q4, scale, I, 4, gs };
+    moty_par_for(O, 0, pack_int4_grouped_part, &c);
+}
+
+static void pack_int2_part(void *c_, int64_t o0, int64_t o1, int tid) {
+    const PackJob *c = c_; const float *w = c->w; uint8_t *q2 = c->q; float *scale = c->scale; int I = c->I;
+    int qmax = (1 << (c->bits - 1)) - 1, rb = (I+3)/4;
+    for (int o = (int)o0; o < (int)o1; o++) {
         const float *wr = w + (int64_t)o*I; float amax = 0;
         for (int i = 0; i < I; i++) { float a = fabsf(wr[i]); if (a > amax) amax = a; }
         float s = amax/qmax; if (s < 1e-8f) s = 1e-8f; scale[o] = s;
@@ -79,6 +98,11 @@ void moty_pack_int2(const float *w, uint8_t *q2, float *scale, int O, int I, int
             qr[i>>2] = byte;
         }
     }
+}
+
+void moty_pack_int2(const float *w, uint8_t *q2, float *scale, int O, int I, int bits) {
+    PackJob c = { w, q2, scale, I, bits, 0 };
+    moty_par_for(O, 0, pack_int2_part, &c);
 }
 
 /* f32 -> IEEE half, round to nearest even (normal, subnormal, inf/nan) */

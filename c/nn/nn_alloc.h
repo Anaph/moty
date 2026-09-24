@@ -20,6 +20,7 @@
 /* OpenMP: header reale se compilato con -fopenmp, altrimenti stub inline a
  * un thread, cosi' i chiamanti (THREADS, scratch per-thread) non hanno
  * bisogno di #ifdef sparsi. Vive qui (fondazione) perche' gemm/att lo usano. */
+#include "nn/par.h"            /* the parallel loops: OpenMP or the MOTY_THREADPOOL pool */
 #ifdef _OPENMP
 #include <omp.h>
 #else

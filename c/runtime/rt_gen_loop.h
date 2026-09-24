@@ -155,8 +155,8 @@ static int gen_turn(Model *m, Tok *T, int *hist, int len, int k, int n_new, int 
      * shared with another busy process one fewer thread can be faster. */
     static int td = -1;
     if (td < 0) td = getenv("THREADS_DECODE") ? atoi(getenv("THREADS_DECODE")) : 0;
-    int th_prefill = omp_get_max_threads();
-    if (td > 0) omp_set_num_threads(td);
+    int th_prefill = moty_par_threads();
+    if (td > 0) moty_par_set_threads(td);
     t0 = now_s();
     for (int s = 0; s < n_new; s++) {
         OP_T(t_s);
@@ -178,7 +178,7 @@ static int gen_turn(Model *m, Tok *T, int *hist, int len, int k, int n_new, int 
     if (logit) free(logit);
     if (dump) fprintf(stderr, "\n");
     double tgen = now_s() - t0;
-    if (td > 0) omp_set_num_threads(th_prefill);
+    if (td > 0) moty_par_set_threads(th_prefill);
     prof_op_report("decode", ng, tgen);
     fprintf(stderr, "\n[" ENGINE_TAG "] prefill %d tok in %.2fs (%.1f tok/s) | decode %d tok in %.2fs (%.2f tok/s) | RSS %.2f GB\n",
             k, tpre, k/(tpre>1e-9?tpre:1e-9), ng, tgen, ng/(tgen>1e-9?tgen:1e-9), rss_gb());

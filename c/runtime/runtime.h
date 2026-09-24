@@ -116,7 +116,7 @@ static int engine_main(int argc, char **argv) {
     /* THREADS: tetto sul team OpenMP (batte OMP_NUM_THREADS), applicato PRIMA
      * di qualunque allocazione dipendente dal numero di thread. */
     const char *th_ = getenv("THREADS");
-    if (th_ && atoi(th_) > 0) omp_set_num_threads(atoi(th_));
+    if (th_ && atoi(th_) > 0) moty_par_set_threads(atoi(th_));
     RunEnv e;
     if (!parse_env(&e)) return 1;
     const char *snap = e.snap;

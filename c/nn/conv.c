@@ -2,6 +2,47 @@
 #include "util/prof.h"
 #include "nn/conv.h"
 
+/* the phases of the VNNI path, each one parallel region */
+typedef struct {
+    const MotyConvView *cv; float *bcx, *ybuf; const int8_t *cxi; const int32_t *cxg; const float *csx;
+    int8_t *yqi; int32_t *yqg; float *ysx; float *out; int S, D, K, ngD, rb;
+} ConvJob;
+static void conv_in_part(void *c_, int64_t r0, int64_t r1, int tid) {
+    const ConvJob *c = c_; const Mat *wi = c->cv->in_proj; int D = c->D, ngD = c->ngD, rb = c->rb;
+    for (int64_t r = r0; r < r1; r++) {
+        int s = (int)(r/(3*D)), o = (int)(r - (int64_t)s*3*D);
+        c->bcx[r] = c->csx[s] * dot_i4g8p(wi->q4 + (int64_t)o*rb, wi->qs + (int64_t)o*ngD,
+                                          c->cxi + (int64_t)s*D, c->cxg + (int64_t)s*ngD, D);
+    }
+}
+static void conv_dw_part(void *c_, int64_t ch0, int64_t ch1, int tid) {
+    const ConvJob *c = c_; int D = c->D;
+    for (int s = 0; s < c->S; s++) {
+        float *row = c->bcx + (int64_t)s*3*D;
+        moty_hw_shortconv_step(c->ybuf + (int64_t)s*D, row, row+D, row+2*D,
+                               c->cv->conv_w, c->cv->conv_state, c->K, (int)ch0, (int)ch1);
+    }
+}
+static void conv_q_part(void *c_, int64_t s0, int64_t s1, int tid) {
+    const ConvJob *c = c_; int D = c->D, ngD = c->ngD;
+    for (int64_t s = s0; s < s1; s++) {
+        c->ysx[s] = qrow_i8(c->ybuf + s*D, c->yqi + s*D, D);
+        for (int g = 0; g < ngD; g++) {
+            int32_t a = 0;
+            for (int j = 0; j < 32; j++) a += c->yqi[s*D + g*32+j];
+            c->yqg[s*ngD + g] = a;
+        }
+    }
+}
+static void conv_out_part(void *c_, int64_t r0, int64_t r1, int tid) {
+    const ConvJob *c = c_; const Mat *wo = c->cv->out_proj; int D = c->D, ngD = c->ngD, rb = c->rb;
+    for (int64_t r = r0; r < r1; r++) {
+        int s = (int)(r/D), o = (int)(r - (int64_t)s*D);
+        c->out[r] = c->ysx[s] * dot_i4g8p(wo->q4 + (int64_t)o*rb, wo->qs + (int64_t)o*ngD,
+                                          c->yqi + (int64_t)s*D, c->yqg + (int64_t)s*ngD, D);
+    }
+}
+
 void moty_nn_conv_layer(const MotyConvView *cv, const float *x, int S, float *out) {
     int D = cv->hidden, K = cv->conv_L;
     /* P5: arena per-Model, reserve unica per tutti i chunk (path VNNI completo) */
@@ -53,46 +94,14 @@ void moty_nn_conv_layer(const MotyConvView *cv, const float *x, int S, float *ou
             cxg[(int64_t)s*ngD + g] = a;
         }
     }
-    int rb = (D+1)/2;
-    int nth = omp_get_max_threads();
-    #pragma omp parallel
-    {
-        int t = omp_get_thread_num();
-        /* fase 1: in_proj — righe [0, S*3D) */
-        #pragma omp for schedule(static)
-        for (int r = 0; r < S*3*D; r++) {
-            int s = r/(3*D), o = r - s*3*D;
-            bcx[r] = csx[s] * dot_i4g8p(wi->q4 + (int64_t)o*rb, wi->qs + (int64_t)o*ngD,
-                                        cxi + (int64_t)s*D, cxg + (int64_t)s*ngD, D);
-        }
-        /* fase 2: conv depthwise — canali propri; per TOKEN: usa lo stato
-         * del canale e AGGIORNA subito (shift), sequenziale su s (causale).
-         * Ogni thread tocca solo i propri canali → niente race. */
-        int ch0 = (int)((int64_t)D * t / nth), ch1 = (int)((int64_t)D * (t+1) / nth);
-        for (int s = 0; s < S; s++) {
-            float *row = bcx + (int64_t)s*3*D;
-            moty_hw_shortconv_step(ybuf + (int64_t)s*D, row, row+D, row+2*D,
-                                   cv->conv_w, cv->conv_state, K, ch0, ch1);
-        }
-        /* quant ybuf per token — BARRIER prima: omp for sincronizza all'USCITA,
-         * non all'ingresso; senza questa un thread quota ybuf[0] mentre altri
-         * calcolano ancora i canali del token 0 (race) */
-        #pragma omp barrier
-        #pragma omp for schedule(static)
-        for (int s = 0; s < S; s++) {
-            ysx[s] = qrow_i8(ybuf + (int64_t)s*D, yqi + (int64_t)s*D, D);
-            for (int g = 0; g < ngD; g++) {
-                int32_t a = 0;
-                for (int j = 0; j < 32; j++) a += yqi[(int64_t)s*D + g*32+j];
-                yqg[(int64_t)s*ngD + g] = a;
-            }
-        }
-        /* fase 3: out_proj */
-        #pragma omp for schedule(static)
-        for (int r = 0; r < S*D; r++) {
-            int s = r/D, o = r - s*D;
-            out[r] = ysx[s] * dot_i4g8p(wo->q4 + (int64_t)o*rb, wo->qs + (int64_t)o*ngD,
-                                        yqi + (int64_t)s*D, yqg + (int64_t)s*ngD, D);
-        }
-    }
+    ConvJob c = { cv, bcx, ybuf, cxi, cxg, csx, yqi, yqg, ysx, out, S, D, K, ngD, (D+1)/2 };
+    moty_par_for((int64_t)S*3*D, 0, conv_in_part, &c);     /* fase 1: in_proj — righe [0, S*3D) */
+    /* fase 2: conv depthwise — canali propri; per TOKEN: usa lo stato del
+     * canale e AGGIORNA subito (shift), sequenziale su s (causale). Ogni
+     * thread tocca solo i propri canali → niente race. The end of each
+     * region is the barrier the next phase needs (ybuf complete before it
+     * is quantized). */
+    moty_par_for(D, 0, conv_dw_part, &c);
+    moty_par_for(S, 0, conv_q_part, &c);                    /* quant ybuf per token */
+    moty_par_for((int64_t)S*D, 0, conv_out_part, &c);       /* fase 3: out_proj */
 }

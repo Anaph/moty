@@ -54,6 +54,29 @@ static int r4_wants_q8(const char *name) {
  * or Q8R4 when `pname` matches Q8_TENSORS. A pre-packed container decides
  * by itself: "<name>" + F16 "<name>.s16", 64 bytes per block-group = Q4R4,
  * 128 = Q8R4. */
+/* int4 lm_head rows [v0, v1) re-packed from the int8 embedding table */
+typedef struct { Mat *h; const int8_t *eq; const float *eqs; int D; int64_t rb; } HeadI4Job;
+static void head_i4_part(void *c_, int64_t v0, int64_t v1, int tid) {
+    const HeadI4Job *c = c_; int D = c->D;
+    for (int64_t v = v0; v < v1; v++) {
+        float row[2048];
+        const int8_t *er = c->eq + v*D;
+        for (int i = 0; i < D; i++) row[i] = er[i] * c->eqs[v];
+        pack_int4(row, c->h->q4 + v*c->rb, c->h->qs + v, 1, D);
+    }
+}
+
+/* R4 packing of the 4-row blocks of one chunk read from disk */
+typedef struct { Mat *w; const float *chunk; int rr, o0, I, nb, gb; } R4PackJob;
+static void r4_pack_part(void *c_, int64_t b0, int64_t b1, int tid) {
+    const R4PackJob *c = c_; Mat *w = c->w; int I = c->I, nb = c->nb, rr = c->rr;
+    for (int b = (int)b0; b < (int)b1; b++) {
+        int nr = rr - b*4 < 4 ? rr - b*4 : 4, ob = c->o0/4 + b;
+        if (c->gb == 128) moty_pack_q8r4_block(c->chunk + (int64_t)b*4*I, nr, I, (int8_t *)w->q4 + (int64_t)ob*nb*128, w->s16 + (int64_t)ob*nb*4);
+        else moty_pack_q4r4_block(c->chunk + (int64_t)b*4*I, nr, I, w->q4 + (int64_t)ob*nb*64, w->s16 + (int64_t)ob*nb*4);
+    }
+}
+
 static void load_mat_r4(Model *m, Mat *w, const char *name, const char *pname, int O, int I) {
     int nb = I / 32, O4 = (O + 3) / 4;
     char sn[256]; snprintf(sn, sizeof sn, "%s.s16", name);
@@ -79,12 +102,8 @@ static void load_mat_r4(Model *m, Mat *w, const char *name, const char *pname, i
     for (int o0 = 0; o0 < O; o0 += rows) {
         int rr = O - o0 < rows ? O - o0 : rows;
         st_read_slice_f32(&m->S, name, (int64_t)o0*I, (int64_t)rr*I, chunk, 0);
-        #pragma omp parallel for schedule(static)
-        for (int b = 0; b < (rr + 3) / 4; b++) {
-            int nr = rr - b*4 < 4 ? rr - b*4 : 4, ob = o0/4 + b;
-            if (gb == 128) moty_pack_q8r4_block(chunk + (int64_t)b*4*I, nr, I, (int8_t *)w->q4 + (int64_t)ob*nb*128, w->s16 + (int64_t)ob*nb*4);
-            else moty_pack_q4r4_block(chunk + (int64_t)b*4*I, nr, I, w->q4 + (int64_t)ob*nb*64, w->s16 + (int64_t)ob*nb*4);
-        }
+        R4PackJob pj = { w, chunk, rr, o0, I, nb, gb };
+        moty_par_for((rr + 3) / 4, 0, r4_pack_part, &pj);
     }
     free(chunk);
 }
@@ -241,6 +260,14 @@ static int64_t g_micro_chunk = 4 << 20; /* byte f32 dello scratch di streaming *
  * Scratch statico che cresce e basta: contratto di chiamata SERIALE, come
  * matmul_q_s. Bit-identica al percorso f32 residente (stesse righe, stesso
  * dot_f32). */
+typedef struct { float *y; const float *x, *buf; int S, I, O, o0; } StreamJob;
+static void stream_rows(void *c_, int64_t r0, int64_t r1, int tid) {
+    const StreamJob *c = c_; int S = c->S, I = c->I, O = c->O;
+    for (int64_t o = r0; o < r1; o++)
+        for (int s = 0; s < S; s++)
+            c->y[(int64_t)s*O + c->o0 + o] = dot_f32(c->x + (int64_t)s*I, c->buf + o*I, I);
+}
+
 static void mat_stream(float *y, const float *x, const Mat *w, int S) {
     shards *Sh = (shards *)w->sh;
     int I = w->I, O = w->O;
@@ -252,10 +279,8 @@ static void mat_stream(float *y, const float *x, const Mat *w, int S) {
     for (int o0 = 0; o0 < O; o0 += rows) {
         int r = O - o0 < rows ? O - o0 : rows;
         st_read_slice_f32(Sh, w->sname, (int64_t)o0 * I, (int64_t)r * I, buf, g_micro_drop);
-        #pragma omp parallel for schedule(static)
-        for (int o = 0; o < r; o++)
-            for (int s = 0; s < S; s++)
-                y[(int64_t)s*O + o0 + o] = dot_f32(x + (int64_t)s*I, buf + (int64_t)o*I, I);
+        StreamJob sj = { y, x, buf, S, I, O, o0 };
+        moty_par_for(r, 0, stream_rows, &sj);
     }
 }
 
@@ -395,14 +420,8 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
             m->base.lm_head.q4 = balloc(V*rb, "lm_head i4");
             m->base.lm_head.qs = falloc(V);
             m->base.lm_head.fmt = WF_I4;
-            #pragma omp parallel for schedule(static)
-            for (int64_t v = 0; v < V; v++) {
-                float row[2048];
-                const int8_t *er = m->base.embed_q + v*D;
-                float es = m->base.embed_qs[v];
-                for (int i = 0; i < D; i++) row[i] = er[i] * es;
-                pack_int4(row, m->base.lm_head.q4 + v*rb, m->base.lm_head.qs + v, 1, D);
-            }
+            HeadI4Job hj = { &m->base.lm_head, m->base.embed_q, m->base.embed_qs, D, rb };
+            moty_par_for(V, 0, head_i4_part, &hj);
         } else {
             m->base.lm_head.f = m->base.embed; m->base.lm_head.q = m->base.embed_q; m->base.lm_head.qs = m->base.embed_qs;
             m->base.lm_head.fmt = m->base.embed_q ? WF_I8 : WF_F32;

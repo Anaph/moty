@@ -7,13 +7,20 @@
  * Prefill: tokens split across the team (NEON row kernel per token). Decode
  * stays serial: one row is ~35 us on an A53, less than what a parallel
  * region costs on average when a core is shared with another process. */
-static void silu_rows(float *out, const float *g, const float *u, int S, int I, int64_t gs, int64_t us) {
-    #pragma omp parallel for schedule(static) if (S >= 4)
-    for (int s = 0; s < S; s++) {
-        float *o = out + (int64_t)s*I;
-        if (o != g + (int64_t)s*gs) memcpy(o, g + (int64_t)s*gs, (size_t)I*sizeof(float));
-        moty_hw_silu_mul(o, u + (int64_t)s*us, I);
+typedef struct { float *out; const float *g, *u; int I; int64_t gs, us; } SiluJob;
+static void silu_part(void *c_, int64_t s0, int64_t s1, int tid) {
+    const SiluJob *c = c_; int I = c->I;
+    for (int64_t s = s0; s < s1; s++) {
+        float *o = c->out + s*I;
+        if (o != c->g + s*c->gs) memcpy(o, c->g + s*c->gs, (size_t)I*sizeof(float));
+        moty_hw_silu_mul(o, c->u + s*c->us, I);
     }
+}
+
+static void silu_rows(float *out, const float *g, const float *u, int S, int I, int64_t gs, int64_t us) {
+    SiluJob c = { out, g, u, I, gs, us };
+    if (S >= 4) moty_par_for(S, 0, silu_part, &c);
+    else silu_part(&c, 0, S, 0);
 }
 
 void moty_nn_dense_ffn(const MotyFfnView *f, const float *x, int S, float *out) {

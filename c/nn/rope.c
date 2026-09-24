@@ -1,5 +1,6 @@
 /* rope.c — M3 libmoty-nn */
 #include "nn/nn_rope.h"
+#include "nn/par.h"
 
 void moty_l2norm_head(float *x, int d) {
     double s = 0; for (int i = 0; i < d; i++) s += (double)x[i] * x[i];
@@ -12,8 +13,7 @@ void moty_l2norm_head(float *x, int d) {
  * posizione (tabella cresciuta a richiesta, stessa espressione del calcolo
  * diretto -> risultato bit-identico) invece che per ogni testa di ogni layer:
  * su A53 powf+cosf+sinf per coppia dominavano "qknorm+rope" nel profilo.
- * Chiamata seriale (fuori da regioni omp); dentro una regione: calcolo diretto. */
-#include <omp.h>
+ * Chiamata seriale (fuori da regioni parallele); dentro una regione: calcolo diretto. */
 #include <stdlib.h>
 typedef struct { float theta; int rot, npos; float *cs; } RopeTab;   /* cs[pos][rot/2][2] */
 static RopeTab g_rope[4]; static int g_nrope;
@@ -37,7 +37,7 @@ static const float *rope_row(float theta, int rot, int pos) {
 }
 
 void moty_rope_head(float *x, int pos, float theta, int rot) {
-    const float *cs = (!omp_in_parallel() && pos >= 0) ? rope_row(theta, rot, pos) : NULL;
+    const float *cs = (!moty_par_active() && pos >= 0) ? rope_row(theta, rot, pos) : NULL;
     for (int i = 0; i < rot / 2; i++) {
         float c, s;
         if (cs) { c = cs[2*i]; s = cs[2*i+1]; }

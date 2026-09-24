@@ -25,7 +25,15 @@ if(NOT GTest_FOUND)
   FetchContent_MakeAvailable(googletest)
 endif()
 
-find_package(OpenMP)
+if(MOTY_THREADPOOL)                  # see c/CMakeLists.txt
+  set(OpenMP_C_FOUND FALSE)
+  set(THREADS_PREFER_PTHREAD_FLAG ON)
+  find_package(Threads REQUIRED)
+  add_compile_definitions(MOTY_THREADPOOL)
+  link_libraries(Threads::Threads)
+else()
+  find_package(OpenMP)
+endif()
 enable_testing()
 include(GoogleTest)
 set(ENGDIR ${CMAKE_CURRENT_SOURCE_DIR}/..)
@@ -56,7 +64,7 @@ endif()
 # motori. MOTY_TEST_MARCH si applica anche a hw.c: i test esercitano il
 # tier SIMD reale della macchina.
 # libmoty-nn completa (M3): stessa lista del Makefile
-set(MOTY_NN_SRCS ../nn/alloc.c ../nn/quant.c ../nn/mat.c ../nn/matmul.c
+set(MOTY_NN_SRCS ../nn/par.c ../nn/alloc.c ../nn/quant.c ../nn/mat.c ../nn/matmul.c
                  ../nn/norm.c ../nn/rope.c ../nn/attn_kernels.c ../nn/sample.c
                  ../nn/attn.c ../nn/conv.c ../nn/ffn.c ../nn/moe.c ../nn/head.c
                  ../runtime/moecache.c ../io/tier.c)
@@ -121,6 +129,7 @@ moty_test(test_lfm2    lfm2_tests.c    lfm2_gtest.cc)
 moty_test(test_q4r4    q4r4_tests.c    q4r4_gtest.cc)
 moty_test(test_ops     ops_tests.c     ops_gtest.cc)
 moty_test(test_head    head_tests.c    head_gtest.cc)
+moty_test(test_par     par_tests.c     par_gtest.cc)
 moty_test(test_gemma   gemma_tests.c   gemma_gtest.cc)
 moty_test(test_glm     glm_tests.c     glm_gtest.cc)
 

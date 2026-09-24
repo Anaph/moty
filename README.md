@@ -20,10 +20,12 @@ make            # builds all engines (from repo root or c/)
 make qwen       # just one engine
 make portable   # portable CPU baseline (x86-64-v3 / armv8-a / power8)
 make test       # test suite (GoogleTest via a separate CMake build path)
+make THREADPOOL=1   # no OpenMP runtime needed: moty's own pthread pool
 
 # CMake build of record (same sources, same libraries):
 cmake -B c/build -S c && cmake --build c/build -j       # portable tier
 cmake -B c/build -S c -DMOTY_ARCH=native && cmake --build c/build -j
+cmake -B c/build -S c -DMOTY_THREADPOOL=ON               # pthread pool, no OpenMP
 ctest --test-dir c/build                                # the full suite
 ```
 
@@ -34,7 +36,14 @@ binaries; the Makefile additionally covers the exotic cross targets
 paths and is what CI-grade tooling should consume.
 
 Requirements: a C compiler (gcc/clang) and GNU make. Linux, macOS, Windows
-(MinGW/MSYS2), *BSD and PowerPC are supported. OpenMP is used when available.
+(MinGW/MSYS2), *BSD and PowerPC are supported. OpenMP is used when available;
+with a toolchain that has no OpenMP runtime (e.g. a clang without libomp)
+build with `THREADPOOL=1` (CMake `-DMOTY_THREADPOOL=ON`): the parallel
+loops then run on a small pool of persistent pthread workers (`c/nn/par.c`)
+instead of running single-threaded. The dense kernels (matmuls, attention,
+conv, FFN, head, sampling, loading) use it; the MoE and DeltaNet regions
+and the glm/olmoe/qwenmoe/gemma engines' own regions run serially in that
+build.
 
 The engines build with the C compiler alone. `make test` additionally needs
 cmake ≥ 3.24 and a C++ compiler for the GoogleTest harness (test logic itself
@@ -137,7 +146,7 @@ Common environment variables (qwen engine):
 | `Q4FMT` | `r4` on aarch64, else `g` | `QBITS=4` layout: `r4` = Q4R4 (ARMv8.0 NEON kernels, 4.5 bits/weight), `g` = legacy grouped int4 |
 | `EMBED` | `ram` | `disk` → no resident embedding table: the row of each input token is read from the snapshot (bf16/f32, no int8 rounding). With a tied lm_head it requires `QBITS=4 Q4FMT=r4` (the head is packed separately). Saves vocab×hidden bytes — 200 MB on MiniCPM5-1B |
 | `SAVE_PACKED` | — | `<dir>`: load with `QBITS=4 Q4FMT=r4`, write a pre-packed Q4R4 container (`<dir>/model.safetensors` + config/tokenizer files) and exit. Loading `SNAP=<dir>` with `QBITS=4` then skips bf16 reading and packing |
-| `THREADS` | — | cap the OpenMP team; overrides `OMP_NUM_THREADS`; applied before load |
+| `THREADS` | — | cap the thread team (OpenMP, or the `THREADPOOL` pool); overrides `OMP_NUM_THREADS`; applied before load |
 | `MEM_GB` | — | RAM budget in GiB: layers beyond the budget stream from disk each step |
 | `MEM_FRAC` | — | same budget as a fraction (0..1) of total physical RAM; `MEM_GB` wins |
 | `MICRO` | 0 | 1 → micro-RSS mode (qwen only): **no** weights resident, minimum possible RAM; see below |
@@ -184,7 +193,11 @@ and REF validation mode structurally bypasses it.
 On startup the engines seed hot-thread OpenMP defaults (`OMP_WAIT_POLICY=active`
 etc.) and re-exec themselves once so libgomp picks them up; any `OMP_`/`GOMP_`
 variable you set yourself wins, and `MOTY_NO_OMP_TUNE=1` disables the whole
-mechanism.
+mechanism. A `THREADPOOL=1` build does not re-exec: its workers are pinned
+one per CPU (like `OMP_PROC_BIND=close`; `MOTY_POOL_PIN=0` to disable),
+poll for the next parallel region `MOTY_POOL_SPIN` times (default 200000,
+like the tuned `GOMP_SPINCOUNT`) and then sleep; workers outside a smaller
+`THREADS_DECODE` team sleep at once.
 
 `MEM_GB`/`MEM_FRAC` (qwen and gemma) trade speed for memory: the engine keeps
 as many layers resident as fit the budget (embeddings, norms and recurrent

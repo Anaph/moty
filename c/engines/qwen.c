@@ -513,6 +513,27 @@ static void state_reset(Model *m) {
 /* attenzione GQA sui token nuovi x[S,hidden]; pos_base = posizione del primo token nuovo.
  * Con l->gated (Qwen3.5): q_proj emette [query|gate] per testa; il contesto viene
  * moltiplicato per sigmoid(gate) prima di o_proj. */
+/* scores + accumulation for (head, token) pairs [r0, r1), r = head*S + token;
+ * per-thread score row from att_sc (kv_alloc): no malloc in the hot region */
+typedef struct { Model *m; const float *q; float *ctx; int S, G, hd, layer, pos_base, kv8; int64_t qw; float scale; } QAttJob;
+static void qwen_att_part(void *c_, int64_t r0, int64_t r1, int tid) {
+    const QAttJob *c = c_; Model *m = c->m; int hd = c->hd, layer = c->layer;
+    float *sc = m->base.att_sc + (int64_t)tid * m->base.max_t;
+    for (int64_t r = r0; r < r1; r++) {
+        int hh = (int)(r / c->S), s = (int)(r % c->S);
+        int kvh = hh / c->G;                  /* GQA: testa kv condivisa */
+        int qpos = c->pos_base + s;
+        const float *qv = c->q + s*c->qw + (int64_t)hh*hd;
+        int64_t kvbase = (int64_t)kvh * m->base.max_t;
+        if (c->kv8) att_scores_i8(sc, qv, m->base.K8[layer], m->base.Ks[layer], kvbase, 0, qpos, hd, c->scale);
+        else        att_scores_f32(sc, qv, m->base.K[layer], kvbase, 0, qpos, hd, c->scale);
+        softmax_row(sc, qpos+1);
+        float *cx = c->ctx + s*c->qw + (int64_t)hh*hd;
+        if (c->kv8) att_accum_i8(cx, sc, m->base.V8[layer], m->base.Vs[layer], kvbase, 0, qpos, hd);
+        else        att_accum_f32(cx, sc, m->base.V[layer], kvbase, 0, qpos, hd);
+    }
+}
+
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     Cfg *c = &m->c;
     int H = c->n_heads, KV = c->n_kv_heads, hd = c->head_dim;
@@ -590,24 +611,8 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     OP_T(t_at);
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = falloc(S*qw);
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int hh = 0; hh < H; hh++) {
-        for (int s = 0; s < S; s++) {
-            /* scratch pre-allocato per thread (att_sc, vedi kv_alloc): niente
-             * malloc/free dentro la regione calda */
-            float *sc = m->base.att_sc + (int64_t)omp_get_thread_num() * m->base.max_t;
-            int kvh = hh / G;                 /* GQA: testa kv condivisa */
-            int qpos = pos_base + s;
-            const float *qv = q + s*qw + (int64_t)hh*hd;
-            int64_t kvbase = (int64_t)kvh * m->base.max_t;
-            if (kv8) att_scores_i8(sc, qv, m->base.K8[layer], m->base.Ks[layer], kvbase, 0, qpos, hd, scale);
-            else     att_scores_f32(sc, qv, m->base.K[layer], kvbase, 0, qpos, hd, scale);
-            softmax_row(sc, qpos+1);
-            float *cx = ctx + s*qw + (int64_t)hh*hd;
-            if (kv8) att_accum_i8(cx, sc, m->base.V8[layer], m->base.Vs[layer], kvbase, 0, qpos, hd);
-            else     att_accum_f32(cx, sc, m->base.V[layer], kvbase, 0, qpos, hd);
-        }
-    }
+    QAttJob aj = { m, q, ctx, S, G, hd, layer, pos_base, kv8, qw, scale };
+    moty_par_for((int64_t)H*S, 0, qwen_att_part, &aj);
     if (gate) {                            /* Qwen3.5: gating per-elemento sull'output */
         for (int64_t i = 0; i < S*qw; i++) ctx[i] *= 1.f/(1.f + expf(-gate[i]));
         free(gate);

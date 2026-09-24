@@ -128,6 +128,15 @@ endif
 endif
 endif
 
+# THREADPOOL=1: build without an OpenMP runtime (e.g. a clang toolchain that
+# ships no libomp); the parallel loops run on moty's own pthread pool
+# (nn/par.c, docs/architecture.md). OpenMP stays the default. `override`
+# so that CFLAGS/LDFLAGS given on the command line are filtered too.
+ifeq ($(THREADPOOL),1)
+override CFLAGS  := $(filter-out -fopenmp -Xclang,$(CFLAGS)) -DMOTY_THREADPOOL -pthread -Wno-unknown-pragmas
+override LDFLAGS := $(filter-out -fopenmp -lomp,$(LDFLAGS)) -pthread
+endif
+
 # Motori da compilare con `make all`. glm.c e' AArch64-only (intrinseci NEON
 # vaddvq a 64-bit + MoE 744B: nessun target Cortex-A 32-bit lo userebbe); sui
 # triplet ARMV7 lo escludiamo e `make glm` dara' errore esplicito se richiesto.
@@ -154,10 +163,10 @@ endif
 # whole program runs. Engines link the archive; hw.h holds only prototypes
 # + legacy name macros (docs/modularization-plan.md, docs/symbol-map.md).
 # ---- libmoty-nn (M2 core + M3 layer): UNA copia di tutta la compute ----
-NN_CORE_SRCS = nn/alloc.c nn/quant.c nn/mat.c nn/matmul.c nn/norm.c nn/rope.c \
+NN_CORE_SRCS = nn/par.c nn/alloc.c nn/quant.c nn/mat.c nn/matmul.c nn/norm.c nn/rope.c \
                nn/attn_kernels.c nn/sample.c nn/attn.c nn/conv.c nn/ffn.c \
                nn/moe.c nn/head.c runtime/moecache.c io/tier.c
-NN_CORE_DEPS = nn/nn_alloc.h nn/nn_quant.h nn/nn_mat.h nn/nn_matmul.h \
+NN_CORE_DEPS = nn/par.h nn/nn_alloc.h nn/nn_quant.h nn/nn_mat.h nn/nn_matmul.h \
                nn/nn_norm.h nn/nn_rope.h nn/nn_attn_kernels.h nn/nn_sample.h \
                nn/attn.h nn/conv.h nn/ffn.h nn/moe.h nn/head.h runtime/moe.h io/tier.h
 libmoty-nn.a: $(NN_CORE_SRCS) $(NN_CORE_DEPS) libmoty-hw.a

@@ -12,48 +12,80 @@ int moty_argmax_v(const float *lo, int V){
     return b;
 }
 
+/* per-thread partials of the vocabulary scans below */
+typedef struct { const float *lo; float *p; int *bid; float *bvl; double *sum; int *cnt; int *off; int *pidx; float thr, mx, invt, inv; } VocJob;
+static void argmax_part(void *c_, int64_t i0, int64_t i1, int t) {
+    VocJob *c = c_; int nb = 0; float nv = -1e30f;
+    for (int64_t i = i0; i < i1; i++) if (c->lo[i] > nv) { nv = c->lo[i]; nb = (int)i; }
+    c->bid[t] = nb; c->bvl[t] = nv;
+}
+static void max_part(void *c_, int64_t i0, int64_t i1, int t) {      /* max of lo (or of p if lo is NULL) */
+    VocJob *c = c_; const float *a = c->lo ? c->lo : c->p; float m = -1e30f;
+    for (int64_t i = i0; i < i1; i++) if (a[i] > m) m = a[i];
+    c->bvl[t] = m;
+}
+static void exp_part(void *c_, int64_t i0, int64_t i1, int t) {
+    VocJob *c = c_; double s = 0;
+    for (int64_t i = i0; i < i1; i++) { c->p[i] = expf((c->lo[i]-c->mx)*c->invt); s += c->p[i]; }
+    c->sum[t] = s;
+}
+static void scale_part(void *c_, int64_t i0, int64_t i1, int t) {
+    VocJob *c = c_;
+    for (int64_t i = i0; i < i1; i++) c->p[i] *= c->inv;
+}
+static void count_part(void *c_, int64_t i0, int64_t i1, int t) {
+    VocJob *c = c_; int n = 0;
+    for (int64_t i = i0; i < i1; i++) if (c->p[i] > c->thr) n++;
+    c->cnt[t] = n;
+}
+static void fill_part(void *c_, int64_t i0, int64_t i1, int t) {   /* same static split as count_part */
+    VocJob *c = c_; int q = c->off[t];
+    for (int64_t i = i0; i < i1; i++)
+        if (c->p[i] > c->thr) { c->bvl[q] = c->p[i]; c->pidx[q] = (int)i; q++; }
+}
+/* partial max over threads (a thread with an empty range left -1e30) */
+static float max_of(const float *v, int n) { float m = v[0]; for (int t = 1; t < n; t++) if (v[t] > m) m = v[t]; return m; }
+
 int moty_argmax_v_par(Scratch *sc, const float *lo, int V){
     if (V < 8192) return argmax_v(lo, V);
-    int bt = omp_get_max_threads();
+    int bt = moty_par_threads();
     scr_reset(sc);
     scr_reserve(sc, scr_al((int64_t)bt*4) + scr_al((int64_t)bt*4));
     int *bid = scr_take(sc, scr_al((int64_t)bt*4));
     float *bvl = scr_take(sc, scr_al((int64_t)bt*4));
-    #pragma omp parallel
-    {
-        int t = omp_get_thread_num(), nb = 0; float nv = -1e30f;
-        #pragma omp for schedule(static)
-        for (int i = 0; i < V; i++) if (lo[i] > nv) { nv = lo[i]; nb = i; }
-        bid[t] = nb; bvl[t] = nv;
-    }
+    for (int t = 0; t < bt; t++) { bid[t] = 0; bvl[t] = -1e30f; }
+    VocJob c = { .lo = lo, .bid = bid, .bvl = bvl };
+    moty_par_for(V, 0, argmax_part, &c);
     int b = bid[0]; float bv = bvl[0];
     for (int t = 1; t < bt; t++) if (bvl[t] > bv) { bv = bvl[t]; b = bid[t]; }
     return b;
 }
 
 void moty_dist_build(Scratch *sc, SampBuf *sb, const float *lo, int V){
-    int nth = omp_get_max_threads();
+    int nth = moty_par_threads();
     scr_reset(sc);
     scr_reserve(sc, 2*scr_al((int64_t)V*4) + 2*scr_al((int64_t)V*4)
-                      + scr_al((int64_t)nth*4) + scr_al((int64_t)(nth+1)*4));
+                      + scr_al((int64_t)nth*4) + scr_al((int64_t)(nth+1)*4)
+                      + scr_al((int64_t)nth*4) + scr_al((int64_t)nth*8));
     float *g_pbuf = scr_take(sc, (int64_t)V*4);   int *g_pidx = scr_take(sc, scr_al((int64_t)V*4));
     float *g_pbuf2 = scr_take(sc, (int64_t)V*4);  int *g_pidx2 = scr_take(sc, scr_al((int64_t)V*4));
     int *cnt = scr_take(sc, scr_al((int64_t)nth*4));
     int *off = scr_take(sc, scr_al((int64_t)(nth+1)*4));
+    float *part = scr_take(sc, scr_al((int64_t)nth*4));
+    double *psum = scr_take(sc, scr_al((int64_t)nth*8));
     g_cmp_p = g_pbuf;
     sb->pbuf = g_pbuf; sb->pidx = g_pidx; sb->pbuf2 = g_pbuf2; sb->pidx2 = g_pidx2;
     float invt=1.f/(g_temp>1e-4f?g_temp:1e-4f);
     if (V >= 16384) {
         /* V=128k: max+expf+sum+normalizza PARALLELI (seriali = ~1.5-2.5ms/tok) */
-        float mx = -1e30f;
-        #pragma omp parallel for reduction(max:mx) schedule(static)
-        for (int i = 0; i < V; i++) if (lo[i] > mx) mx = lo[i];
-        double s = 0;
-        #pragma omp parallel for reduction(+:s) schedule(static)
-        for (int i = 0; i < V; i++) { g_pbuf[i] = expf((lo[i]-mx)*invt); s += g_pbuf[i]; }
-        float inv = (float)(1.0/s);
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < V; i++) g_pbuf[i] *= inv;
+        for (int t = 0; t < nth; t++) { part[t] = -1e30f; psum[t] = 0; }
+        VocJob c = { .lo = lo, .p = g_pbuf, .bvl = part, .sum = psum, .invt = invt };
+        moty_par_for(V, 0, max_part, &c);
+        c.mx = max_of(part, nth);
+        moty_par_for(V, 0, exp_part, &c);
+        double s = 0; for (int t = 0; t < nth; t++) s += psum[t];
+        c.inv = (float)(1.0/s);
+        moty_par_for(V, 0, scale_part, &c);
     } else {
         float mx=lo[0]; for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
         double s=0;
@@ -65,33 +97,23 @@ void moty_dist_build(Scratch *sc, SampBuf *sb, const float *lo, int V){
          * ordinano solo i candidati sopra soglia (tipicamente <1k); se la
          * loro massa non copre nuc, fallback sul qsort completo (raro). */
         float pmax;
-        if (V >= 16384) { pmax = -1e30f;
-            #pragma omp parallel for reduction(max:pmax) schedule(static)
-            for (int i = 0; i < V; i++) if (g_pbuf[i] > pmax) pmax = g_pbuf[i];
+        if (V >= 16384) {
+            for (int t = 0; t < nth; t++) part[t] = -1e30f;
+            VocJob c = { .p = g_pbuf, .bvl = part };
+            moty_par_for(V, 0, max_part, &c);
+            pmax = max_of(part, nth);
         } else { pmax = g_pbuf[0]; for(int i=1;i<V;i++) if(g_pbuf[i]>pmax) pmax=g_pbuf[i]; }
         float thr = pmax * 1e-5f;
         int nc = 0;
         if (V >= 16384) {
-            /* scan+collect parallelo: conteggio per thread, offset, fill */
-            (void)0;
-            #pragma omp parallel
-            {
-                int t = omp_get_thread_num();
-                int c = 0;
-                #pragma omp for schedule(static) nowait
-                for (int i = 0; i < V; i++) if (g_pbuf[i] > thr) c++;
-                cnt[t] = c;
-            }
+            /* scan+collect parallelo: conteggio per thread, offset, fill
+             * (both passes on the same static split) */
+            for (int t = 0; t < nth; t++) cnt[t] = 0;
+            VocJob c = { .p = g_pbuf, .cnt = cnt, .off = off, .bvl = g_pbuf2, .pidx = g_pidx2, .thr = thr };
+            moty_par_for(V, 0, count_part, &c);
             off[0] = 0;
             for (int t2 = 0; t2 < nth; t2++) off[t2+1] = off[t2] + cnt[t2];
-            #pragma omp parallel
-            {
-                int t = omp_get_thread_num();
-                int p = off[t];
-                int i0 = (int)((int64_t)V * t / nth), i1 = (int)((int64_t)V * (t+1) / nth);
-                for (int i = i0; i < i1; i++)
-                    if (g_pbuf[i] > thr) { g_pbuf2[p] = g_pbuf[i]; g_pidx2[p] = i; p++; }
-            }
+            moty_par_for(V, 0, fill_part, &c);
             nc = off[nth];
         } else {
             for(int i=0;i<V;i++) if(g_pbuf[i] > thr) { g_pbuf2[nc] = g_pbuf[i]; g_pidx2[nc] = i; nc++; }

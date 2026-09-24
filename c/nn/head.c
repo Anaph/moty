@@ -5,17 +5,27 @@
 #include "nn/head.h"
 #include "nn/nn_alloc.h"
 
+typedef struct { MotyHeadSL *h; const Mat *head; } SlBuildJob;
+static void sl_build_part(void *c_, int64_t v0, int64_t v1, int tid);
+
 int moty_nn_head_sl_build(MotyHeadSL *h, const Mat *head, int K) {
     memset(h, 0, sizeof *h);
     if (head->fmt != WF_Q4R4 || head->I % 32 || K <= 0) return 0;
-    int V = head->O, D = head->I, nb = D / 32, rb = D / 8;
+    int V = head->O, D = head->I, rb = D / 8;
     if (K > V) K = V;
     h->V = V; h->D = D; h->K = K;
     h->bits = malloc((size_t)V * rb); h->scale = malloc(sizeof(float) * V); h->pc = malloc(sizeof(int32_t) * V);
     if (!h->bits || !h->scale || !h->pc) { moty_nn_head_sl_free(h); return 0; }
     /* from the packed codes: value = (q-8)*d, q = low/high nibble */
-    #pragma omp parallel for schedule(static)
-    for (int v = 0; v < V; v++) {
+    SlBuildJob c = { h, head };
+    moty_par_for(V, 0, sl_build_part, &c);
+    return 1;
+}
+
+static void sl_build_part(void *c_, int64_t v0, int64_t v1, int tid) {
+    const SlBuildJob *c = c_; MotyHeadSL *h = c->h; const Mat *head = c->head;
+    int D = h->D, nb = D / 32, rb = D / 8;
+    for (int v = (int)v0; v < (int)v1; v++) {
         int b = v / 4, r = v % 4;
         uint8_t *row = h->bits + (size_t)v * rb;
         memset(row, 0, rb);
@@ -33,7 +43,6 @@ int moty_nn_head_sl_build(MotyHeadSL *h, const Mat *head, int K) {
         }
         h->scale[v] = (float)(sa / D); h->pc[v] = pc;
     }
-    return 1;
 }
 
 void moty_nn_head_sl_free(MotyHeadSL *h) {
@@ -58,10 +67,11 @@ static int32_t head_planes(const float *x, int D, uint8_t *pl) {
     return su;
 }
 
-static void head_scores(const MotyHeadSL *h, const uint8_t *pl, int32_t su, float *score) {
+typedef struct { const MotyHeadSL *h; const uint8_t *pl; int32_t su; float *score; } ScoreJob;
+static void scores_part(void *c_, int64_t b0, int64_t b1, int tid) {
+    const ScoreJob *c = c_; const MotyHeadSL *h = c->h; const uint8_t *pl = c->pl; int32_t su = c->su; float *score = c->score;
     int V = h->V, D = h->D, rb = D / 8, full = V / 4;
-    #pragma omp parallel for schedule(dynamic, 64)
-    for (int b = 0; b < (V + 3) / 4; b++) {
+    for (int b = (int)b0; b < (int)b1; b++) {
         uint32_t cnt[12];
         if (b < full) moty_hw_popc4x3(h->bits + (size_t)b*4*rb, rb, pl, rb, cnt);
         else {                                         /* ragged tail: rows one by one */
@@ -80,6 +90,11 @@ static void head_scores(const MotyHeadSL *h, const uint8_t *pl, int32_t su, floa
             score[v] = h->scale[v] * (float)(2*sb - 8*h->pc[v] - su + 4*D);
         }
     }
+}
+
+static void head_scores(const MotyHeadSL *h, const uint8_t *pl, int32_t su, float *score) {
+    ScoreJob c = { h, pl, su, score };
+    moty_par_for((h->V + 3) / 4, 64, scores_part, &c);
 }
 
 void moty_nn_head_sl_scores(const MotyHeadSL *h, const float *x, float *score) {
@@ -103,6 +118,17 @@ static float kth_largest(float *a, int n, int k) {
         if (want <= j) hi = j; else if (want >= i) lo = i; else break;
     }
     return a[want];
+}
+
+/* stage 2 of the head: exact logits of candidate blocks [i0, i1) */
+typedef struct { float *logit; const Mat *head; const int32_t *blk; const int8_t *xq; const float *xs; const int32_t *xm; int nb, V; } ExactJob;
+static void exact_part(void *c_, int64_t i0, int64_t i1, int tid) {
+    const ExactJob *c = c_; int nb = c->nb;
+    for (int64_t i = i0; i < i1; i++) {
+        int b = c->blk[i]; float y4[4];
+        moty_hw_q4r4_gemm(c->head->q4 + (size_t)b*nb*64, c->head->s16 + (size_t)b*nb*4, c->xq, c->xs, c->xm, nb, 1, y4, 4);
+        for (int r = 0; r < 4 && b*4 + r < c->V; r++) c->logit[b*4 + r] = y4[r];
+    }
 }
 
 void moty_nn_head_apply(float *logit, const float *x, const Mat *head, const MotyHeadSL *h) {
@@ -142,10 +168,6 @@ void moty_nn_head_apply(float *logit, const float *x, const Mat *head, const Mot
     /* stage 2: exact Q4R4 logits of the candidate blocks, -1e30 elsewhere */
     moty_hw_quant_g32(x, D, xq, xs, xm);
     for (int v = 0; v < V; v++) logit[v] = -1e30f;
-    #pragma omp parallel for schedule(dynamic, 4)
-    for (int i = 0; i < nblk; i++) {
-        int b = blk[i]; float y4[4];
-        moty_hw_q4r4_gemm(head->q4 + (size_t)b*nb*64, head->s16 + (size_t)b*nb*4, xq, xs, xm, nb, 1, y4, 4);
-        for (int r = 0; r < 4 && b*4 + r < V; r++) logit[b*4 + r] = y4[r];
-    }
+    ExactJob c = { logit, head, blk, xq, xs, xm, nb, V };
+    moty_par_for(nblk, 4, exact_part, &c);
 }

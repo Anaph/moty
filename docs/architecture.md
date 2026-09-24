@@ -45,6 +45,28 @@ c/
   `_axpy`, `_add`, `_shortconv_step` — row ops (`hw/hw_ops.h`). Every one
   has a `*_ref` scalar reference that is also the portable kernel.
 
+### Parallel loops (`nn/par.h`)
+
+The dense kernels parallelise through one call, `moty_par_for(n, chunk,
+fn, ctx)`: `fn(ctx, i0, i1, tid)` covers `[i0, i1)` on thread `tid`;
+`chunk == 0` gives each thread one contiguous range split like
+`schedule(static)` (`moty_par_range`), `chunk > 0` hands out chunks in
+order like `schedule(dynamic, chunk)` (the Q4R4/Q8R4 block loops use 8
+blocks). The end of a call is the barrier; a call from inside a region
+runs serially on the calling thread. Two backends, chosen at build time:
+OpenMP (default: thin wrappers over `#pragma omp`) and `MOTY_THREADPOOL`
+(`make THREADPOOL=1`, CMake `-DMOTY_THREADPOOL=ON`): persistent pthread
+workers pinned one per CPU of the process's mask, a generation counter
+that publishes each region, workers polling it (`MOTY_POOL_SPIN`) and then
+sleeping on a per-worker condition variable, the caller doing its own
+share and waiting on a done counter. `moty_par_set_threads` is what
+`THREADS` and `THREADS_DECODE` call; workers outside a smaller team go to
+sleep instead of polling, which leaves their core to other processes.
+Per-thread scratch (attention score rows) is indexed by `tid` and sized
+by `moty_par_threads()`. Sites not converted (MoE, DeltaNet, the
+glm/olmoe/qwenmoe/gemma engines) keep their pragmas and run serially in
+a pool build.
+
 ## Module reference
 
 | Folder | Key files | Role |

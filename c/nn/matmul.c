@@ -6,12 +6,45 @@
 #include "io/gguf.h"
 #include "nn/nn_matmul.h"
 
-void moty_matmul(float *y, const float *x, const float *W, int S, int I, int O) {
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const float *w = W + (int64_t)o * I;
+/* one context for the row loops below: each fills y[s][o] for rows [o0, o1) */
+typedef struct {
+    float *y; const float *x; const float *W; const int8_t *q; const uint8_t *q4; const float *scale;
+    const int8_t *xi; const float *sx; const int32_t *xg; int S, I, O, gs;
+} RowJob;
+
+static void f32_rows(void *c_, int64_t o0, int64_t o1, int tid) {
+    const RowJob *c = c_; int S = c->S, I = c->I, O = c->O;
+    for (int o = (int)o0; o < (int)o1; o++) {
+        const float *w = c->W + (int64_t)o * I;
         for (int s = 0; s < S; s++)
-            y[(int64_t)s * O + o] = dot_f32(x + (int64_t)s*I, w, I);
+            c->y[(int64_t)s * O + o] = dot_f32(c->x + (int64_t)s*I, w, I);
+    }
+}
+
+void moty_matmul(float *y, const float *x, const float *W, int S, int I, int O) {
+    RowJob c = { .y = y, .x = x, .W = W, .S = S, .I = I, .O = O };
+    moty_par_for(O, 0, f32_rows, &c);
+}
+
+static void q8_idot_rows(void *c_, int64_t o0, int64_t o1, int tid) {
+    const RowJob *c = c_; int S = c->S, I = c->I, O = c->O;
+    for (int o = (int)o0; o < (int)o1; o++) {
+        const int8_t *w = c->q + (int64_t)o*I;
+        for (int s = 0; s < S; s++)
+            c->y[(int64_t)s*O + o] = c->scale[o] * c->sx[s] * (float)dot_i8i8(w, c->xi + (int64_t)s*I, I);
+    }
+}
+
+static void q8_f32_rows(void *c_, int64_t o0, int64_t o1, int tid) {
+    const RowJob *c = c_; int S = c->S, I = c->I, O = c->O;
+    for (int o = (int)o0; o < (int)o1; o++) {
+        const int8_t *w = c->q + (int64_t)o * I;
+        for (int s = 0; s < S; s++) {
+            const float *xs = c->x + (int64_t)s*I;
+            float acc = 0.f;
+            for (int i = 0; i < I; i++) acc += xs[i] * (float)w[i];
+            c->y[(int64_t)s*O + o] = acc * c->scale[o];
+        }
     }
 }
 
@@ -24,52 +57,53 @@ void moty_matmul_q_s(float *y, const float *x, const int8_t *q, const float *sca
         grow((void **)&xi, &xcap, (int64_t)S*I, 1, "attivazioni int8");
         grow((void **)&sx, &scap, S, sizeof(float), "scale attivazioni");
         for (int s = 0; s < S; s++) sx[s] = qrow_i8(x + (int64_t)s*I, xi + (int64_t)s*I, I);
-        #pragma omp parallel for schedule(static)
-        for (int o = 0; o < O; o++) {
-            const int8_t *w = q + (int64_t)o*I;
-            for (int s = 0; s < S; s++)
-                y[(int64_t)s*O + o] = scale[o] * sx[s] * (float)dot_i8i8(w, xi + (int64_t)s*I, I);
-        }
+        RowJob c = { .y = y, .q = q, .scale = scale, .xi = xi, .sx = sx, .S = S, .I = I, .O = O };
+        moty_par_for(O, 0, q8_idot_rows, &c);
         return;
     }
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const int8_t *w = q + (int64_t)o * I;
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s*I;
-            float acc = 0.f;
-            for (int i = 0; i < I; i++) acc += xs[i] * (float)w[i];
-            y[(int64_t)s*O + o] = acc * scale[o];
-        }
-    }
+    RowJob c = { .y = y, .x = x, .q = q, .scale = scale, .S = S, .I = I, .O = O };
+    moty_par_for(O, 0, q8_f32_rows, &c);
 }
 
 void moty_matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
     matmul_q_s(y, x, q, scale, 1, I, O);
 }
 
+static void i4_idot_rows(void *c_, int64_t o0, int64_t o1, int tid);
+static void i4_f32_rows(void *c_, int64_t o0, int64_t o1, int tid);
+
 void moty_matmul_i4_s(float *y, const float *x, const uint8_t *q4, const float *scale, int S, int I, int O) {
     static int idot4 = -1;
     if (idot4 < 0) { const char *e = getenv("IDOT4"); idot4 = e ? atoi(e) : 0; }
-    int rb = (I+1)/2;
     if (idot4 && I <= NN_QROW_MAX) {
         static int8_t *xi = NULL; static float *sx = NULL;
         static int64_t xcap = 0, scap = 0;
         grow((void **)&xi, &xcap, (int64_t)S*I, 1, "idot4 xi");
         grow((void **)&sx, &scap, S, sizeof(float), "idot4 sx");
         for (int s = 0; s < S; s++) sx[s] = qrow_i8(x + (int64_t)s*I, xi + (int64_t)s*I, I);
-        #pragma omp parallel for schedule(static)
-        for (int o = 0; o < O; o++) {
-            const uint8_t *w4 = q4 + (int64_t)o*rb;
-            for (int s = 0; s < S; s++)
-                y[(int64_t)s*O + o] = scale[o] * sx[s] * (float)dot_i4i8(w4, xi + (int64_t)s*I, I);
-        }
+        RowJob c = { .y = y, .q4 = q4, .scale = scale, .xi = xi, .sx = sx, .S = S, .I = I, .O = O };
+        moty_par_for(O, 0, i4_idot_rows, &c);
         return;
     }
     /* f32×int4 dequant-on-fly */
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const uint8_t *w = q4 + (int64_t)o*rb; float sc = scale[o];
+    RowJob c = { .y = y, .x = x, .q4 = q4, .scale = scale, .S = S, .I = I, .O = O };
+    moty_par_for(O, 0, i4_f32_rows, &c);
+}
+
+static void i4_idot_rows(void *c_, int64_t o0, int64_t o1, int tid) {
+    const RowJob *c = c_; int S = c->S, I = c->I, O = c->O, rb = (I+1)/2;
+    for (int o = (int)o0; o < (int)o1; o++) {
+        const uint8_t *w4 = c->q4 + (int64_t)o*rb;
+        for (int s = 0; s < S; s++)
+            c->y[(int64_t)s*O + o] = c->scale[o] * c->sx[s] * (float)dot_i4i8(w4, c->xi + (int64_t)s*I, I);
+    }
+}
+
+static void i4_f32_rows(void *c_, int64_t o0, int64_t o1, int tid) {
+    const RowJob *c = c_; int S = c->S, I = c->I, O = c->O, rb = (I+1)/2;
+    const float *x = c->x; float *y = c->y;
+    for (int o = (int)o0; o < (int)o1; o++) {
+        const uint8_t *w = c->q4 + (int64_t)o*rb; float sc = c->scale[o];
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s*I; float a = 0; int i = 0;
 #if defined(__AVX2__)
@@ -110,9 +144,25 @@ void moty_matmul_i4_s(float *y, const float *x, const uint8_t *q4, const float *
     }
 }
 
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+static void i4g_vnni_rows(void *c_, int64_t o0, int64_t o1, int tid) {
+    const RowJob *c = c_; int S = c->S, I = c->I, O = c->O, rb = (I+1)/2, ng = I/32;
+    const uint8_t *pf = c->q4 + o0*rb;
+    for (int64_t k = 0; k < 512 && k < (o1-o0)*rb; k += 64)
+        __builtin_prefetch(pf + k, 0, 3);
+    for (int o = (int)o0; o < (int)o1; o++) {
+        const uint8_t *wr = c->q4 + (int64_t)o*rb;
+        const float *sr = c->scale + (int64_t)o*ng;
+        for (int s = 0; s < S; s++)
+            c->y[(int64_t)s*O + o] = c->sx[s] * dot_i4g8p(wr, sr, c->xi + (int64_t)s*I, c->xg + (int64_t)s*ng, I);
+    }
+}
+#endif
+
+static void i4g_f32_rows(void *c_, int64_t o0, int64_t o1, int tid);
+
 void moty_matmul_i4_grouped_s(float *y, const float *x, const uint8_t *q4, const float *scale,
                                 int S, int I, int O, int gs) {
-    int rb = (I+1)/2, ng = (I+gs-1)/gs;
     /* IDOT4: VNNI per gruppo (dot_i4g8p). x quantizzato int8 per riga una
      * volta (stessa doppia-quant degli expert, validata A/B sui token). */
 #if defined(__AVX512F__) && defined(__AVX512VNNI__)
@@ -120,6 +170,7 @@ void moty_matmul_i4_grouped_s(float *y, const float *x, const uint8_t *q4, const
         static int idot4 = -1;
         if (idot4 < 0) { const char *e = getenv("IDOT4"); idot4 = e ? atoi(e) : 0; }
         if (idot4 && gs == 32 && (I & 63) == 0 && I <= NN_QROW_MAX) {
+            int ng = I / 32;
             static int8_t *xi = NULL; static int32_t *xg = NULL; static float *sx = NULL;
             static int64_t xic = 0, xgc = 0, sxc = 0;
             grow((void**)&xi, &xic, (int64_t)S*I, 1, "g4 xi");
@@ -133,33 +184,24 @@ void moty_matmul_i4_grouped_s(float *y, const float *x, const uint8_t *q4, const
                     xg[(int64_t)s*ng + g] = a;
                 }
             }
-            {   /* regione esplicita: ogni thread prefetcha la testa del SUO
-                 * chunk (ramp ~15-30us su matrici piccole da 2-6MB) */
-                int nth = omp_get_max_threads();
-                #pragma omp parallel
-                {
-                    int t = omp_get_thread_num();
-                    int o0 = (int)((int64_t)O * t / nth);
-                    const uint8_t *pf = q4 + (int64_t)o0*rb;
-                    for (int k = 0; k < 512 && k < (O-o0)*rb; k += 64)
-                        __builtin_prefetch(pf + k, 0, 3);
-                    #pragma omp for schedule(static)
-                    for (int o = 0; o < O; o++) {
-                        const uint8_t *wr = q4 + (int64_t)o*rb;
-                        const float *sr = scale + (int64_t)o*ng;
-                        for (int s = 0; s < S; s++)
-                            y[(int64_t)s*O + o] = sx[s] * dot_i4g8p(wr, sr, xi + (int64_t)s*I, xg + (int64_t)s*ng, I);
-                    }
-                }
-            }
+            /* static split: each thread prefetches the head of its own
+             * range (ramp ~15-30us on small 2-6 MB matrices) */
+            RowJob c = { .y = y, .q4 = q4, .scale = scale, .xi = xi, .sx = sx, .xg = xg, .S = S, .I = I, .O = O };
+            moty_par_for(O, 0, i4g_vnni_rows, &c);
             return;
         }
     }
 #endif
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const uint8_t *w = q4 + (int64_t)o*rb;
-        const float *scl = scale + (int64_t)o*ng;
+    RowJob c = { .y = y, .x = x, .q4 = q4, .scale = scale, .S = S, .I = I, .O = O, .gs = gs };
+    moty_par_for(O, 0, i4g_f32_rows, &c);
+}
+
+static void i4g_f32_rows(void *c_, int64_t o0, int64_t o1, int tid) {
+    const RowJob *c = c_; int S = c->S, I = c->I, O = c->O, gs = c->gs, rb = (I+1)/2, ng = (I+gs-1)/gs;
+    const float *x = c->x; float *y = c->y;
+    for (int o = (int)o0; o < (int)o1; o++) {
+        const uint8_t *w = c->q4 + (int64_t)o*rb;
+        const float *scl = c->scale + (int64_t)o*ng;
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s*I; float a = 0;
             for (int g = 0; g*gs < I; g++) {
@@ -210,11 +252,18 @@ void moty_matmul_i4_grouped_s(float *y, const float *x, const uint8_t *q4, const
     }
 }
 
+static void i2_rows(void *c_, int64_t o0, int64_t o1, int tid);
+
 void moty_matmul_i2_s(float *y, const float *x, const uint8_t *q2, const float *scale, int S, int I, int O) {
-    int rb = (I+3)/4;
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const uint8_t *w = q2 + (int64_t)o*rb; float sc = scale[o];
+    RowJob c = { .y = y, .x = x, .q4 = q2, .scale = scale, .S = S, .I = I, .O = O };
+    moty_par_for(O, 0, i2_rows, &c);
+}
+
+static void i2_rows(void *c_, int64_t o0, int64_t o1, int tid) {
+    const RowJob *c = c_; int S = c->S, I = c->I, O = c->O, rb = (I+3)/4;
+    const float *x = c->x; float *y = c->y;
+    for (int o = (int)o0; o < (int)o1; o++) {
+        const uint8_t *w = c->q4 + (int64_t)o*rb; float sc = c->scale[o];
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s*I; float a = 0; int i = 0;
 #ifdef __AVX2__
@@ -256,57 +305,60 @@ void moty_matmul_i2_s(float *y, const float *x, const uint8_t *q2, const float *
     }
 }
 
+static void q4k_rows(void *c_, int64_t o0, int64_t o1, int tid) {
+    const RowJob *c = c_; int S = c->S, I = c->I, O = c->O, nblk = I / 256;
+    float *acc = malloc((size_t)S * sizeof(float));
+    float wtmp[256];
+    for (int o = (int)o0; o < (int)o1; o++) {
+        const uint8_t *blk = c->q4 + (int64_t)o * nblk * 144;
+        for (int s = 0; s < S; s++) acc[s] = 0;
+        for (int b = 0; b < nblk; b++, blk += 144) {
+            gguf_dq_q4k(blk, 1, wtmp);
+            for (int s = 0; s < S; s++) {
+                const float *xs = c->x + (int64_t)s * I + b * 256;
+                float a = 0;
+                for (int l = 0; l < 256; l++) a += xs[l] * wtmp[l];
+                acc[s] += a;
+            }
+        }
+        for (int s = 0; s < S; s++) c->y[(int64_t)s * O + o] = acc[s];
+    }
+    free(acc);
+}
+
 void moty_matmul_q4k_native(float *y, const float *x, const uint8_t *raw,
                               int S, int I, int O) {
-    int nblk = I / 256;
     /* dequant ONCE per (row, block), dot against ALL S tokens */
-    #pragma omp parallel
-    {
-        float *acc = malloc((size_t)S * sizeof(float));
-        float wtmp[256];
-        #pragma omp for schedule(static)
-        for (int o = 0; o < O; o++) {
-            const uint8_t *blk = raw + (int64_t)o * nblk * 144;
-            for (int s = 0; s < S; s++) acc[s] = 0;
-            for (int b = 0; b < nblk; b++, blk += 144) {
-                gguf_dq_q4k(blk, 1, wtmp);
-                for (int s = 0; s < S; s++) {
-                    const float *xs = x + (int64_t)s * I + b * 256;
-                    float a = 0;
-                    for (int l = 0; l < 256; l++) a += xs[l] * wtmp[l];
-                    acc[s] += a;
-                }
+    RowJob c = { .y = y, .x = x, .q4 = raw, .S = S, .I = I, .O = O };
+    moty_par_for(O, 0, q4k_rows, &c);
+}
+
+static void q6k_rows(void *c_, int64_t o0, int64_t o1, int tid) {
+    const RowJob *c = c_; int S = c->S, I = c->I, O = c->O, nblk = I / 256;
+    float *acc = malloc((size_t)S * sizeof(float));
+    float wtmp[256];
+    for (int o = (int)o0; o < (int)o1; o++) {
+        const uint8_t *blk = c->q4 + (int64_t)o * nblk * 210;
+        for (int s = 0; s < S; s++) acc[s] = 0;
+        for (int b = 0; b < nblk; b++, blk += 210) {
+            gguf_dq_q6k(blk, 1, wtmp);
+            for (int s = 0; s < S; s++) {
+                const float *xs = c->x + (int64_t)s * I + b * 256;
+                float a = 0;
+                for (int l = 0; l < 256; l++) a += xs[l] * wtmp[l];
+                acc[s] += a;
             }
-            for (int s = 0; s < S; s++) y[(int64_t)s * O + o] = acc[s];
         }
-        free(acc);
+        for (int s = 0; s < S; s++) c->y[(int64_t)s * O + o] = acc[s];
     }
+    free(acc);
 }
 
 void moty_matmul_q6k_native(float *y, const float *x, const uint8_t *raw,
                               int S, int I, int O) {
-    int nblk = I / 256;
-    #pragma omp parallel
-    {
-        float *acc = malloc((size_t)S * sizeof(float));
-        float wtmp[256];
-        #pragma omp for schedule(static)
-        for (int o = 0; o < O; o++) {
-            const uint8_t *blk = raw + (int64_t)o * nblk * 210;
-            for (int s = 0; s < S; s++) acc[s] = 0;
-            for (int b = 0; b < nblk; b++, blk += 210) {
-                gguf_dq_q6k(blk, 1, wtmp);
-                for (int s = 0; s < S; s++) {
-                    const float *xs = x + (int64_t)s * I + b * 256;
-                    float a = 0;
-                    for (int l = 0; l < 256; l++) a += xs[l] * wtmp[l];
-                    acc[s] += a;
-                }
-            }
-            for (int s = 0; s < S; s++) y[(int64_t)s * O + o] = acc[s];
-        }
-        free(acc);
-    }
+    /* dequant ONCE per (row, block), dot against ALL S tokens */
+    RowJob c = { .y = y, .x = x, .q4 = raw, .S = S, .I = I, .O = O };
+    moty_par_for(O, 0, q6k_rows, &c);
 }
 
 
@@ -317,6 +369,42 @@ void moty_matmul_q6k_native(float *y, const float *x, const uint8_t *raw,
  * inside a tile every block is unpacked once per 4 tokens by the GEMM kernel.
  * Serial calling contract (static scratch), like matmul_q_s. */
 #define Q4R4_TT 32
+/* activation quantization for the R4 kernels, one token per index */
+typedef struct { const float *x; int8_t *xq; float *xs; int32_t *xsum; int I; } QuantJob;
+static void quant_rows(void *c_, int64_t s0, int64_t s1, int tid) {
+    const QuantJob *c = c_; int I = c->I, nb = I / 32;
+    for (int64_t s = s0; s < s1; s++)
+        moty_hw_quant_g32(c->x + s*I, I, c->xq + s*I, c->xs + s*nb, c->xsum + s*nb);
+}
+
+/* one token tile of an R4 matmul: 4-row blocks [b0, b1) */
+typedef struct {
+    int q8; const uint8_t *w; const uint16_t *s16; const int8_t *xq_t; const float *xs_t; const int32_t *xm_t;
+    const float *xst, *xct; float *y_t; int t0, ns, n4, I, O, nb, full;
+} R4Job;
+static void r4_blocks(void *c_, int64_t b0, int64_t b1, int tid) {
+    const R4Job *c = c_; int I = c->I, O = c->O, nb = c->nb, full = c->full, ns = c->ns, n4 = c->n4, t0 = c->t0;
+    size_t bw = (size_t)nb * (c->q8 ? 128 : 64), bd = (size_t)nb * 4;
+    for (int ob = (int)b0; ob < (int)b1; ob++) {
+        float tmp[4 * Q4R4_TT]; int ragged = ob == full;   /* rows O%4 of the last block */
+        float *yo = ragged ? tmp : c->y_t + ob*4; int ys = ragged ? 4 : O;
+        for (int t = 0; t < n4; t += 4) {
+            const float *st = c->xst + ((int64_t)(t0 + t)/4)*nb*4;
+            if (c->q8) moty_hw_q8r4_gemm4t((const int8_t *)c->w + ob*bw, c->s16 + ob*bd, c->xq_t + (int64_t)t*I, I, st, nb, yo + (int64_t)t*ys, ys);
+            else moty_hw_q4r4_gemm4t(c->w + ob*bw, c->s16 + ob*bd, c->xq_t + (int64_t)t*I, I,
+                                     st, c->xct + ((int64_t)(t0 + t)/4)*nb*4, nb, yo + (int64_t)t*ys, ys);
+        }
+        if (n4 < ns) {
+            if (c->q8) moty_hw_q8r4_gemm((const int8_t *)c->w + ob*bw, c->s16 + ob*bd, c->xq_t + (int64_t)n4*I, c->xs_t + (int64_t)n4*nb,
+                                         nb, ns - n4, yo + (int64_t)n4*ys, ys);
+            else moty_hw_q4r4_gemm(c->w + ob*bw, c->s16 + ob*bd, c->xq_t + (int64_t)n4*I, c->xs_t + (int64_t)n4*nb, c->xm_t + (int64_t)n4*nb,
+                                   nb, ns - n4, yo + (int64_t)n4*ys, ys);
+        }
+        if (ragged)
+            for (int t = 0; t < ns; t++) for (int r = 0; r < O - full*4; r++) c->y_t[(int64_t)t*O + full*4 + r] = tmp[t*4 + r];
+    }
+}
+
 void moty_matmul_q4r4_s(float *y, const float *x, const uint8_t *q4, const uint16_t *s16,
                         int S, int I, int O) {
     static int8_t *xq = NULL; static float *xs = NULL, *xst = NULL, *xct = NULL; static int32_t *xsum = NULL;
@@ -325,11 +413,9 @@ void moty_matmul_q4r4_s(float *y, const float *x, const uint8_t *q4, const uint1
     grow((void **)&xq, &c1, (int64_t)S*I, 1, "q4r4 xq");
     grow((void **)&xs, &c2, (int64_t)S*nb, sizeof(float), "q4r4 xs");
     grow((void **)&xsum, &c3, (int64_t)S*nb, sizeof(int32_t), "q4r4 xsum");
-    if (S >= 8) {
-        #pragma omp parallel for schedule(static)
-        for (int s = 0; s < S; s++) moty_hw_quant_g32(x + (int64_t)s*I, I, xq + (int64_t)s*I, xs + (int64_t)s*nb, xsum + (int64_t)s*nb);
-    } else
-        for (int s = 0; s < S; s++) moty_hw_quant_g32(x + (int64_t)s*I, I, xq + (int64_t)s*I, xs + (int64_t)s*nb, xsum + (int64_t)s*nb);
+    QuantJob qj = { x, xq, xs, xsum, I };
+    if (S >= 8) moty_par_for(S, 0, quant_rows, &qj);
+    else quant_rows(&qj, 0, S, 0);
     /* 4-token groups: scales rearranged once (moty_hw_q4r4_gemm4t layout) */
     int S4 = S / 4;
     if (S4) {
@@ -338,25 +424,11 @@ void moty_matmul_q4r4_s(float *y, const float *x, const uint8_t *q4, const uint1
         for (int k = 0; k < S4; k++)
             moty_hw_q4r4_tile_scales(xs + (int64_t)k*4*nb, xsum + (int64_t)k*4*nb, nb, xst + (int64_t)k*nb*4, xct + (int64_t)k*nb*4);
     }
-    size_t bw = (size_t)nb * 64, bd = (size_t)nb * 4;
     for (int t0 = 0; t0 < S; t0 += Q4R4_TT) {
-        int ns = S - t0 < Q4R4_TT ? S - t0 : Q4R4_TT, n4 = ns / 4 * 4;
-        const int8_t *xq_t = xq + (int64_t)t0*I;
-        const float *xs_t = xs + (int64_t)t0*nb; const int32_t *xm_t = xsum + (int64_t)t0*nb;
-        float *y_t = y + (int64_t)t0*O;
-        #pragma omp parallel for schedule(dynamic, 8)
-        for (int ob = 0; ob < O4; ob++) {
-            float tmp[4 * Q4R4_TT]; int ragged = ob == full;   /* rows O%4 of the last block */
-            float *yo = ragged ? tmp : y_t + ob*4; int ys = ragged ? 4 : O;
-            for (int t = 0; t < n4; t += 4)
-                moty_hw_q4r4_gemm4t(q4 + ob*bw, s16 + ob*bd, xq_t + (int64_t)t*I, I,
-                                    xst + ((int64_t)(t0 + t)/4)*nb*4, xct + ((int64_t)(t0 + t)/4)*nb*4, nb, yo + (int64_t)t*ys, ys);
-            if (n4 < ns)
-                moty_hw_q4r4_gemm(q4 + ob*bw, s16 + ob*bd, xq_t + (int64_t)n4*I, xs_t + (int64_t)n4*nb, xm_t + (int64_t)n4*nb,
-                                  nb, ns - n4, yo + (int64_t)n4*ys, ys);
-            if (ragged)
-                for (int t = 0; t < ns; t++) for (int r = 0; r < O - full*4; r++) y_t[(int64_t)t*O + full*4 + r] = tmp[t*4 + r];
-        }
+        int ns = S - t0 < Q4R4_TT ? S - t0 : Q4R4_TT;
+        R4Job c = { 0, q4, s16, xq + (int64_t)t0*I, xs + (int64_t)t0*nb, xsum + (int64_t)t0*nb, xst, xct,
+                    y + (int64_t)t0*O, t0, ns, ns / 4 * 4, I, O, nb, full };
+        moty_par_for(O4, 8, r4_blocks, &c);
     }
 }
 
@@ -370,11 +442,9 @@ void moty_matmul_q8r4_s(float *y, const float *x, const int8_t *q8, const uint16
     grow((void **)&xq, &c1, (int64_t)S*I, 1, "q8r4 xq");
     grow((void **)&xs, &c2, (int64_t)S*nb, sizeof(float), "q8r4 xs");
     grow((void **)&xsum, &c3, (int64_t)S*nb, sizeof(int32_t), "q8r4 xsum");
-    if (S >= 8) {
-        #pragma omp parallel for schedule(static)
-        for (int s = 0; s < S; s++) moty_hw_quant_g32(x + (int64_t)s*I, I, xq + (int64_t)s*I, xs + (int64_t)s*nb, xsum + (int64_t)s*nb);
-    } else
-        for (int s = 0; s < S; s++) moty_hw_quant_g32(x + (int64_t)s*I, I, xq + (int64_t)s*I, xs + (int64_t)s*nb, xsum + (int64_t)s*nb);
+    QuantJob qj = { x, xq, xs, xsum, I };
+    if (S >= 8) moty_par_for(S, 0, quant_rows, &qj);
+    else quant_rows(&qj, 0, S, 0);
     int S4 = S / 4;                                   /* 4-token groups: scales rearranged once */
     if (S4) {
         grow((void **)&xst, &c4, (int64_t)S4*nb*4, sizeof(float), "q8r4 xst");
@@ -382,23 +452,10 @@ void moty_matmul_q8r4_s(float *y, const float *x, const int8_t *q8, const uint16
         for (int k = 0; k < S4; k++)
             moty_hw_q4r4_tile_scales(xs + (int64_t)k*4*nb, xsum + (int64_t)k*4*nb, nb, xst + (int64_t)k*nb*4, xct + (int64_t)k*nb*4);
     }
-    size_t bw = (size_t)nb * 128, bd = (size_t)nb * 4;
     for (int t0 = 0; t0 < S; t0 += Q4R4_TT) {
-        int ns = S - t0 < Q4R4_TT ? S - t0 : Q4R4_TT, n4 = ns / 4 * 4;
-        const int8_t *xq_t = xq + (int64_t)t0*I; const float *xs_t = xs + (int64_t)t0*nb;
-        float *y_t = y + (int64_t)t0*O;
-        #pragma omp parallel for schedule(dynamic, 8)
-        for (int ob = 0; ob < O4; ob++) {
-            float tmp[4 * Q4R4_TT]; int ragged = ob == full;   /* rows O%4 of the last block */
-            float *yo = ragged ? tmp : y_t + ob*4; int ys = ragged ? 4 : O;
-            for (int t = 0; t < n4; t += 4)
-                moty_hw_q8r4_gemm4t(q8 + ob*bw, s16 + ob*bd, xq_t + (int64_t)t*I, I,
-                                    xst + ((int64_t)(t0 + t)/4)*nb*4, nb, yo + (int64_t)t*ys, ys);
-            if (n4 < ns)
-                moty_hw_q8r4_gemm(q8 + ob*bw, s16 + ob*bd, xq_t + (int64_t)n4*I, xs_t + (int64_t)n4*nb,
-                                  nb, ns - n4, yo + (int64_t)n4*ys, ys);
-            if (ragged)
-                for (int t = 0; t < ns; t++) for (int r = 0; r < O - full*4; r++) y_t[(int64_t)t*O + full*4 + r] = tmp[t*4 + r];
-        }
+        int ns = S - t0 < Q4R4_TT ? S - t0 : Q4R4_TT;
+        R4Job c = { 1, (const uint8_t *)q8, s16, xq + (int64_t)t0*I, xs + (int64_t)t0*nb, NULL, xst, NULL,
+                    y + (int64_t)t0*O, t0, ns, ns / 4 * 4, I, O, nb, full };
+        moty_par_for(O4, 8, r4_blocks, &c);
     }
 }

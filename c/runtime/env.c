@@ -41,6 +41,11 @@ int64_t moty_rt_budget_from_env(const char *gb, const char *frac, int64_t total_
 }
 
 void moty_rt_omp_hot_tune(char **argv) {
+#ifndef _OPENMP
+    (void)argv;         /* no OpenMP runtime to tune: the MOTY_THREADPOOL pool
+                         * spins and pins by itself (nn/par.c), no re-exec */
+    return;
+#endif
     if (!getenv("MOTY_OMP_TUNED") && !getenv("MOTY_NO_OMP_TUNE")) {
 #if defined(__linux__)
         /* with OMP_PROC_BIND/OMP_PLACES already in the environment libgomp has

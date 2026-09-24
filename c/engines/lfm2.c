@@ -368,8 +368,8 @@ int main(int argc, char **argv) {
     setenv("EBITS", "4", 0);   /* int4 experts via VPDPBUSD */
     setenv("IDOT4", "1", 0);   /* dot_i4i8 for expert GEMV */
     setenv("CTX", "32768", 0);
-    if (getenv("THREADS")) { int t = atoi(getenv("THREADS")); if (t > 0) omp_set_num_threads(t); }
-    else { int nc = omp_get_num_procs(); if (nc > 12) omp_set_num_threads(nc*3/4); }  /* 8C/16T: 12 > 8 */
+    if (getenv("THREADS")) { int t = atoi(getenv("THREADS")); if (t > 0) moty_par_set_threads(t); }
+    else { int nc = moty_par_procs(); if (nc > 12) moty_par_set_threads(nc*3/4); }  /* 8C/16T: 12 > 8 */
     return engine_main(argc, argv);
 }
 #endif /* LFM2_TEST */

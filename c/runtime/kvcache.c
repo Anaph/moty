@@ -4,7 +4,7 @@
 
 void moty_rt_kv_arrays_alloc(MotyCommon *mc, int n_layers, int max_t) {
     mc->max_t = max_t; mc->kv_len = 0;
-    mc->att_sc = falloc((int64_t)omp_get_max_threads() * max_t);
+    mc->att_sc = falloc((int64_t)moty_par_threads() * max_t);
     mc->K  = bzalloc(n_layers * sizeof(float*),  "array K");
     mc->V  = bzalloc(n_layers * sizeof(float*),  "array V");
     mc->K8 = bzalloc(n_layers * sizeof(int8_t*), "array K8");
