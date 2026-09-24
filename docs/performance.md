@@ -572,3 +572,43 @@ attention output buys another 1.1 points of top-1 for −6 % decode and
 and does not fit next to the board's workload. Layer-wise mixes, which
 worked for LFM2.5, do not pay here: layers 0, 1, 4, 23 in int8 cost 6×
 the bytes of v, k for similar quality.
+
+### 5.12 moty vs llama.cpp on the board, LFM2.5-350M and MiniCPM5-1B
+
+Board B (RV1126B, its vision workload running), llama.cpp 42916d8 built
+as in §5.6 plus `Q4_K_M` from the same `llama-quantize`. One prompt of 66
+tokens, 64 decode tokens; moty on 4 threads with decode on 3
+(`THREADS_DECODE=3`, its best setting), llama.cpp at `-t 3` and `-t 4`
+(`llama-bench -p 66 -n 64`); medians of 3 interleaved runs, 24 runs in
+all, none near the memory margin. moty loads its `SAVE_PACKED` container
+(`EMBED=disk` for MiniCPM5); llama.cpp mmaps the GGUF.
+
+Quality in one protocol, llama-perplexity's: `ppl_text_long.txt` in
+1024-token chunks with BOS at each chunk start, the second half of each
+chunk scored (1022 positions). moty: top-1 agreement with HF
+transformers f32 on exactly those positions; llama.cpp: `Same top p`
+against its own f16 GGUF (`--kl-divergence`), which is an easier target
+than HF f32 — the comparison favours llama.cpp slightly.
+
+| model | engine | format | weights on disk | prefill tok/s | decode tok/s | peak RSS | top-1 |
+|---|---|---|---|---|---|---|---|
+| LFM2.5-350M | moty | Q4R4 | 334 MB | **46.6** | **15.80** | 300 MB | 56.9 % |
+| LFM2.5-350M | moty | **GPTQ + Q8R4 layers 0–1** (§5.8) | 352 MB | **45.1** | **15.32** | 318 MB | **70.4 %** |
+| LFM2.5-350M | llama.cpp | Q4_0, t3 / t4 | 219 MB | 15.4 / 18.6 | 9.39 / 10.17 | 242 MB | 58.4 % |
+| LFM2.5-350M | llama.cpp | Q4_K_M, t3 / t4 | 229 MB | 15.3 / 19.1 | 8.99 / 9.69 | 252 MB | 64.2 % |
+| MiniCPM5-1B | moty | Q4R4 | 896 MB | **19.0** | **5.95** | 556 MB | 69.1 % |
+| MiniCPM5-1B | moty | **GPTQ + Q8R4 v, k** (§5.11) | 906 MB | **18.1** | **6.32** | 565 MB | **82.5 %** |
+| MiniCPM5-1B | llama.cpp | Q4_0, t3 / t4 | 665 MB | 6.1 / 7.5 | 3.76 / 3.87 | 686 MB | 72.9 % |
+| MiniCPM5-1B | llama.cpp | Q4_K_M, t3 / t4 | 688 MB | 6.1 / 6.8 | 3.68 / 3.95 | 707 MB | 81.8 % |
+
+At equal quality the comparison is between moty's recommended layouts
+and llama.cpp's Q4_K_M: prefill 2.4× (LFM2.5) / 2.7× (MiniCPM5), decode
+1.6× / 1.6× faster, top-1 +6 / +0.7 points. The llama.cpp build uses
+the same instruction class (§5.6); the per-op profiles of §5.4 and §5.7
+show where moty's time goes, llama.cpp's were not profiled here. moty's
+disk size is larger because the container keeps the embedding table in
+the snapshot's bf16 (LFM2.5 134 MB, MiniCPM5 401 MB), of which a decode
+step reads one row (`EMBED=disk` keeps it out of RAM for MiniCPM5). llama.cpp's peak
+RSS is lower for LFM2.5 (242 vs 300 MB) and higher for MiniCPM5 (686–707
+vs 556–565 MB). Loading: moty 3.3–4.2 s from the container;
+`llama-bench` does not report a load time (§5.2).
