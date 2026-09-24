@@ -24,6 +24,8 @@ reference is HF f32 on the same rows.
 | int4, head int8 | 4.2, 0/8 | 78.5 % | 416 MB |
 | int4 MLP, attention + head int8 | 6.5, 0/8 | 87.1 % | 456 MB |
 | int4 gate/up only, rest int8 | 11.5, 0/8 | 90.4 % | 495 MB |
+| GPTQ int4, head int8 (text calibration) | 0.5, 0/8 | 73.4 % | 416 MB |
+| GPTQ int4 gate/up only, rest int8 (text calibration) | 0.0, 0/8 | 83.6 % | 495 MB |
 
 x86 moty unless marked "board" (the aarch64 kernels round differently: the
 board's greedy answers match the reference as far as the table says, on the
@@ -36,8 +38,14 @@ layers 28–31 0.863, `down_proj` 0.875, `v_proj` 0.881, `gate/up_proj`
 0.895, layers 20–23 0.902, other 4-layer blocks 0.926–0.953, `q/k_proj`
 0.926, `o_proj` 0.947. The damage is spread over every layer; no int8
 subset of a few tensors rescues int4. With RTN, int8 everywhere is the
-recipe to use. Calibrated int4 (GPTQ on image sequences) has not been
-tried yet on this decoder.
+recipe to use.
+
+GPTQ (`pack_r4.py --method gptq --calib tools/ref/calib_text.txt`, 2048
+text tokens) is worse than RTN here (73.4 % vs 78.5 %, 83.6 % vs 90.4 %):
+its answers stay on topic ("This is a black and white photograph ... a
+cluttered indoor space") but leave the reference at the first word. GPTQ
+calibrated on image sequences (`--calib-tiles`) needs live tiles other
+than the 8 evaluation tiles; it has not been run.
 
 ## Speed on the board (RV1126B, 4× Cortex-A53, brownai running)
 
