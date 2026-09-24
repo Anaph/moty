@@ -2,7 +2,7 @@
 calibrated int4 codes.
 
   pack_r4.py <snapshot> <out_dir> [--method rtn|gptq] [--calib text]
-             [--q8 glob,glob,...] [--tokens N]
+             [--q8 glob,glob,...] [--tokens N] [--variants "dir=globs;dir2=globs"]
 
 Every matrix moty packs for an LFM2 / Qwen / Llama snapshot (the Linear
 weights of the layers and the tied or separate lm_head) is written as
@@ -104,8 +104,13 @@ def main():
     ap.add_argument("--method", default="gptq", choices=["rtn", "gptq"])
     ap.add_argument("--calib"); ap.add_argument("--tokens", type=int, default=2048)
     ap.add_argument("--q8", default="")
+    ap.add_argument("--variants", default="",
+                    help="dir=glob,glob;dir2=glob...: several containers in one pass (int4 codes computed once)")
     a = ap.parse_args()
-    q8 = [p for p in a.q8.split(",") if p]
+    variants = [(a.out, [p for p in a.q8.split(",") if p])]
+    if a.variants:
+        variants = [(v.split("=", 1)[0], [p for p in v.split("=", 1)[1].split(",") if p] if "=" in v else [])
+                    for v in a.variants.split(";") if v]
     files = sorted(f for f in os.listdir(a.snap) if f.endswith(".safetensors"))
     tensors = {}                                   # name -> (file, header entry, base)
     for fn in files:
@@ -138,40 +143,44 @@ def main():
         model(ids); [h.remove() for h in hs]
         H = {n: (s[1] / s[0]).float() for n, s in acc.items()}
         print(f"calibration: {ids.shape[1]} tokens of {a.calib}", flush=True)
-    os.makedirs(a.out, exist_ok=True)
-    out_t = []                                     # (name, dtype, n, bytes)
     def canon(name):              # moty's engine-side name (Q8_TENSORS globs match these)
         return "model." + name[len("model.language_model."):] if name.startswith("model.language_model.") else name
-    def add_packed(name, w):
-        bits = 8 if any(fnmatch.fnmatchcase(canon(name), p) for p in q8) else 4
-        codes, scales = quantize(w.float(), bits, a.method, H.get(name))
-        data, sc = pack(codes, scales, bits)
-        out_t.append((name, "I8" if bits == 8 else "U8", len(data), data))
-        out_t.append((name + ".s16", "F16", len(sc) // 2, sc))
-        print(f"{name}: {'Q8R4' if bits == 8 else 'Q4R4'} {a.method}", flush=True)
-    for name in tensors:
-        if name in lin:
-            add_packed(name, lin[name].weight)
-        else:
-            fn, v, base = tensors[name]
-            o0, o1 = v["data_offsets"]
-            with open(fn, "rb") as f: f.seek(base + o0); raw = f.read(o1 - o0)
-            n = int(np.prod(v["shape"])) if v["shape"] else 1
-            out_t.append((name, v["dtype"], n, raw))
-    if "lm_head.weight" in tensors:                # separate head: pack it instead of copying
-        out_t = [t for t in out_t if t[0] != "lm_head.weight"]
-    add_packed("lm_head.weight", head_mod.weight)
-    hdr = {"__metadata__": {"format": "moty-q4r4"}}; off = 0
-    for name, dt, n, data in out_t:
-        hdr[name] = {"dtype": dt, "shape": [n], "data_offsets": [off, off + len(data)]}; off += len(data)
-    hb = json.dumps(hdr, separators=(",", ":")).encode()
-    hb += b" " * ((8 - len(hb) % 8) % 8)
-    with open(os.path.join(a.out, "model.safetensors"), "wb") as f:
-        f.write(struct.pack("<Q", len(hb))); f.write(hb)
-        for _, _, _, data in out_t: f.write(data)
-    for aux in ("config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json", "special_tokens_map.json", "chat_template.jinja"):
-        if os.path.exists(os.path.join(a.snap, aux)): shutil.copy(os.path.join(a.snap, aux), a.out)
-    print("wrote", os.path.join(a.out, "model.safetensors"), off, "bytes of data")
+    cache = {}                                     # (name, bits) -> (codes bytes, scale bytes)
+    def packed(name, w, bits):
+        if (name, bits) not in cache:
+            codes, scales = quantize(w.float(), bits, a.method, H.get(name))
+            cache[(name, bits)] = pack(codes, scales, bits)
+            print(f"{name}: {'Q8R4' if bits == 8 else 'Q4R4'} {a.method}", flush=True)
+        return cache[(name, bits)]
+    for out_dir, q8 in variants:
+        os.makedirs(out_dir, exist_ok=True)
+        out_t = []                                 # (name, dtype, n, bytes)
+        def add_packed(name, w):
+            bits = 8 if any(fnmatch.fnmatchcase(canon(name), p) for p in q8) else 4
+            data, sc = packed(name, w, bits)
+            out_t.append((name, "I8" if bits == 8 else "U8", len(data), data))
+            out_t.append((name + ".s16", "F16", len(sc) // 2, sc))
+        for name in tensors:
+            if name in lin:
+                add_packed(name, lin[name].weight)
+            elif name != "lm_head.weight":         # a separate head is packed below
+                fn, v, base = tensors[name]
+                o0, o1 = v["data_offsets"]
+                with open(fn, "rb") as f: f.seek(base + o0); raw = f.read(o1 - o0)
+                n = int(np.prod(v["shape"])) if v["shape"] else 1
+                out_t.append((name, v["dtype"], n, raw))
+        add_packed("lm_head.weight", head_mod.weight)
+        hdr = {"__metadata__": {"format": "moty-q4r4"}}; off = 0
+        for name, dt, n, data in out_t:
+            hdr[name] = {"dtype": dt, "shape": [n], "data_offsets": [off, off + len(data)]}; off += len(data)
+        hb = json.dumps(hdr, separators=(",", ":")).encode()
+        hb += b" " * ((8 - len(hb) % 8) % 8)
+        with open(os.path.join(out_dir, "model.safetensors"), "wb") as f:
+            f.write(struct.pack("<Q", len(hb))); f.write(hb)
+            for _, _, _, data in out_t: f.write(data)
+        for aux in ("config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json", "special_tokens_map.json", "chat_template.jinja"):
+            if os.path.exists(os.path.join(a.snap, aux)): shutil.copy(os.path.join(a.snap, aux), out_dir)
+        print("wrote", os.path.join(out_dir, "model.safetensors"), off, "bytes of data", flush=True)
 
 if __name__ == "__main__":
     main()

@@ -517,3 +517,58 @@ ms/frame alone) was run at the same time as the VL encoder: detector mean
 frame unchanged), VL encode 1522 → 1555 ms (+2 %). A deployment that needs
 steady detector latency should schedule the VL encoder between detector
 frames or accept ~1.5 s NPU pauses.
+
+### 5.11 MiniCPM5-1B: GPTQ and Q8R4 mixes
+
+Same method as §5.8: teacher-forced over 2047 tokens of
+`ppl_text_long.txt` against HF transformers f32 (PPL 24.45), GPTQ
+calibrated on the first 2048 tokens of `calib_text.txt`, KL from the
+`hf_qstudy.py` simulation with moty's int8 activations (it reproduces
+moty: round-to-nearest Q4R4 simulated PPL 30.11 / top-1 71.9 % vs moty
+30.10 / 71.6 %).
+
+**Sensitivity** (`hf_sens.py`, KL with one group int4): unlike LFM2.5,
+no layer stands out — layers 4, 0, 1, 23 lead with 0.024–0.029, the rest
+are close behind. By type: FFN down 0.073, attention out 0.054, v 0.050,
+FFN up 0.049, gate 0.036, lm_head 0.028, q 0.027, k 0.012; an int8 head
+or embedding costs 0.0004 / 0.0001. The v and k projections are small
+(2 KV heads × 128 = 256 rows each), so v is the cheapest int8 per unit of
+KL; k rides along for 0.6 % more bytes.
+
+**Pareto on board B** (RV1126B, its vision workload running; prompt 66
+tokens, 64 decode tokens; 4 threads, decode on 3, `EMBED=disk`; speed
+medians of 3 interleaved runs; PPL / top-1 measured with moty on x86 from
+the same containers, KL simulated):
+
+| layout (`pack_r4.py`) | MB/token | prefill tok/s | decode tok/s | peak RSS | PPL | top-1 | KL |
+|---|---|---|---|---|---|---|---|
+| Q4R4, round-to-nearest (before) | 495.0 | 19.2 | 6.23 | 556 MB | 30.10 | 71.6 % | 0.302 |
+| Q4R4, GPTQ | 495.0 | 19.2 | 6.23 | 556 MB | 27.26 | 79.0 % | 0.178 |
+| **GPTQ + Q8R4 v, k** | 504.4 | **19.1** | **6.31** | 565 MB | 27.66 | **81.5 %** | 0.159 |
+| GPTQ + Q8R4 v, k, attention out | 542.2 | 16.8 | 5.93 | 602 MB | 27.60 | 82.6 % | 0.135 |
+| GPTQ + Q8R4 FFN down | 579.9 | 16.2 | 5.50 | 637 MB* | 26.18† | 82.2 %† | 0.131 |
+| GPTQ + Q8R4 layers 0, 1, 4, 23 | 551.6 | — | — | — | 27.06† | 81.2 %† | 0.155 |
+| Q8R4 everywhere | 935.0 | — | — | — | 24.42† | 96.3 %† | 0.003 |
+
+Speed and RSS were measured with round-to-nearest containers of each
+layout; GPTQ changes code values only (same bytes, same kernels), so the
+GPTQ rows take the speed of their layout. The round-to-nearest v, k
+container gives PPL 29.40 / top-1 73.6 %: GPTQ is the larger step.
+\* MemAvailable fell to 135 MB during each of the three runs — below the
+150 MB margin kept for the board's own workload, so this layout does not
+fit next to it. † simulation only. Q8R4 everywhere (≈ 1 GB of weights)
+does not fit on the board. Decode on all 4 threads instead of 3: 5.44
+tok/s (−13 %), as for LFM2.5.
+
+**Recommendation for MiniCPM5-1B on the A53: GPTQ-calibrated Q4R4 with
+Q8R4 for the v and k projections** (`pack_r4.py --method gptq --q8
+"*.self_attn.v_proj.weight,*.self_attn.k_proj.weight"`): +1.9 % bytes,
+prefill and decode within noise of plain int4, top-1 agreement with f32
+71.6 → 81.5 %. The moty PPL of this row is 0.4 above plain GPTQ while
+KL, simulated PPL (26.99 vs 27.21) and top-1 all favour it — a small
+difference in the other direction on one 2047-token text. Adding the
+attention output buys another 1.1 points of top-1 for −6 % decode and
+−12 % prefill; FFN down is the most sensitive type but also the largest
+and does not fit next to the board's workload. Layer-wise mixes, which
+worked for LFM2.5, do not pay here: layers 0, 1, 4, 23 in int8 cost 6×
+the bytes of v, k for similar quality.

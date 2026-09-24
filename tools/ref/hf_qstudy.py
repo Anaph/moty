@@ -175,6 +175,7 @@ def main():
         top1 = (ref.argmax(-1) == lp.argmax(-1)).float().mean().item()
         print(f"{name:44s} {bytes_tok/1e6:7.1f} MB/tok  ppl {math.exp(nll.mean().item()):9.3f}  KL {kl:.4f}  top1 {top1:.4f}", flush=True)
     report("f32", ref, sum(w.numel() for w in orig.values()) * 4)
+    gcache = {}
     for cfg in configs:
         act8["on"] = cfg.endswith("@a8"); cfg0 = cfg; cfg = cfg[:-3] if act8["on"] else cfg
         parts = cfg.split("+")
@@ -206,7 +207,9 @@ def main():
                 q = best[1]; nbytes += w.numel() * BITS[scheme] / 8
             elif method == "gptq":
                 gs = int(re.search(r"g(\d+)", scheme).group(1)) if "g" in scheme else w.shape[1]
-                q = gptq(w, stats[n]["H"], lambda t: qfn(t), gs); nbytes += w.numel() * BITS[scheme] / 8
+                key = (n, scheme)                     # configs share GPTQ results per tensor and scheme
+                if key not in gcache: gcache[key] = gptq(w, stats[n]["H"], lambda t: qfn(t), gs)
+                q = gcache[key]; nbytes += w.numel() * BITS[scheme] / 8
             else:
                 raise SystemExit("unknown method " + method)
             mods[n].weight.copy_(q)
