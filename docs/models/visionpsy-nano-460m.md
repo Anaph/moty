@@ -109,14 +109,63 @@ complete answer, against ≈ 9.5 s for 64 tokens of a truncated description
   (K 512) with moty's 3-bit activations, 97 % at best (8-bit, K 4096) —
   the hidden states have strong outlier dimensions (median max/mean 14.5)
   and a sign-bit copy of this head cannot rank them. Not kept.
-- The int8 decode path itself was not re-measured: board B is down and
-  board C is agent B's; a read-only THREADS_DECODE × pool-spin benchmark
-  (decode tok/s and CPU seconds per generate) is with agent B.
+## VL-aware GPTQ and mixed layouts (46 calibration tiles)
 
-## VL-aware GPTQ: ready, waiting for calibration tiles
+Agent B's 46 calibration tiles (`from-b/visionpsy/calib`: 22 night IR +
+24 day colour, one desk; none of the 8 evaluation tiles), calibration on
+the f32 greedy answers of each tile with the image positions masked out
+of the Hessians, tiles only:
 
-`tools/ref/pack_r4.py` calibrates on image sequences of a split-off decoder
-(`--image-token 49152 --calib-tiles <dir> --calib-prompt <ids>`, image
-positions masked out of the Hessians; `--calib ""` for tiles only). The
-code path is checked; the tiles must not be the 8 evaluation tiles and
-have not been delivered yet.
+    pack_r4.py --method gptq --calib "" --calib-tiles <calib dir> --calib-prompt <78 ids> \
+        --image-token 49152 <decoder> <out> --variants "<out>=lm_head*;..."
+
+Quality on x86 (the 8 evaluation tiles). "describe": the node's prompt,
+64 tokens against HF f32 (leading tokens, teacher-forced top-1); "short
+question": the recommended contract, answers ending at EOS (17–28 tokens),
+teacher-forced top-1 and answers identical to HF f32. Speed on board B
+(brownai running, 4 threads, decode on 3, 64 tokens, 2 repetitions).
+
+| layout | MB/token | describe: teacher-forced / leading | short q.: teacher-forced / identical | decode tok/s (board) | RSS |
+|---|---|---|---|---|---|
+| int8 RTN (recommended) | 384.4 | 96.9 % / 33.2 | 98.8 % / 6/8 | 9.47–9.74 | 400 MB |
+| int8 VL-GPTQ | 384.4 | 97.7 % / 38.6 | 96.9 % / 3/8 | (same format) | 400 MB |
+| int4 gate/up, rest int8, VL-GPTQ | 305.8 | 94.3 % / 22.1 | 88.8 % / 1/8 | 11.00–11.29 | 324 MB |
+| int4 MLP, attention + head int8, VL-GPTQ | 266.5 | 93.2 % / 21.0 | 84.5 % / 0/8 | 12.29–12.51 | 285 MB |
+| int4, head int8, VL-GPTQ | 227.2 | 90.4 % / 13.9 | 85.1 % / 0/8 | 11.78–13.72 | 247 MB |
+| int4 gate/up, RTN | 305.8 | 90.4 % / 11.5 | 85.1 % / 0/8 | — | — |
+| int4 MLP, RTN | 266.5 | 87.1 % / 6.5 | 82.0 % / 0/8 | — | — |
+| int4, head int8, RTN | 227.2 | 78.5 % / 4.2 | 82.0 % / 0/8 | — | — |
+
+VL-aware calibration lifts every int4 layout by 4–12 points (describe),
+text-only GPTQ had lowered them. It does not reach int8: the best int4
+layout (gate/up) is 94.3 % on the describe prompt and 88.8 % on the short
+contract, for +16–19 % decode speed. int8 stays the recommendation; the
+int4 layouts are a quality trade to choose knowingly. GPTQ on int8 helps
+the describe prompt (the calibration answers are descriptions) but not the
+short contract.
+
+## Decode threads and CPU (board B, int8, brownai running)
+
+Prefill 78 tokens on 4 threads 2.35–2.8 s in every row; decode 64 tokens.
+CPU per generate from getrusage (`moty_cycle`: "cpu X s over Y s"); the
+decode phase's cores = (CPU − ~4 × prefill s) / decode s.
+
+| THREADS_DECODE | pool spin 1000 µs | spin 0 | decode cores busy | tok/s per core |
+|---|---|---|---|---|
+| 1 | 5.17–5.66 tok/s | 5.62–5.63 | ~0.9 | ~5.9 |
+| 2 | 8.15–8.61 | 8.15–8.46 | ~1.7 | ~4.9 |
+| 3 | 9.55–9.66 | 8.88–9.00 | ~2.7 | ~3.5 |
+| 4 | 7.59–7.85 | 7.52–8.50 | ~3.1 | ~2.6 |
+
+Four decode threads are slower than three (the detector's core preempts
+one). At 3 threads the int8 decode streams 384 MB × 9.66 ≈ 3.7 GB/s,
+77–86 % of the board's measured 4.3–4.8 GB/s read roofline. For a board
+that also runs the camera pipeline, `threads_decode` 2 gives 8.2–8.6 tok/s
+(−12 %) on ~1.7 cores instead of ~2.7; `pool_spin_us` 0 saves a little CPU
+at up to −7 % decode.
+
+End to end, the short-question contract (86-id prompt, `max_new_tokens`
+48, stop at EOS, decode on 3): 4.29–5.42 s from the generate call to the
+complete answer on all 8 tiles (prefill 2.56–2.75 s, 17–25 tokens), against
+~9 s for 64 tokens of the description prompt.
+
