@@ -58,6 +58,11 @@ def run(binary, env):
     log = err.decode(errors="replace")
     if proc.returncode or not first_byte:
         raise RuntimeError(log)
+    if env.get("MOTY_Q41_FILE_WINDOWS") == "1":
+        windows = re.search(r"Q4_1 file windows used: gate=(\d+) down=(\d+)", log)
+        if not windows or min(map(int, windows.groups())) == 0:
+            raise RuntimeError(f"The streaming profile did not map both gate and down panels. "
+                               f"Check the Apple FMLAL build and the sidecar cache.\n{log}")
     pp = re.search(r"prefill (\d+) tok in .*? \(([\d.]+) tok/s\)", log)
     tps = re.search(r"decode \d+ tok in .*? \(([\d.]+) tok/s\)", log)
     rss = re.search(r"(\d+)\s+maximum resident set size", log)

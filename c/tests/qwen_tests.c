@@ -1028,6 +1028,16 @@ int qt_q41_stream_budget(void) {
     g_gguf = path;
     Model full;
     model_init_ex(&full,NULL,-1,0,CTX);
+    const char *qbits = getenv("QBITS");
+    char *saved_qbits = qbits ? strdup(qbits) : NULL;
+    unsetenv("QBITS");
+    CHECK(q41_native_selected(&full.S,0,0));
+    setenv("QBITS","0",1);
+    CHECK(!q41_native_selected(&full.S,0,0));
+    if (saved_qbits) {
+        setenv("QBITS",saved_qbits,1);
+        free(saved_qbits);
+    } else unsetenv("QBITS");
     kv_alloc(&full,CTX);
     const int ids[] = {1,2,3,4,5,6};
     float *a = step(&full,ids,5,0);
@@ -1479,10 +1489,27 @@ int qt_q41_panel_cache(void) {
     q41_cache_digest_update(&digest,parallel+8+Q41_PANEL_BYTES,sizeof(up_panel)-8-Q41_PANEL_BYTES);
     CHECK(q41_cache_digest_finish(&digest) ==
           q41_cache_hash_payload(Q41_CACHE_HASH_PARALLEL,parallel,sizeof(up_panel)));
+    Q41CacheHeader before, after;
+    int old_fd = st_q41_cache_open(&sh,&tensor,I,O,&before);
+    CHECK(old_fd >= 0);
+    struct timespec timestamps[] = {{100,0},{100,0}};
+    CHECK(utimensat(AT_FDCWD,path,timestamps,0) == 0);
+    int new_fd = st_q41_cache_open(&sh,&tensor,I,O,&after);
+    CHECK(new_fd >= 0 && before.mtime != after.mtime);
+    struct stat old_info, new_info;
+    CHECK(!fstat(old_fd,&old_info) && !fstat(new_fd,&new_info));
+    CHECK(old_info.st_ino != new_info.st_ino);
+    CHECK(!close(old_fd) && !close(new_fd));
+    const uint8_t *rebuilt = st_q41_cache(&sh,&tensor,I,O);
+    CHECK(rebuilt && !memcmp(parallel,rebuilt,sizeof(up_panel)));
     st_close_fds(&sh);
     for (int version = Q41_CACHE_HASH_LEGACY; version <= Q41_CACHE_INDEXED; version++) {
         if (version == Q41_CACHE_HASH_PARALLEL) setenv("MOTY_Q41_CACHE_HASH","parallel",1);
         else unsetenv("MOTY_Q41_CACHE_HASH");
+        int is_indexed = version == Q41_CACHE_INDEXED;
+        tensor.fd = st_open_fd(&sh,path);
+        CHECK(st_q41_cache_map(&sh,&tensor,I,O,is_indexed));
+        st_close_fds(&sh);
         snprintf(cache,sizeof(cache),"%s.%s-0",path,q41_cache_suffix(version));
         wfd = open(cache,O_RDWR);
         CHECK(wfd >= 0);
@@ -1493,9 +1520,13 @@ int qt_q41_panel_cache(void) {
         bad ^= 1;
         CHECK(pwrite(wfd,&bad,1,offset) == 1);
         CHECK(close(wfd) == 0);
-        sh.nfd = 0;
         tensor.fd = st_open_fd(&sh,path);
-        CHECK(!st_q41_cache_map(&sh,&tensor,I,O,version == Q41_CACHE_INDEXED));
+        const uint8_t *repaired = st_q41_cache_map(&sh,&tensor,I,O,is_indexed);
+        CHECK(repaired);
+        if (is_indexed)
+            q41_indexed_row_block(repaired,q41_indexed_table(repaired,I,O),0,0,block);
+        else q41_panel_row_block(repaired,0,0,block);
+        CHECK(!memcmp(block,raw,Q4_1_BYTES));
         st_close_fds(&sh);
         unlink(cache);
     }
@@ -1768,6 +1799,9 @@ int qt_q41_history_draft(void) {
 
 #ifdef QWEN_Q41_TEST_MAIN
 int main(void) {
+#ifdef MOTY_Q41_REQUIRE_FMLAL
+    CHECK(moty_q41_uses_fp16());
+#endif
     moty_par_set_threads(4);
     return qt_gguf_q4_1_native() || qt_q41_stream_budget() || qt_q41_ffn() || qt_q41_panel_cache() || qt_q41_qkv() || qt_gqa_decode_tail() || qt_q41_causal_prefill_group() || qt_gqa_batch_exact() || qt_q41_history_draft() || qt_prefill_workspace();
 }

@@ -269,6 +269,7 @@ static void qwen_q41_read(void *arg) {
             for (size_t i = 0; i < length; i += job->file_window->page_size) (void)pages[i];
             job->dst = view+sizeof(Q41CacheHeader);
             job->packed = 1;
+            job->file_window->mapped_panel = 1;
             return;
         }
     }
@@ -280,6 +281,7 @@ static void qwen_q41_read(void *arg) {
             job->packed = 1;
             return;
         }
+        job->invalid_panel = 1;
     }
 #endif
     qwen_q41_read_raw(job);
@@ -335,7 +337,16 @@ static void qwen_q41_stream_bind(Model *m, int li, QwenQ41Read jobs[3],
             w->gs = Q41_PACKED_GS;
             continue;
         }
-        if (jobs[j].panel) qwen_q41_panel_close(input);
+        if (jobs[j].panel) {
+            qwen_q41_panel_close(input);
+            if (jobs[j].invalid_panel) {
+                /* This step already uses the raw block. Repair the sidecar
+                 * for later opens without changing the current window. */
+                Q41CacheHeader disk;
+                int fd = st_q41_cache_open_format(&m->S,input->tensor,w->I,w->O,&disk,0,1);
+                if (fd >= 0) close(fd);
+            }
+        }
         if (w->gs == Q41_PACKED_GS) w->gs = input->raw_gs;
 #endif
         if (input->check_group64) {
@@ -413,8 +424,13 @@ static void qwen_q41_queue_close(Model *m) {
     pthread_cond_broadcast(&q->work);
     pthread_mutex_unlock(&q->mutex);
     for (int j = 0; j < q->n_readers; j++) pthread_join(q->readers[j],NULL);
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    int mapped_gate = 0, mapped_down = 0;
+#endif
     for (int j = 0; j < m->q41_window_count; j++) {
 #if defined(__aarch64__) && defined(__ARM_NEON)
+        mapped_gate += q->batch[j].file_windows[0].mapped_panel;
+        mapped_down += q->batch[j].file_windows[2].mapped_panel;
         for (int p = 0; p < Q41_FFN_MATRICES; p++)
             qwen_q41_file_window_close(&q->batch[j].file_windows[p]);
 #endif
@@ -423,6 +439,8 @@ static void qwen_q41_queue_close(Model *m) {
     }
 #if defined(__aarch64__) && defined(__ARM_NEON)
     if (q->attention.ready) dispatch_release(q->attention.ready);
+    if (q->batch[0].file_windows[0].page_size)
+        fprintf(stderr,"[qwen] Q4_1 file windows used: gate=%d down=%d\n",mapped_gate,mapped_down);
 #endif
     pthread_cond_destroy(&q->work);
     pthread_mutex_destroy(&q->mutex);

@@ -147,7 +147,7 @@ Common environment variables (qwen engine):
 | `TEMP` / `NUCLEUS` / `SEED` | 0.7 / 0.95 | sampling (TEMP=0 → greedy) |
 | `CHAT_TEMPLATE` | 1 | wrap prompt in the model's chat format |
 | `THINK` | 0 | Qwen3 thinking mode (0 pre-closes the think block) |
-| `QBITS` | native for Q4_1 GGUF, 0 otherwise | `-1` → native GGUF kernel for Q4_1/Q4_K/Q6_K; `0` → float32 weights; `8` → int8-quantize weights **and embeddings** at load; `4` → int4 layer weights, int8 embeddings, and a Q4R4 tied head when `Q4FMT=r4` |
+| `QBITS` | native for Q4_1 GGUF in Qwen, 0 otherwise | `-1` → native GGUF kernel for Q4_1 (Qwen), Q4_K or Q6_K; `0` → float32 weights; `8` → int8-quantize weights **and embeddings** at load; `4` → int4 layer weights, int8 embeddings, and a Q4R4 tied head when `Q4FMT=r4` |
 | `Q41_ACT` | `f16` on AArch64 builds with NEON FMLAL, `f32` elsewhere | Q4_1 matmul activation precision. Both modes accumulate in float32. Set `f32` to select the previous activation precision. |
 | `QGROUP` | 32 | int4 scale group size (multiple of 16; 0 → one scale per row). 32 matches the GGUF Q4_0 block. Q4R4 always uses 32 |
 | `Q4FMT` | `r4` on aarch64, else `g` | `QBITS=4` layout: `r4` = Q4R4 (ARMv8.0 NEON kernels, 4.5 bits/weight), `g` = legacy grouped int4 |

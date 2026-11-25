@@ -206,10 +206,17 @@ static int q41_cache_build(int fd, const st_tensor *t, Q41CacheHeader *h) {
     return ok && pwrite(fd,h,sizeof(*h),0) == sizeof(*h);
 }
 
-/* Open the cache after checking its identity and shape. The caller checks
- * the payload checksum before consuming any packed weights. */
+static int q41_cache_read_header(int fd, const Q41CacheHeader *key, Q41CacheHeader *disk,
+                                 const struct stat *info) {
+    return info->st_size >= 0 && (uint64_t)info->st_size == sizeof(*key)+key->bytes &&
+           q41_cache_read(fd,(uint8_t *)disk,sizeof(*disk),0) &&
+           !memcmp(key,disk,offsetof(Q41CacheHeader,checksum));
+}
+
+/* Open or replace a stale regular sidecar. The payload is checked by the
+ * consumer. A resident consumer can request one retry after a checksum miss. */
 static int st_q41_cache_open_format(shards *s, const st_tensor *t, int I, int O,
-                                     Q41CacheHeader *disk, int indexed) {
+                                     Q41CacheHeader *disk, int indexed, int repair) {
     if (I <= 0 || O <= 0 || I%64 || O%4 || !g_st_map ||
         t->off < 0 || (int64_t)O*(I/64)*40 != t->nbytes) return -1;
     struct stat src;
@@ -229,56 +236,59 @@ static int st_q41_cache_open_format(shards *s, const st_tensor *t, int I, int O,
     Q41CacheHeader key = {version,src.st_dev,src.st_ino,src.st_size,mt.tv_sec,mt.tv_nsec,
                           ct.tv_sec,ct.tv_nsec,t->off,I,O,bytes,0};
     if (key.bytes > SIZE_MAX-sizeof(key)) return -1;
-    size_t size = sizeof(key)+key.bytes;
     char path[4096], tmp[4096];
     int n = snprintf(path,sizeof(path),"%s.%s-%lld",s->paths[shard],q41_cache_suffix(version),(long long)t->off);
     if (n < 0 || (size_t)n >= sizeof(path)-8) return -1;
     int fd = open(path,O_RDONLY | O_NONBLOCK);
-    if (fd < 0 && errno == ENOENT) {
-        snprintf(tmp,sizeof(tmp),"%s.XXXXXX",path);
-        int writer = mkstemp(tmp);
-        if (writer < 0) return -1;
-        int ok = q41_cache_build(writer,t,&key);
-        if (close(writer) != 0) ok = 0;
-        if (ok && rename(tmp,path) == 0) fd = open(path,O_RDONLY | O_NONBLOCK);
-        unlink(tmp);
-    }
-    if (fd < 0) return -1;
     struct stat sb;
-    if (fstat(fd,&sb) || !S_ISREG(sb.st_mode) || (uint64_t)sb.st_size != size ||
-        !q41_cache_read(fd,(uint8_t *)disk,sizeof(*disk),0) ||
-        memcmp(&key,disk,offsetof(Q41CacheHeader,checksum))) {
+    if (fd >= 0) {
+        if (fstat(fd,&sb) || !S_ISREG(sb.st_mode)) { close(fd); return -1; }
+        if (q41_cache_read_header(fd,&key,disk,&sb) && !repair) return fd;
         close(fd);
-        return -1;
-    }
-    return fd;
+    } else if (errno != ENOENT) return -1;
+
+    snprintf(tmp,sizeof(tmp),"%s.XXXXXX",path);
+    int writer = mkstemp(tmp);
+    if (writer < 0) return -1;
+    int ok = q41_cache_build(writer,t,&key);
+    if (close(writer) != 0) ok = 0;
+    if (ok && rename(tmp,path) == 0) {
+        fd = open(path,O_RDONLY | O_NONBLOCK);
+        if (fd < 0) return -1;
+        if (!fstat(fd,&sb) && S_ISREG(sb.st_mode) && q41_cache_read_header(fd,&key,disk,&sb))
+            return fd;
+        close(fd);
+    } else unlink(tmp);
+    return -1;
 }
 
 static int st_q41_cache_open(shards *s, const st_tensor *t, int I, int O, Q41CacheHeader *disk) {
-    return st_q41_cache_open_format(s,t,I,O,disk,0);
+    return st_q41_cache_open_format(s,t,I,O,disk,0,0);
 }
 
 static const uint8_t *st_q41_cache_map(shards *s, st_tensor *t, int I, int O, int indexed) {
     if (s->nfd == ST_MAX_SHARDS) return NULL;
-    Q41CacheHeader disk;
-    int fd = st_q41_cache_open_format(s,t,I,O,&disk,indexed);
-    if (fd < 0) return NULL;
-    size_t size = sizeof(disk)+disk.bytes;
-    void *map = mmap(NULL,size,PROT_READ,MAP_PRIVATE,fd,0);
-    close(fd);
-    if (map == MAP_FAILED) return NULL;
-    const uint8_t *data = (const uint8_t *)map+sizeof(disk);
-    if (q41_cache_hash_payload(disk.version,data,disk.bytes) != disk.checksum) {
+    for (int repair = 0; repair <= 1; repair++) {
+        Q41CacheHeader disk;
+        int fd = st_q41_cache_open_format(s,t,I,O,&disk,indexed,repair);
+        if (fd < 0) return NULL;
+        size_t size = sizeof(disk)+disk.bytes;
+        void *map = mmap(NULL,size,PROT_READ,MAP_PRIVATE,fd,0);
+        close(fd);
+        if (map == MAP_FAILED) return NULL;
+        const uint8_t *data = (const uint8_t *)map+sizeof(disk);
+        if (q41_cache_hash_payload(disk.version,data,disk.bytes) == disk.checksum) {
+            int slot = s->nfd++;
+            s->fds[slot] = s->dfds[slot] = -1;
+            s->paths[slot] = NULL;
+            s->maps[slot] = map;
+            s->maplen[slot] = size;
+            t->used = 1;
+            return data;
+        }
         munmap(map,size);
-        return NULL;
     }
-    int slot = s->nfd++;
-    s->fds[slot] = s->dfds[slot] = -1;
-    s->paths[slot] = NULL;
-    s->maps[slot] = map;
-    s->maplen[slot] = size;
-    t->used = 1;
-    return data;
+    return NULL;
 }
 
 static const uint8_t *st_q41_cache(shards *s, st_tensor *t, int I, int O) {

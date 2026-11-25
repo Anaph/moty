@@ -33,6 +33,22 @@ jobs:
       - name: Test suite (native march)
         run: cd c && make test-native
 
+  apple-q41:
+    name: Pocket Q4_1 (Apple Silicon, pthread)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Exercise FMLAL and FFN file windows
+        run: |
+          test "$(uname -m)" = arm64
+          cd c
+          make -j3 THREADPOOL=1 ARCH=apple-m1 libmoty-runtime.a
+          clang -O2 -mcpu=apple-m1 -DMOTY_THREADPOOL -pthread -I. \
+            -DQWEN_Q41_TEST_MAIN -DMOTY_Q41_REQUIRE_FMLAL \
+            -ffunction-sections -Wl,-dead_strip tests/qwen_tests.c \
+            libmoty-runtime.a libmoty-nn.a libmoty-hw.a -lm -o /tmp/moty-q41-test
+          /tmp/moty-q41-test
+
   # Cross-compile + QEMU parity for the ARM SIMD tiers added in WP1.1/1.4.
   # x86 runners can't run ARM code natively; qemu-user executes the simd parity
   # suite (bit-exact vs scalar int64/double reference) under each tier so a

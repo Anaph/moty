@@ -20,8 +20,8 @@ GGUF="$model" QBITS=-1 THREADS=4 CTX=512 TEMP=0 NGEN=64 \
   PROMPT='Explain how a rainbow forms, step by step.' ./c/moty
 ```
 
-- `QBITS=-1` selects native GGUF weights. A compatible GGUF uses this
-  mode automatically when `QBITS` is unset. `QBITS=0` selects float32
+- `QBITS=-1` selects native GGUF weights in Qwen. Qwen uses this
+  mode automatically for compatible GGUFs when `QBITS` is unset. `QBITS=0` selects float32
   weights and `QBITS=8` selects the existing int8 conversion.
 - `Q41_ACT=f16` uses NEON FMLAL and FP32 accumulation when the build
   supports it. ARMv8.0 uses FP32 activations and NEON FP32 accumulation.
@@ -50,6 +50,10 @@ for streamed `gate` and `down` at a reusable address. Workers keep each
 slot until its consumers have finished. Missing or invalid panels fall
 back to the original tensor. The tied indexed head stores repeated
 scale/min pairs once and still computes all logits.
+Stale sidecar headers and lengths trigger an atomic replacement. A resident
+checksum failure triggers one rebuild attempt. A checksum failure found by a
+streaming reader uses raw Q4_1 for the current run and attempts to repair the
+sidecar for the next open.
 
 | Option | Purpose |
 | --- | --- |
@@ -116,7 +120,8 @@ python3 tools/ref/pocket_bench.py --model "$model" --candidate ./c/moty > pocket
 ```
 
 The [benchmark runner](../../tools/ref/pocket_bench.py) checks generated
-IDs in each pair, then writes prefill and decode rates, latency and RSS
+IDs in each pair and confirms that the candidate mapped both gate and down
+panels, then writes prefill and decode rates, latency and RSS
 to JSON. Use `--workload text`, `256`, `1536`, `3584` or
 `3584-speed` to run a single case. The same
 [prompts and token IDs](../../tools/ref/pocket_bench_inputs.json) can
@@ -142,8 +147,9 @@ on the fixed inputs and on short prompts covering 15 lengths from 2 to
 64. Tests cover panel tails, causal bounds and the 2048-position GQA
 transition, chunk overrides, and fallbacks for FP32 activations,
 int8 KV and buffered loading. The
-[ARMv8.0 CI job](../../.github/workflows/ci.yml) runs the Q4_1 and GQA
-kernel tests with `qemu-aarch64 -cpu cortex-a53`. Cortex-A53 speed
+[CI workflow](../../.github/workflows/ci.yml) runs the Q4_1 and GQA
+kernel tests with `qemu-aarch64 -cpu cortex-a53` and exercises FMLAL,
+the pthread backend and the FFN file windows on macOS arm64. Cortex-A53 speed
 requires physical hardware.
 
 To repeat the teacher-forced comparison, write the included token IDs

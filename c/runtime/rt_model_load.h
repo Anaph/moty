@@ -450,6 +450,31 @@ static void stream_scratch_alloc(Model *m) {
     }
 }
 
+/* Native Q4_1 is an engine capability, independent of the GGUF parser's
+ * ability to decode Q4_1 tensors into the engine's existing formats. */
+static int q41_native_selected(const shards *s, int qbits, int64_t budget_bytes) {
+    if (qbits != -1 && (qbits != 0 || moty_getenv("QBITS"))) return 0;
+    for (int i = 0; i < s->n; i++) {
+        if (s->t[i].dtype != ST_Q4_1) continue;
+#ifndef ENGINE_NATIVE_Q41
+        (void)budget_bytes;
+        if (qbits == -1)
+            moty_fail_code(MOTY_FAIL_FORMAT, "[" ENGINE_TAG "] native Q4_1 is not supported by this engine; use QBITS=0 or 8\n");
+        return 0;
+#else
+        int native_budget = 0;
+#ifdef ENGINE_Q41_STREAM
+        native_budget = qbits == -1 && gguf_find(&g_gguf_meta,"pocket.qat_conversion");
+#endif
+        if (!g_micro && (budget_bytes <= 0 || native_budget)) return 1;
+        if (qbits == -1)
+            moty_fail_code(MOTY_FAIL_FORMAT,"Native Q4_1 is incompatible with MICRO or a layer streaming budget; use QBITS=0 or 8\n");
+        return 0;
+#endif
+    }
+    return 0;
+}
+
 /* budget_bytes==0 -> tutto residente (comportamento classico) */
 static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_bytes, int ctx_hint) {
     memset(m, 0, sizeof(*m));
@@ -461,26 +486,13 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
     /* GGUF: l'indice va costruito PRIMA del config (i metadati SONO il config) */
     if (g_gguf) {
         gguf_index(&m->S, &g_gguf_meta, g_gguf);
-        if (qbits == -1 || (qbits == 0 && !moty_getenv("QBITS"))) {
-            for (int i = 0; i < m->S.n; i++) {
-                if (m->S.t[i].dtype != ST_Q4_1) continue;
-                int native_budget = 0;
+        if (q41_native_selected(&m->S,qbits,budget_bytes)) {
+            m->base.qbits = -1;
 #ifdef ENGINE_Q41_STREAM
-                native_budget = qbits == -1 && gguf_find(&g_gguf_meta, "pocket.qat_conversion");
+            q41_stream = budget_bytes > 0;
 #endif
-                if (g_micro || (budget_bytes > 0 && !native_budget)) {
-                    if (qbits == -1)
-                        moty_fail_code(MOTY_FAIL_FORMAT, "Native Q4_1 is incompatible with MICRO or a layer streaming budget; use QBITS=0 or 8\n");
-                } else {
-                    m->base.qbits = -1;
-#ifdef ENGINE_Q41_STREAM
-                    q41_stream = budget_bytes > 0;
-#endif
-                    fprintf(stderr, "[" ENGINE_TAG "] native GGUF Q4_1 (%s activations, FP32 accumulation)\n",
-                            moty_q41_uses_fp16() ? "NEON FP16" : "FP32");
-                }
-                break;
-            }
+            fprintf(stderr, "[" ENGINE_TAG "] native GGUF Q4_1 (%s activations, FP32 accumulation)\n",
+                    moty_q41_uses_fp16() ? "NEON FP16" : "FP32");
         }
     }
     load_cfg(&m->c, snap);

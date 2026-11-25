@@ -104,7 +104,7 @@ typedef struct {
 typedef struct {
     uint8_t *address;
     size_t capacity, page_size;
-    int writable;
+    int writable, mapped_panel;
 } QwenQ41FileWindow;
 #endif
 
@@ -116,7 +116,7 @@ typedef struct {
     const QwenQ41Input *panel;
     QwenQ41FileWindow *file_window;
     uint8_t *copy_dst;
-    int packed, map_panel;
+    int packed, map_panel, invalid_panel;
 #endif
 } QwenQ41Read;
 
@@ -175,6 +175,7 @@ static float *qwen_cli_verify(Model *m, const int *ids, int n, int pos);
 #define ENGINE_API_ID qwen
 #define ENGINE_API_TYPES "qwen3", "qwen2", "llama"
 
+#define ENGINE_NATIVE_Q41 1
 #define ENGINE_Q41_PANELS 1
 #define ENGINE_Q41_STREAM 1
 #ifdef __APPLE__
