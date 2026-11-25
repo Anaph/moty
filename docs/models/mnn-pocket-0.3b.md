@@ -82,15 +82,16 @@ medians. TTFT and request time include process startup.
 
 | Workload | Budget (GiB) | Original → candidate RSS (MiB) | Prefill | Decode | TTFT | Request time |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Eight ordinary prompts, 12 workers | 0.1065 | 205.55 → 100.42 | +0.58% | +6.66% | −15.06% | −10.47% |
-| 256 IDs, 12 workers | 0.108 | 224.28 → 107.81 | +0.49% | +6.09% | −4.01% | −5.07% |
-| 1536 IDs, 4 workers | 0.145 | 300.17 → 147.16 | +7.28% | +3.20% | −6.96% | −6.33% |
-| 3584 IDs, 12 workers | 0.202 | 434.06 → 206.38 | +1.15% | +2.41% | −1.32% | −1.93% |
-| 3584 IDs, 12 workers | 0.207 | 434.06 → 214.06 | +3.33% | +2.98% | −3.44% | −3.63% |
+| Eight ordinary prompts, 12 workers | 0.1065 | 205.55 → 100.38 | +3.65% | +6.64% | −15.63% | −10.41% |
+| 256 IDs, 12 workers | 0.108 | 224.27 → 108.08 | +2.11% | +5.52% | −5.23% | −5.45% |
+| 1536 IDs, 4 workers | 0.145 | 299.14 → 147.34 | +6.72% | +3.45% | −6.46% | −5.98% |
+| 3584 IDs, 12 workers | 0.202 | 434.08 → 206.30 | +1.52% | +2.67% | −1.63% | −1.48% |
+| 3584 IDs, 12 workers | 0.207 | 434.02 → 215.98 | +2.13% | +4.25% | −2.32% | −2.34% |
 
-The table records the optimization series using the saved earlier native
-Q4_1 baseline with SHA-256
-`3e70bcb62710c0bad7cb56a0937fd2653371c3a13d0619bd60c15983a0c09178`.
+The table records the clean pthread build after the Qwen refactor
+(SHA-256 `b7a90d1bbfa47fd1a9601111737e4ba79eaea6992465cb525d35cb45f0403997`).
+All generated token IDs matched the saved native Q4_1 baseline (SHA-256
+`3e70bcb62710c0bad7cb56a0937fd2653371c3a13d0619bd60c15983a0c09178`).
 For a fresh checkout, the benchmark defaults to comparing streaming
 and resident modes in the same binary. Pass `--baseline /path/to/binary`
 to use a saved native baseline. The benchmark records both binary hashes
@@ -98,7 +99,8 @@ and the model hash.
 
 ## Reproduce on Apple Silicon
 
-Build in a fresh checkout with the pthread backend. Prepare both cache
+Build in a fresh checkout with the pthread backend. The runner uses
+Python 3.11 or newer. Prepare both cache
 layouts next to the writable copy of the GGUF before timing. The resident
 run builds the ordinary Group64 head first. The second run builds the
 indexed head while reusing the other sidecars.
@@ -121,6 +123,14 @@ to JSON. Use `--workload text`, `256`, `1536`, `3584` or
 also be used with `PROMPT_IDS` or `PPL`.
 
 ## Quality and compatibility
+
+The post-refactor benchmark matched all 585 generated IDs across the
+four distinct workloads. The clean build also matched all 2310 top-1 IDs
+between resident and streaming execution at perplexity 119.9085.
+CTest passed 176 cases with four platform skips. The standalone
+Q4_1 and GQA tests passed on Cortex-A53 QEMU.
+
+The optimization series used this quality suite.
 
 | Build | Generated IDs matched | Teacher-forced top-1 IDs matched | Perplexity |
 | --- | ---: | ---: | ---: |
