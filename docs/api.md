@@ -42,9 +42,9 @@ engines (MoE, Gemma, GLM, Qwen3.5 hybrid) are command-line only.
 | `config.json` | architecture; `model_type` picks the engine; `image_token_id` (root) for `moty_model_image_token` |
 | every `*.safetensors` file in `dir` | the weights, as one shard set (sorted by name) |
 | `tokenizer.json` | optional: without it only token ids work (`moty_tokenize` returns `MOTY_ERR_UNSUPPORTED`) |
+| `chat_template.jinja` | optional: the Qwen engine checks whether its ChatML turn should include a `<think>` block |
 
-Everything else in the directory is ignored (signature manifests, a
-`chat_template.jinja`: the chat template of each engine is built in). A moty
+Each engine still formats chat turns with its built-in template. A moty
 container (`tools/ref/pack_r4.py`, `SAVE_PACKED=`) keeps its own int4/int8
 layout; an HF snapshot is quantized at open (`qbits` 4 or 8). `qbits` is not
 used for a pre-packed container.
