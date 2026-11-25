@@ -168,7 +168,7 @@ NN_CORE_SRCS = nn/par.c nn/alloc.c nn/quant.c nn/mat.c nn/matmul.c nn/norm.c nn/
                nn/moe.c nn/head.c runtime/moecache.c io/tier.c
 NN_CORE_DEPS = nn/par.h nn/nn_alloc.h nn/nn_quant.h nn/nn_mat.h nn/nn_matmul.h \
                nn/nn_norm.h nn/nn_rope.h nn/nn_attn_kernels.h nn/nn_sample.h \
-               nn/attn.h nn/conv.h nn/ffn.h nn/moe.h nn/head.h runtime/moe.h io/tier.h
+               nn/attn.h nn/conv.h nn/ffn.h nn/moe.h nn/head.h runtime/moe.h io/tier.h io/q41_panels.h util/prof.h
 libmoty-nn.a: $(NN_CORE_SRCS) $(NN_CORE_DEPS) libmoty-hw.a
 	@for src in $(NN_CORE_SRCS); do \
 		obj=$${src%.c}.o; \
@@ -206,7 +206,7 @@ libmoty-runtime.a: $(RT_SRCS) $(RT_DEPS) libmoty-nn.a libmoty-hw.a
 # One archive: the three layers + the lfm2 and qwen engines + the registry.
 # Build it with the pthread pool (no OpenMP runtime needed):
 #   make clean && make THREADPOOL=1 libmoty.a
-libmoty.a: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/lfm2.c engines/qwen.c api/registry.c api/api_internal.h $(RUNTIME_H)
+libmoty.a: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/lfm2.c engines/qwen.c engines/qwen_q41_stream.h api/registry.c api/api_internal.h $(RUNTIME_H)
 	$(CC) $(CFLAGS) -DMOTY_NO_MAIN -c engines/lfm2.c -o api/lfm2_lib.o
 	$(CC) $(CFLAGS) -DMOTY_NO_MAIN -c engines/qwen.c -o api/qwen_lib.o
 	$(CC) $(CFLAGS) -c api/registry.c -o api/registry.o
@@ -239,7 +239,7 @@ endif
 # compile adds -I. A shared deps list keeps the .o rules honest.
 NN_CORE   = nn/nn.h nn/nn_alloc.h nn/nn_norm.h nn/nn_sample.h nn/nn_gemm.h hw/hw.h
 RUNTIME_H = runtime/runtime.h runtime/rt_model_load.h runtime/rt_kv_cache.h runtime/rt_gen_loop.h runtime/rt_env_cfg.h runtime/config.h
-IO_H      = io/st.h io/gguf.h io/tier.h
+IO_H      = io/st.h io/gguf.h io/tier.h io/q41_panels.h
 TOK_H     = tok/tok.h tok/tok_unicode.h
 UTIL_H    = util/json.h util/compat.h util/prof.h
 
@@ -249,7 +249,7 @@ glm$(EXE): libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/glm.c io/st.h io/
 olmoe$(EXE): libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/olmoe.c $(NN_CORE) runtime/moe.h $(IO_H) $(TOK_H) $(UTIL_H)
 	$(CC) $(CFLAGS) engines/olmoe.c -o olmoe$(EXE) libmoty-runtime.a libmoty-nn.a libmoty-hw.a $(LDFLAGS)
 
-qwen$(EXE): libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/qwen.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h $(RUNTIME_H) $(IO_H) util/stw.h engines/qwen_train.h $(UTIL_H)
+qwen$(EXE): libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/qwen.c engines/qwen_q41_stream.h $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h $(RUNTIME_H) $(IO_H) util/stw.h engines/qwen_train.h $(UTIL_H)
 	$(CC) $(CFLAGS) engines/qwen.c -o qwen$(EXE) libmoty-runtime.a libmoty-nn.a libmoty-hw.a $(LDFLAGS)
 
 qwenmoe$(EXE): libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/qwenmoe.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h runtime/moe.h $(RUNTIME_H) $(IO_H) $(TOK_H) $(UTIL_H)
@@ -278,7 +278,7 @@ gemma.o: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/gemma.c $(NN_CORE) 
 olmoe.o: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/olmoe.c $(NN_CORE) runtime/moe.h $(IO_H) $(TOK_H) $(UTIL_H)
 	$(CC) $(CFLAGS) -Dmain=olmoe_main -c engines/olmoe.c -o olmoe.o
 
-qwen.o: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/qwen.c $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h $(RUNTIME_H) $(IO_H) util/stw.h engines/qwen_train.h $(UTIL_H)
+qwen.o: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/qwen.c engines/qwen_q41_stream.h $(NN_CORE) nn/nn_rope.h nn/nn_deltanet.h $(RUNTIME_H) $(IO_H) util/stw.h engines/qwen_train.h $(UTIL_H)
 	$(CC) $(CFLAGS) -Dmain=qwen_main -c engines/qwen.c -o qwen.o
 
 glm.o: libmoty-runtime.a libmoty-nn.a libmoty-hw.a engines/glm.c io/st.h io/uring.h util/json.h $(TOK_H) util/compat.h util/grammar.h

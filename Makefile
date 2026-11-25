@@ -18,6 +18,6 @@ docker-test:
 docker-run:
 	docker run --rm -it -v $(MODELS_DIR):/models:ro \
 	  -e SNAP -e GGUF -e PROMPT -e REF -e NGEN -e CTX -e TEMP -e NUCLEUS -e SEED \
-	  -e QBITS -e QGROUP -e KV_BITS -e MEM_GB -e MEM_FRAC -e MICRO -e MICRO_DROP \
+	  -e QBITS -e Q41_ACT -e QGROUP -e KV_BITS -e MEM_GB -e MEM_FRAC -e MICRO -e MICRO_DROP \
 	  -e PREFILL_CHUNK -e THREADS -e TOKENS -e TTA -e LORA \
 	  $(DOCKER_IMAGE)

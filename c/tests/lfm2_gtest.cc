@@ -3,6 +3,7 @@
 
 extern "C" {
 int lt_cfg_dense(void);
+int lt_q41_requires_opt_in(void);
 int lt_load_small_no_mats(void);
 int lt_ref_f32(void);
 int lt_ref_q8(void);
@@ -16,6 +17,7 @@ int lt_embed_inject(void);
 }
 
 TEST(Lfm2, ConfigDenseHf)       { EXPECT_EQ(lt_cfg_dense(), 0); }
+TEST(Lfm2, Q41RequiresOptIn)    { EXPECT_EQ(lt_q41_requires_opt_in(), 0); }
 TEST(Lfm2, LoadSmallNoMats)     { EXPECT_EQ(lt_load_small_no_mats(), 0); }
 TEST(Lfm2, RefF32PrefillDecode) { EXPECT_EQ(lt_ref_f32(), 0); }
 TEST(Lfm2, RefQ8)               { EXPECT_EQ(lt_ref_q8(), 0); }

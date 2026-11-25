@@ -3,7 +3,7 @@
  * con i nomi gia' tradotti nella nomenclatura HF, quindi tutto il downstream
  * (model_init_ex, streaming MEM_GB, micro-RSS, LoRA, REF) funziona invariato.
  *
- *   - dtypes: F32/F16/BF16 diretti; Q8_0/Q4_0/Q4_K/Q5_K/Q6_K via il dequant
+ *   - dtypes: F32/F16/BF16 diretti; Q8_0/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K via il dequant
  *     hook g_st_dequant_fn (st.h resta ignaro del formato);
  *   - Q4_0 + QBITS=4: gguf_repack_q4_0 e' una PURA permutazione di nibble
  *     (stessa codifica v+8, stessa granularita' 32) -> int4 grouped LOSSLESS
@@ -36,8 +36,8 @@ static inline char *strndup(const char *s, size_t n) {
 enum { GG_U8=0, GG_I8=1, GG_U16=2, GG_I16=3, GG_U32=4, GG_I32=5, GG_F32=6,
        GG_BOOL=7, GG_STR=8, GG_ARR=9, GG_U64=10, GG_I64=11, GG_F64=12 };
 
-/* valore di un KV: scalari convertiti; stringhe e array puntano nel buffer
- * dell'header (M->hdr), che resta vivo per tutta la vita del processo */
+/* Strings and arrays borrow either the GGUF file mapping or the owned
+ * header buffer, for the lifetime of the index. */
 typedef struct {
     int t;                      /* GG_* */
     int64_t i; double f;
@@ -223,6 +223,7 @@ static int gguf_ggml_dtype(uint32_t t) {
         case 30: return 0;         /* BF16 */
         case 8:  return ST_Q8_0;
         case 2:  return ST_Q4_0;
+        case 3:  return ST_Q4_1;
         case 12: return ST_Q4_K;
         case 13: return ST_Q5_K;
         case 14: return ST_Q6_K;
@@ -248,6 +249,20 @@ static void gguf_dq_q4_0(const uint8_t *b, int64_t nblk, float *out) {
         for (int i = 0; i < 16; i++) {
             out[i]      = d * (float)((int)(q[i] & 0xF) - 8);
             out[i + 16] = d * (float)((int)(q[i] >> 4) - 8);
+        }
+    }
+}
+/* Q4_1 stores an FP16 scale and minimum followed by 32 unsigned nibbles. */
+static void gguf_dq_q4_1(const uint8_t *b, int64_t nblk, float *out) {
+    for (int64_t k = 0; k < nblk; k++, b += Q4_1_BYTES, out += Q4_1_ELEMS) {
+        uint16_t dh, mh;
+        memcpy(&dh, b, 2);
+        memcpy(&mh, b + 2, 2);
+        float d = f16_to_f32(dh), m = f16_to_f32(mh);
+        const uint8_t *q = b + 4;
+        for (int i = 0; i < 16; i++) {
+            out[i]      = d * (float)(q[i] & 0xF) + m;
+            out[i + 16] = d * (float)(q[i] >> 4) + m;
         }
     }
 }
@@ -325,6 +340,7 @@ static void gguf_dequant(int dtype, const void *raw, int64_t numel, float *out) 
     switch (dtype) {
         case ST_Q8_0: gguf_dq_q8_0(b, numel/32,  out); return;
         case ST_Q4_0: gguf_dq_q4_0(b, numel/32,  out); return;
+        case ST_Q4_1: gguf_dq_q4_1(b, numel/Q4_1_ELEMS, out); return;
         case ST_Q4_K: gguf_dq_q4k(b, numel/256, out); return;
         case ST_Q5_K: gguf_dq_q5k(b, numel/256, out); return;
         case ST_Q6_K: gguf_dq_q6k(b, numel/256, out); return;
@@ -449,19 +465,21 @@ static void gguf_index(shards *S, GgufMeta *M, const char *path) {
     const uint16_t one = 1;
     if (*(const uint8_t *)&one != 1) { fprintf(stderr, "%s: host big-endian non supportato\n", path); exit(1); }
 
-    /* l'header ha lunghezza ignota (i metadati del tokenizer possono essere
-     * decine di MB): si legge un prefisso crescente e si riparsa da capo
-     * finche' il parse non entra tutto nel buffer */
-    int64_t cap = 1 << 20;
+    /* Borrow the same clean pages as the tensor reader. Without mmap,
+     * grow a read buffer only as far as the header parser needs. */
+    const uint8_t *mapped = st_map_fd(S,fd);
+    int64_t cap = mapped ? fsz : 1 << 20;
     uint8_t *buf = NULL;
     gcur c;
     int64_t n_tensors = 0, n_kv = 0;
     for (;;) {
         if (cap > fsz) cap = fsz;
-        buf = realloc(buf, cap);
-        if (!buf) { fprintf(stderr, "OOM gguf header\n"); exit(1); }
-        if (pread(fd, buf, cap, 0) != cap) { perror("pread gguf"); exit(1); }
-        c.p = buf; c.n = cap; c.off = 0; c.fail = 0;
+        if (!mapped) {
+            buf = realloc(buf,cap);
+            if (!buf) moty_fail_code(MOTY_FAIL_OOM,"OOM GGUF header");
+            if (pread(fd,buf,cap,0) != cap) { perror("pread gguf"); exit(1); }
+        }
+        c.p = mapped ? mapped : buf; c.n = cap; c.off = 0; c.fail = 0;
         uint32_t magic = (uint32_t)gc_u(&c, 4);
         uint32_t ver   = (uint32_t)gc_u(&c, 4);
         if (c.fail || magic != 0x46554747u) { fprintf(stderr, "%s: non e' un file GGUF\n", path); exit(1); }
@@ -488,7 +506,7 @@ static void gguf_index(shards *S, GgufMeta *M, const char *path) {
         for (int i = 0; i < M->nkv; i++) free(M->kv[i].key);
         M->nkv = 0;
         if (cap >= fsz) { fprintf(stderr, "%s: header GGUF troncato/malformato\n", path); exit(1); }
-        cap *= 8;
+        cap = cap > fsz/4 ? fsz : cap*4;
     }
     /* i tensor info seguono i KV: possono ancora sforare il buffer -> stesso
      * schema a prefisso crescente, ripartendo dal parse completo */
@@ -530,12 +548,21 @@ static void gguf_index(shards *S, GgufMeta *M, const char *path) {
         if (ok && !c.fail) break;
         for (int64_t i = 0; i < nti; i++) free(ti[i].hf);
         if (cap >= fsz) { fprintf(stderr, "%s: tensor info GGUF troncati\n", path); exit(1); }
-        cap *= 8; if (cap > fsz) cap = fsz;
-        buf = realloc(buf, cap);
-        if (pread(fd, buf, cap, 0) != cap) { perror("pread gguf"); exit(1); }
+        cap = cap > fsz/4 ? fsz : cap*4;
+        uintptr_t old = (uintptr_t)buf;
+        buf = realloc(buf,cap);
+        if (!buf) moty_fail_code(MOTY_FAIL_OOM,"OOM GGUF header");
+        if (pread(fd,buf,cap,0) != cap) { perror("pread gguf"); exit(1); }
+        for (int i = 0; i < M->nkv; i++) {
+            gval *value = &M->kv[i].v;
+            if (value->t == GG_STR)
+                value->s = (const char *)buf+((uintptr_t)value->s-old);
+            else if (value->t == GG_ARR) {
+                value->ap = buf+((uintptr_t)value->ap-old);
+                value->aend = buf+((uintptr_t)value->aend-old);
+            }
+        }
         c.p = buf; c.n = cap; c.fail = 0; c.off = save;
-        /* NB: save resta valido: i KV sono gia' parsati e il prefisso riletto
-         * e' identico byte a byte */
     }
     int64_t align = gguf_int(M, "general.alignment", 32);
     if (align <= 0 || (align & (align - 1))) { fprintf(stderr, "%s: alignment %lld non valido\n", path, (long long)align); exit(1); }
@@ -558,6 +585,30 @@ static void gguf_index(shards *S, GgufMeta *M, const char *path) {
     g_st_dequant_fn = gguf_dequant;
     fprintf(stderr, "[gguf] %s: arch=%s, %d tensori, data @ %lld\n",
             path, M->arch[0] ? M->arch : "?", S->n, (long long)M->data_off);
+}
+
+/* Release complete metadata pages when a caller is finished with the index.
+ * Keep the virtual range reserved so tensor addresses and shard close still
+ * use the original mapping. The partial page before the tensors stays mapped. */
+static int gguf_release_mapped_metadata(shards *S, GgufMeta *M) {
+#ifdef __APPLE__
+    if (!M->kv || M->hdr || !S->nfd || !S->maps[0] || S->maps[0] == (void *)-1 ||
+        M->data_off <= 0 || M->data_off >= S->maplen[0]) return 0;
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return 0;
+    const size_t bytes = (size_t)(M->data_off / page * page);
+    if (!bytes || mmap(S->maps[0],bytes,PROT_NONE,MAP_PRIVATE|MAP_FIXED|MAP_ANON,-1,0) == MAP_FAILED)
+        return 0;
+    for (int i = 0; i < M->nkv; i++) free(M->kv[i].key);
+    free(M->kv);
+    M->kv = NULL;
+    M->nkv = 0;
+    return 1;
+#else
+    (void)S;
+    (void)M;
+    return 0;
+#endif
 }
 
 #endif /* GGUF_H */

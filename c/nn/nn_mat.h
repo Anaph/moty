@@ -15,7 +15,7 @@
 
 #include <stdint.h>
 
-typedef struct Mat { int fmt;             /* WF_F32/WF_I8/WF_I4/WF_I4G/WF_I2/WF_Q4R4/WF_Q8R4 */
+typedef struct Mat { int fmt;             /* WF_* */
                      float *f; int8_t *q; float *qs; int O, I;
                      uint8_t *q4; int gs;  /* WF_Q8R4: its int8 codes live in q4 too */
                      uint16_t *s16;       /* WF_Q4R4/Q8R4: f16 group scales [O/4][I/32][4] */
@@ -47,6 +47,8 @@ typedef struct MotyCommon {
     int qbits;                                       /* 0 f32 / 8 i8 / 4 i4 / -1 nativo GGUF */
     float *embed, *final_norm;
     int8_t *embed_q; float *embed_qs;                /* QBITS=8: embedding int8 */
+    const uint8_t *embed_q41;                      /* native GGUF embedding, shared with a tied head */
+    int embed_q41_gs;
     Mat lm_head; int lm_tied;
     struct MotyHeadSL *head_sl;                      /* HEAD_TOPK shortlist (nn/head.h) or NULL */
     const float *inj; int inj_n, inj_used, inj_tok; /* EMBEDS: rows injected at inj_tok positions */

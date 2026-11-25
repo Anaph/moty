@@ -67,13 +67,13 @@ int qt_gqa(void) {
     kv_alloc(&A, 16); kv_alloc(&B, 16);
     float *x = falloc((int64_t)S*D); qt_fill(x,(int64_t)S*D,1);
     float *oa = falloc((int64_t)S*D), *ob = falloc((int64_t)S*D);
-    attention(&A, &la, 0, x, S, 0, oa);
-    attention(&B, &lb, 0, x, S, 0, ob);
+    attention(&A, &la, 0, x, S, 0, oa, NULL);
+    attention(&B, &lb, 0, x, S, 0, ob, NULL);
     for (int64_t i = 0; i < (int64_t)S*D; i++) CHECK(fabsf(oa[i]-ob[i]) < 1e-5f);
     float *xt = falloc(D); qt_fill(xt,D,1);
     float *oa1 = falloc(D), *ob1 = falloc(D);
-    attention(&A, &la, 0, xt, 1, S, oa1);
-    attention(&B, &lb, 0, xt, 1, S, ob1);
+    attention(&A, &la, 0, xt, 1, S, oa1, NULL);
+    attention(&B, &lb, 0, xt, 1, S, ob1, NULL);
     for (int i = 0; i < D; i++) CHECK(fabsf(oa1[i]-ob1[i]) < 1e-5f);
     return 0;
 }
@@ -304,8 +304,8 @@ int qt_gated_layout(void) {
     kv_alloc(&A, 8); kv_alloc(&B, 8);
     float *x = falloc((int64_t)S*D); for (int64_t i=0;i<(int64_t)S*D;i++) x[i]=qt_frnd();
     float *oa = falloc((int64_t)S*D), *ob = falloc((int64_t)S*D);
-    attention(&A, &la, 0, x, S, 0, oa);
-    attention(&B, &lb, 0, x, S, 0, ob);
+    attention(&A, &la, 0, x, S, 0, oa, NULL);
+    attention(&B, &lb, 0, x, S, 0, ob, NULL);
     for (int64_t i = 0; i < (int64_t)S*D; i++) CHECK(fabsf(ob[i] - 0.5f*oa[i]) < 1e-5f);
     return 0;
 }
@@ -472,6 +472,48 @@ static void qt_write_dense_dir(const char *dir) {
         #undef AT
     }
     tst_write(dir);
+}
+
+int qt_prefill_workspace(void) {
+    const char *dir = tst_dir("qwen_tiny_model");
+    qt_write_dense_dir(dir);
+    enum { TOKENS = 1025, PREFIX = 3, CTX = TOKENS + PREFIX + 1 };
+    int ids[CTX];
+    for (int i = 0; i < CTX; i++) ids[i] = (i*13+7) % 32;
+    MotyTrack memory = {0};
+    MotyTrack *prev = moty_track_set(&memory);
+    Model full, compact;
+    model_init(&full,dir,0); model_init(&compact,dir,0);
+    kv_alloc(&full,CTX); kv_alloc(&compact,CTX);
+    compact.prefill_workspace = 1;
+    compact.prefill_parallel = 1;
+    compact.auto_prefill_chunk = 256;
+    const int threads = moty_par_threads();
+    moty_par_set_threads(4);
+    float *a = step(&full,ids,PREFIX,0);
+    float *b = step(&compact,ids,PREFIX,0);
+    int exact = !memcmp(a,b,full.c.vocab*sizeof(float));
+    free(a); free(b);
+    a = step(&full,ids+PREFIX,TOKENS,PREFIX);
+    b = step(&compact,ids+PREFIX,TOKENS,PREFIX);
+    exact &= !memcmp(a,b,full.c.vocab*sizeof(float));
+    free(a); free(b);
+    for (int l = 0; l < full.c.n_layers; l++)
+        for (int h = 0; h < full.c.n_kv_heads; h++) {
+            int row = h*CTX*full.c.head_dim;
+            size_t bytes = (CTX-1)*full.c.head_dim*sizeof(float);
+            exact &= !memcmp(full.base.K[l]+row,compact.base.K[l]+row,bytes);
+            exact &= !memcmp(full.base.V[l]+row,compact.base.V[l]+row,bytes);
+        }
+    a = step(&full,ids+CTX-1,1,CTX-1);
+    b = step(&compact,ids+CTX-1,1,CTX-1);
+    exact &= !memcmp(a,b,full.c.vocab*sizeof(float));
+    st_close_fds(&full.S); st_close_fds(&compact.S);
+    moty_par_set_threads(threads);
+    moty_track_set(prev);
+    moty_track_free_all(&memory);
+    CHECK(exact);
+    return 0;
 }
 
 static void qt_write_hybrid_dir(const char *dir) {
@@ -825,7 +867,10 @@ int qt_gguf_q4_0_load(void) {
     CHECK(st_dtype(&m.S, "model.layers.0.mlp.gate_proj.weight") == ST_Q4_0);
     /* QBITS=4: repack lossless, bit-identico al repack di riferimento */
     Mat w;
+    int save_fmt = g_q4fmt;
+    g_q4fmt = 0;   /* exercise grouped int4 even where Q4R4 is the default */
     load_mat_bits(&m, &w, "model.layers.0.mlp.gate_proj.weight", O, I, 4);
+    g_q4fmt = save_fmt;
     CHECK(w.q4 != NULL && w.gs == 32 && w.f == NULL && w.q == NULL);
     uint8_t rq4[O*I/2]; float rqs[O*NB];
     gguf_repack_q4_0(blocks, rq4, rqs, O, I);
@@ -841,6 +886,940 @@ int qt_gguf_q4_0_load(void) {
     remove(gpath);
     return 0;
 }
+
+int qt_gguf_q4_1_native(void) {
+    enum { O = 7, I = 96, S = 15, NB = I / Q4_1_ELEMS }; /* full SIMD tile and all tail sizes */
+    uint8_t raw[O * NB][Q4_1_BYTES];
+    static const uint16_t scales[] = { 0x3800, 0x2800, 0x0001, 0 };
+    static const uint16_t mins[] = { 0xc000, 0x3400, 0x8001, 0x3c00 };
+    qt_rng_s = 401;
+    for (int b = 0; b < O * NB; b++) {
+        memcpy(raw[b], &scales[b % 4], 2);
+        memcpy(raw[b] + 2, &mins[b % 4], 2);
+        for (int i = 4; i < Q4_1_BYTES; i++) raw[b][i] = (uint8_t)(b * 11 + i * 19);
+    }
+    float x[S * I], w[O * I], ref[S * O], out[S * O], single[O], row[I];
+    qt_fill(x, S * I, 1.f);
+    const char *tmp = getenv("TMPDIR"); if (!tmp) tmp = "/tmp";
+    char path[600]; snprintf(path, sizeof(path), "%s/qwen_native_q41.gguf", tmp);
+    tg_reset();
+    tg_kv_str("general.architecture", "qwen3");
+    int64_t dims[] = { I, O };
+    tg_tensor("token_embd.weight", 3, 2, dims, raw, sizeof(raw));
+    tg_write(path);
+    tg_reset();
+
+    Model m = {0}; m.c.hidden = I;
+    GgufMeta meta;
+    gguf_index(&m.S, &meta, path);
+    const char *name = "model.embed_tokens.weight";
+    st_read_f32(&m.S, name, w, 0);
+    moty_matmul(ref, x, w, S, I, O);
+    float ref16[S * O];
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_FML)
+    float rounded[S * I];
+    for (int i = 0; i < S * I; i++) rounded[i] = f16_to_f32(moty_f32_to_f16(x[i]));
+    moty_matmul(ref16, rounded, w, S, I, O);
+#else
+    memcpy(ref16, ref, sizeof(ref));
+#endif
+    const char *act = getenv("Q41_ACT");
+    char *saved_act = act ? strdup(act) : NULL;
+    int saved_map = g_st_map;
+    for (int map = 0; map <= 1; map++) {
+        Mat packed;
+        g_st_map = map;
+        load_mat_bits(&m, &packed, name, O, I, -1);
+        CHECK(packed.fmt == WF_Q4_1 && packed.f == NULL && packed.q == NULL);
+        CHECK(!memcmp(packed.q4, raw, sizeof(raw)));
+        CHECK(packed.borrowed == 0 || packed.borrowed == 2);
+        if (!map) CHECK(packed.borrowed == 0);
+        m.base.embed_q41 = packed.q4;
+        embed_row(&m, O - 1, 1.f, row);
+        CHECK(!memcmp(row, w + (O - 1) * I, sizeof(row)));
+        embed_row(&m, 1, 0.5f, row);
+        for (int i = 0; i < I; i++) CHECK(row[i] == 0.5f * w[I + i]);
+        for (int half = 0; half < 2; half++) {
+            setenv("Q41_ACT", half ? "f16" : "f32", 1);
+            const float *expected = half ? ref16 : ref;
+            mat_apply(out, x, &packed, S);
+            for (int i = 0; i < S * O; i++) CHECK(fabsf(expected[i] - out[i]) < 3e-5f);
+            for (int s = 0; s < S; s++) {
+                mat_apply(single, x + s * I, &packed, 1);
+                CHECK(!memcmp(out + s * O, single, sizeof(single)));
+            }
+        }
+        float x0 = x[0];
+        x[0] = 100000.f;  /* exceeds FP16 range; must use the FP32 kernel */
+        setenv("Q41_ACT", "f32", 1);
+        mat_apply(single, x, &packed, 1);
+        setenv("Q41_ACT", "f16", 1);
+        mat_apply(out, x, &packed, 1);
+        CHECK(!memcmp(out, single, sizeof(single)));
+        x[0] = x0;
+        if (!packed.borrowed) moty_bfree(packed.q4);
+    }
+    if (saved_act) { setenv("Q41_ACT", saved_act, 1); free(saved_act); }
+    else unsetenv("Q41_ACT");
+    g_st_map = saved_map;
+    st_close_fds(&m.S);
+    free(m.S.paths[0]); free(m.S.t[0].name); free(m.S.t); free(m.S.hidx);
+    free(meta.kv[0].key); free(meta.kv); free(meta.hdr);
+    g_st_dequant_fn = NULL;
+    remove(path);
+    return 0;
+}
+
+/* Give every projection different codes so a stale or overwritten FFN
+ * window changes the complete forward logits. */
+static void qt_q41_stream_tensor(const char *name, int rows, int cols, int seed) {
+    uint8_t raw[64*64/Q4_1_ELEMS*Q4_1_BYTES];
+    int blocks = rows*cols/Q4_1_ELEMS;
+    for (int b = 0; b < blocks; b++) {
+        uint8_t *block = raw+b*Q4_1_BYTES;
+        const uint16_t params[] = {0x2400,0xb000};
+        memcpy(block,params,sizeof(params));
+        for (int k = 4; k < Q4_1_BYTES; k++)
+            block[k] = (uint8_t)((b*17+k*23+seed*31) ^ (b*k+seed));
+    }
+    int64_t dims[] = {cols,rows};
+    tg_tensor(name,3,2,dims,raw,(size_t)blocks*Q4_1_BYTES);
+}
+
+int qt_q41_stream_budget(void) {
+    enum { D = 64, V = 32, L = 5, CTX = 8 };
+    tg_reset();
+    tg_kv_str("general.architecture","qwen3");
+    tg_kv_str("pocket.qat_conversion","test fixture");
+    tg_kv_u32("qwen3.embedding_length",D);
+    tg_kv_u32("qwen3.block_count",L);
+    tg_kv_u32("qwen3.attention.head_count",2);
+    tg_kv_u32("qwen3.attention.head_count_kv",1);
+    tg_kv_u32("qwen3.feed_forward_length",D);
+    tg_kv_u32("qwen3.context_length",CTX);
+    const char *tokens[V];
+    for (int i = 0; i < V; i++) tokens[i] = "x";
+    tg_kv_arr_str("tokenizer.ggml.tokens",tokens,V);
+    float norm[D];
+    for (int i = 0; i < D; i++) norm[i] = 1.f;
+    tg_tensor_f32("output_norm.weight",1,D,norm);
+    qt_q41_stream_tensor("token_embd.weight",V,D,1);
+    const char *proj[] = {"attn_q","attn_k","attn_v","attn_output","ffn_gate","ffn_up","ffn_down"};
+    for (int l = 0; l < L; l++) {
+        char name[64];
+        snprintf(name,sizeof(name),"blk.%d.attn_norm.weight",l);
+        tg_tensor_f32(name,1,D,norm);
+        snprintf(name,sizeof(name),"blk.%d.ffn_norm.weight",l);
+        tg_tensor_f32(name,1,D,norm);
+        for (int p = 0; p < 7; p++) {
+            snprintf(name,sizeof(name),"blk.%d.%s.weight",l,proj[p]);
+            qt_q41_stream_tensor(name,p == 1 || p == 2 ? D/2 : D,D,2+7*l+p);
+        }
+    }
+    char path[600];
+    snprintf(path,sizeof(path),"%s/pocket.gguf",tst_dir("qwen_q41_stream"));
+    tg_write(path);
+    tg_reset();
+
+    MotyTrack memory = {0};
+    MotyTrack *prev = moty_track_set(&memory);
+    const char *saved_gguf = g_gguf;
+    GgufMeta saved_meta = g_gguf_meta;
+    g_gguf = path;
+    Model full;
+    model_init_ex(&full,NULL,-1,0,CTX);
+    const char *qbits = getenv("QBITS");
+    char *saved_qbits = qbits ? strdup(qbits) : NULL;
+    unsetenv("QBITS");
+    CHECK(q41_native_selected(&full.S,0,0));
+    setenv("QBITS","0",1);
+    CHECK(!q41_native_selected(&full.S,0,0));
+    if (saved_qbits) {
+        setenv("QBITS",saved_qbits,1);
+        free(saved_qbits);
+    } else unsetenv("QBITS");
+    kv_alloc(&full,CTX);
+    const int ids[] = {1,2,3,4,5,6};
+    float *a = step(&full,ids,5,0);
+    float *b = step(&full,ids+5,1,5);
+    int exact = 1;
+    /* Cover the synchronous path, both Apple queue depths and a budget
+     * with no cold layers. Multiple layers reuse each window. */
+    int64_t ffn_bytes = 3*scr_al(D*D/Q4_1_ELEMS*Q4_1_BYTES);
+    int64_t fixed = fixed_bytes(&full,CTX) + L*8*D*sizeof(float)
+                  + (V*D + L*3*D*D)/Q4_1_ELEMS*Q4_1_BYTES;
+#ifdef __APPLE__
+    int windows = Q41_WINDOWS;
+#else
+    int windows = 1;
+#endif
+    const int64_t partial_budget = fixed+(windows+1)*ffn_bytes+2*(ffn_bytes/3);
+    const int64_t budgets[] = {1,fixed+2*ffn_bytes,fixed+3*ffn_bytes,1<<20,fixed+4*ffn_bytes,
+                               partial_budget,partial_budget,fixed+4*ffn_bytes};
+    const char *prefix = getenv("MOTY_Q41_RESIDENT_PREFIX");
+    char *saved_prefix = prefix ? strdup(prefix) : NULL;
+    unsetenv("MOTY_Q41_RESIDENT_PREFIX");
+    const char *order = getenv("MOTY_Q41_RESIDENT_DOWN");
+    char *saved_order = order ? strdup(order) : NULL;
+    unsetenv("MOTY_Q41_RESIDENT_DOWN");
+#ifdef __APPLE__
+    const char *window_depth = getenv("MOTY_Q41_WINDOWS");
+    char *saved_window_depth = window_depth ? strdup(window_depth) : NULL;
+    unsetenv("MOTY_Q41_WINDOWS");
+#endif
+#if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
+    const char *packed = getenv("MOTY_Q41_PACKED");
+    char *saved_packed = packed ? strdup(packed) : NULL;
+    const char *checksum = getenv("MOTY_Q41_CACHE_HASH");
+    char *saved_checksum = checksum ? strdup(checksum) : NULL;
+    const char *ahead = getenv("MOTY_Q41_READ_AHEAD");
+    char *saved_ahead = ahead ? strdup(ahead) : NULL;
+    const char *batch_panels = getenv("MOTY_Q41_STREAM_PREFILL");
+    char *saved_batch_panels = batch_panels ? strdup(batch_panels) : NULL;
+    const char *attn_layout = getenv("MOTY_Q41_PREFILL_ATTN");
+    char *saved_attn_layout = attn_layout ? strdup(attn_layout) : NULL;
+    const char *split_down = getenv("MOTY_Q41_SPLIT_DOWN");
+    char *saved_split_down = split_down ? strdup(split_down) : NULL;
+    const char *file_windows = getenv("MOTY_Q41_FILE_WINDOWS");
+    char *saved_file_windows = file_windows ? strdup(file_windows) : NULL;
+    unsetenv("MOTY_Q41_READ_AHEAD");
+    unsetenv("MOTY_Q41_STREAM_PREFILL");
+    unsetenv("MOTY_Q41_PREFILL_ATTN");
+    unsetenv("MOTY_Q41_SPLIT_DOWN");
+    unsetenv("MOTY_Q41_FILE_WINDOWS");
+#endif
+    for (int i = 0; i < (int)(sizeof(budgets)/sizeof(*budgets)); i++) {
+        Model stream;
+        int partial = i == 5 || i == 6;
+        int slot_order = i == 6;
+#if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
+        int panels = i == 2 && moty_q41_uses_fp16() && g_st_map;
+        int panel_only = i == 7;
+        int attention_panels = (i == 4 || panel_only) && moty_q41_uses_fp16() && g_st_map;
+        int partial_panels = partial && moty_q41_uses_fp16() && g_st_map;
+        if ((i == 4 || panel_only) && !attention_panels) continue;
+        if (i == 1 || panel_only) setenv("MOTY_Q41_WINDOWS","4",1);
+        else unsetenv("MOTY_Q41_WINDOWS");
+        if (slot_order || panel_only) setenv("MOTY_Q41_READ_AHEAD","2",1);
+        if (panels || slot_order || panel_only) setenv("MOTY_Q41_SPLIT_DOWN","1",1);
+        else unsetenv("MOTY_Q41_SPLIT_DOWN");
+        if (panel_only) {
+            unsetenv("MOTY_Q41_RESIDENT_PREFIX");
+            setenv("MOTY_Q41_STREAM_PREFILL","5",1);
+            setenv("MOTY_Q41_PREFILL_ATTN","panel",1);
+            setenv("MOTY_Q41_READ_AHEAD","4",1);
+            setenv("MOTY_Q41_FILE_WINDOWS","1",1);
+        }
+        if (panels) setenv("MOTY_Q41_CACHE_HASH","parallel",1);
+        else unsetenv("MOTY_Q41_CACHE_HASH");
+        if (attention_panels) setenv("MOTY_Q41_PACKED","stream-all",1);
+        else if (panels || partial_panels) setenv("MOTY_Q41_PACKED","stream",1);
+        else unsetenv("MOTY_Q41_PACKED");
+#else
+        if (i == 4 || i == 7) continue;
+#endif
+        if (partial) setenv("MOTY_Q41_RESIDENT_PREFIX","1",1);
+        if (slot_order) setenv("MOTY_Q41_RESIDENT_DOWN","slot",1);
+        model_init_ex(&stream,NULL,-1,budgets[i],CTX);
+        exact &= (stream.q41_window != NULL) == (i != 3);
+        if (i == 0) exact &= stream.q41_window_count == 1 && stream.base.n_resident == 0;
+        const uint8_t *resident_down = NULL;
+        if (partial) {
+            exact &= stream.base.n_resident == 1 && stream.q41_window_count == windows;
+            int second = slot_order ? 1+windows : 2;
+            for (int li = 1; li < L; li++)
+                exact &= stream.q41_layers[li].ffn[2].resident == (li == 1 || li == second);
+            resident_down = stream.L[1].down.q4;
+            exact &= resident_down != NULL;
+        }
+#ifdef __APPLE__
+        if (i == 1 || i == 2) exact &= stream.q41_window_count == i+1;
+#endif
+        if (i == 3) exact &= stream.base.n_resident == L;
+        kv_alloc(&stream,CTX);
+        float *out = step(&stream,ids,5,0);
+        exact &= memcmp(out,a,V*sizeof(float)) == 0;
+        free(out);
+#if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
+        if (slot_order || panel_only)
+            exact &= stream.q41_queue && stream.q41_queue->split_down &&
+                     stream.q41_queue->staged == (panel_only ? 15u : 3u);
+        if (panel_only) exact &= stream.q41_window_count == Q41_MAX_WINDOWS;
+        if (panel_only)
+            exact &= stream.q41_layers[stream.base.n_resident].ffn[0].panel_verified;
+        if (panel_only && stream.q41_queue) {
+            int first = stream.base.n_resident;
+            QwenQ41Batch *batch = qwen_q41_batch_for_layer(&stream,first);
+            dispatch_group_wait(batch->ready,DISPATCH_TIME_FOREVER);
+            dispatch_group_wait(batch->down_ready,DISPATCH_TIME_FOREVER);
+            exact &= batch->jobs[0].packed && batch->jobs[2].packed &&
+                     batch->file_windows[0].address && !batch->file_windows[0].writable &&
+                     batch->file_windows[2].address && !batch->file_windows[2].writable &&
+                     !batch->file_windows[1].address;
+            exact &= !stream.q41_mapped_gate && !stream.q41_mapped_down;
+            /* Change a verified, already staged panel without resizing it.
+             * Binding must use raw gate and up and restore the sidecar. */
+            const QwenQ41Input *gate = &stream.q41_layers[first].ffn[0];
+            char path_gate[720];
+            snprintf(path_gate,sizeof(path_gate),"%s.%s-%lld",path,q41_cache_suffix(gate->panel_version),
+                     (long long)gate->tensor->off);
+            int gate_fd = open(path_gate,O_RDWR);
+            uint8_t gate_byte = 0;
+            exact &= gate_fd >= 0 && pread(gate_fd,&gate_byte,1,sizeof(Q41CacheHeader)) == 1;
+            if (gate_fd >= 0) {
+                uint8_t corrupt = gate_byte^1;
+                exact &= pwrite(gate_fd,&corrupt,1,sizeof(Q41CacheHeader)) == 1;
+                close(gate_fd);
+            }
+            unsigned writes = stream.S.q41_cache_writes;
+            qwen_q41_stream_bind(&stream,first,batch->jobs,0,2);
+            exact &= batch->file_windows[0].writable && !batch->jobs[0].packed &&
+                     !batch->jobs[1].packed && batch->jobs[0].invalid_panel &&
+                     stream.S.q41_cache_writes == writes+1 && stream.q41_fallbacks == 2;
+
+            const QwenQ41Input *down = &stream.q41_layers[first].ffn[2];
+            char path_down[720];
+            snprintf(path_down,sizeof(path_down),"%s.%s-%lld",path,q41_cache_suffix(down->panel_version),
+                     (long long)down->tensor->off);
+            int fd = open(path_down,O_WRONLY);
+            if (fd < 0) exact = 0;
+            else {
+                exact &= ftruncate(fd,sizeof(Q41CacheHeader)) == 0;
+                close(fd);
+            }
+            batch->jobs[2].packed = 0;
+            qwen_q41_read(&batch->jobs[2]);
+            exact &= batch->file_windows[2].writable && !batch->jobs[2].packed && !batch->jobs[2].error;
+        }
+        char sidecar[720];
+        if (panels) {
+            /* Rejection of one gate cache must keep both projections raw. */
+            const QwenQ41Input *gate = &stream.q41_layers[0].ffn[0];
+            exact &= gate->panel_bytes > 0 && gate->panel_version == Q41_CACHE_HASH_PARALLEL;
+            snprintf(sidecar,sizeof(sidecar),"%s.%s-%lld",path,q41_cache_suffix(gate->panel_version),
+                     (long long)gate->tensor->off);
+            int fd = open(sidecar,O_RDWR);
+            uint8_t byte;
+            if (fd < 0) exact = 0;
+            else {
+                if (pread(fd,&byte,1,sizeof(Q41CacheHeader)) != 1) exact = 0;
+                else {
+                    byte ^= 0x01;
+                    exact &= pwrite(fd,&byte,1,sizeof(Q41CacheHeader)) == 1;
+                }
+                close(fd);
+            }
+        }
+#endif
+        out = step(&stream,ids+5,1,5);
+        exact &= memcmp(out,b,V*sizeof(float)) == 0;
+        free(out);
+        if (partial) exact &= stream.L[1].down.q4 == resident_down;
+        for (int l = stream.base.n_resident; l < L; l++)
+            for (int j = 0; j < 3; j++) {
+                const Mat *w = stream.q41_layers[l].ffn[j].mat;
+                exact &= w->fmt == WF_Q4_1 && w->q4 && !w->f && !w->q;
+            }
+#ifdef __APPLE__
+        if (i == 1 || i == 2) exact &= stream.q41_queue != NULL;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        if (attention_panels)
+            exact &= !!stream.q41_attention_raw == !panel_only && stream.L[0].q.gs == Q41_PACKED_GS &&
+                     stream.L[0].o.gs == Q41_PACKED_GS;
+        if (slot_order) exact &= stream.q41_queue && stream.q41_queue->staged == 3u;
+        if (panels) {
+            const QwenQ41Input *in = stream.q41_layers[0].ffn;
+            exact &= !in[0].panel_bytes && !in[1].panel_bytes && in[2].panel_verified;
+        }
+        if (panels || attention_panels || partial_panels || slot_order) {
+            /* The following batch uses its selected layout after staging decode. */
+            out = step(&stream,ids,5,0);
+            exact &= memcmp(out,a,V*sizeof(float)) == 0;
+            free(out);
+            for (int t = 0; t < stream.S.n; t++) {
+                const int version = panels ? Q41_CACHE_HASH_PARALLEL : Q41_CACHE_HASH_LEGACY;
+                snprintf(sidecar,sizeof(sidecar),"%s.%s-%lld",path,q41_cache_suffix(version),
+                         (long long)stream.S.t[t].off);
+                remove(sidecar);
+            }
+        }
+#endif
+        qwen_q41_stream_close(&stream);
+        exact &= stream.q41_queue == NULL;
+#endif
+        st_close_fds(&stream.S);
+    }
+    if (saved_prefix) {
+        setenv("MOTY_Q41_RESIDENT_PREFIX",saved_prefix,1);
+        free(saved_prefix);
+    } else unsetenv("MOTY_Q41_RESIDENT_PREFIX");
+    if (saved_order) {
+        setenv("MOTY_Q41_RESIDENT_DOWN",saved_order,1);
+        free(saved_order);
+    } else unsetenv("MOTY_Q41_RESIDENT_DOWN");
+#ifdef __APPLE__
+    if (saved_window_depth) {
+        setenv("MOTY_Q41_WINDOWS",saved_window_depth,1);
+        free(saved_window_depth);
+    } else unsetenv("MOTY_Q41_WINDOWS");
+#endif
+#if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
+    if (saved_packed) {
+        setenv("MOTY_Q41_PACKED",saved_packed,1);
+        free(saved_packed);
+    } else unsetenv("MOTY_Q41_PACKED");
+    if (saved_checksum) {
+        setenv("MOTY_Q41_CACHE_HASH",saved_checksum,1);
+        free(saved_checksum);
+    } else unsetenv("MOTY_Q41_CACHE_HASH");
+    if (saved_ahead) {
+        setenv("MOTY_Q41_READ_AHEAD",saved_ahead,1);
+        free(saved_ahead);
+    } else unsetenv("MOTY_Q41_READ_AHEAD");
+    if (saved_batch_panels) {
+        setenv("MOTY_Q41_STREAM_PREFILL",saved_batch_panels,1);
+        free(saved_batch_panels);
+    } else unsetenv("MOTY_Q41_STREAM_PREFILL");
+    if (saved_attn_layout) {
+        setenv("MOTY_Q41_PREFILL_ATTN",saved_attn_layout,1);
+        free(saved_attn_layout);
+    } else unsetenv("MOTY_Q41_PREFILL_ATTN");
+    if (saved_split_down) {
+        setenv("MOTY_Q41_SPLIT_DOWN",saved_split_down,1);
+        free(saved_split_down);
+    } else unsetenv("MOTY_Q41_SPLIT_DOWN");
+    if (saved_file_windows) {
+        setenv("MOTY_Q41_FILE_WINDOWS",saved_file_windows,1);
+        free(saved_file_windows);
+    } else unsetenv("MOTY_Q41_FILE_WINDOWS");
+#endif
+    st_close_fds(&full.S);
+    g_gguf = saved_gguf;
+    g_gguf_meta = saved_meta;
+    g_st_dequant_fn = NULL;
+    moty_track_set(prev);
+    moty_track_free_all(&memory);
+    remove(path);
+    CHECK(exact);
+    return 0;
+}
+
+int qt_q41_ffn(void) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    enum { I = 128, O = 20, S = 37, N = O*I/Q4_1_ELEMS };
+    uint8_t gate[N*Q4_1_BYTES], up[N*Q4_1_BYTES];
+    float x[S*I], ref[S*O], buf[S*O], out[S*O], expected[S*O], down[S*O];
+    uint16_t params[2] = {0x3000, 0xbc00};
+    qt_rng_s = 212;
+    qt_fill(x,S*I,0.5f);
+    for (int b = 0; b < N; b++) {
+        int pos = b*Q4_1_BYTES;
+        memcpy(gate+pos,params,sizeof(params));
+        memcpy(up+pos,params,sizeof(params));
+        for (int k = 4; k < Q4_1_BYTES; k++) {
+            gate[pos+k] = (uint8_t)(19*b+11*k);
+            up[pos+k] = (uint8_t)(13*b+7*k);
+        }
+    }
+    CHECK(q41_same_params_per_pair(gate,I,sizeof(gate)));
+    gate[Q4_1_BYTES] ^= 1;
+    CHECK(!q41_same_params_per_pair(gate,I,sizeof(gate)));
+    gate[Q4_1_BYTES] ^= 1;
+    setenv("MOTY_Q41_FFN","0",1);
+    CHECK(!moty_q41_gate_up(out,x,gate,up,S,I,O,0));
+    setenv("MOTY_Q41_FFN","1",1);
+    for (int mode = 0; mode < 2; mode++) {
+        setenv("Q41_ACT",mode ? "f16" : "f32",1);
+        setenv("MOTY_Q41_ROWS","0",1);
+        moty_matmul_q4_1_native(ref,x,gate,S,I,O);
+        moty_matmul_q4_1_native(buf,x,up,S,I,O);
+        moty_hw_silu_mul(ref,buf,S*O);
+        for (int t = 0; t < S; t++) {
+            setenv("MOTY_Q41_ROWS","0",1);
+            moty_matmul_q4_1_native(buf,x+t*I,gate,1,I,O);
+            setenv("MOTY_Q41_ROWS","1",1);
+            moty_matmul_q4_1_native(out,x+t*I,gate,1,I,O);
+            CHECK(!memcmp(out,buf,O*sizeof(float)));
+            CHECK(moty_q41_gate_up(out,x+t*I,gate,up,1,I,O,0));
+            for (int r = 0; r < O; r++) CHECK(fabsf(out[r]-ref[t*O+r]) < 2e-5f);
+            CHECK(moty_q41_gate_up(out,x+t*I,gate,up,1,I,O,1));
+            for (int r = 0; r < O; r++) CHECK(fabsf(out[r]-ref[t*O+r]) < 2e-5f);
+        }
+        CHECK(moty_q41_gate_up(out,x,gate,up,S,I,O,0));
+        for (int i = 0; i < S*O; i++) CHECK(fabsf(out[i]-ref[i]) < 2e-5f);
+        moty_q41_matmul(down,x,gate,S,I,O,0);
+        const char *tiles[] = {"2", "4", "8"};
+        for (int j = 0; j < 3; j++) {
+            setenv("MOTY_Q41_TILE",tiles[j],1);
+            CHECK(moty_q41_gate_up(expected,x,gate,up,S,I,O,0));
+            CHECK(!memcmp(expected,out,sizeof(out)));
+            moty_q41_matmul(buf,x,gate,S,I,O,0);
+            CHECK(!memcmp(buf,down,sizeof(down)));
+        }
+        unsetenv("MOTY_Q41_TILE");
+
+        for (int j = 0; j < 2; j++) {
+            setenv("MOTY_Q41_PP_TILE",j ? "32" : "16",1);
+            setenv("MOTY_Q41_PP_XPACK",j ? "0" : "1",1);
+            CHECK(moty_q41_gate_up(expected,x,gate,up,S,I,O,0));
+            CHECK(!memcmp(expected,out,sizeof(out)));
+            moty_q41_matmul(buf,x,gate,S,I,O,0);
+            CHECK(!memcmp(buf,down,sizeof(down)));
+        }
+        unsetenv("MOTY_Q41_PP_TILE");
+        unsetenv("MOTY_Q41_PP_XPACK");
+
+        for (int j = 0; j < 2; j++) {
+            const char *tile = j ? "6" : "4";
+            setenv("MOTY_Q41_COMPACT_PP",tile,1);
+            setenv("MOTY_Q41_COMPACT_DOWN",tile,1);
+            CHECK(moty_q41_gate_up(expected,x,gate,up,S,I,O,0));
+            CHECK(!memcmp(expected,out,sizeof(out)));
+            moty_q41_matmul(buf,x,gate,S,I,O,0);
+            CHECK(!memcmp(buf,down,sizeof(down)));
+            CHECK(moty_q41_gate_up(expected,x,gate,up,S-2,I,O,0));
+            CHECK(!memcmp(expected,out,(S-2)*O*sizeof(float)));
+            moty_q41_matmul(buf,x,gate,S-2,I,O,0);
+            CHECK(!memcmp(buf,down,(S-2)*O*sizeof(float)));
+        }
+        unsetenv("MOTY_Q41_COMPACT_PP");
+        unsetenv("MOTY_Q41_COMPACT_DOWN");
+
+        moty_q41_matmul(buf,x,gate,1,I,O-1,1);
+        setenv("MOTY_Q41_DOWN_ALIGN","1",1);
+        moty_q41_matmul(down+1,x,gate,1,I,O-1,1);
+        CHECK(!memcmp(buf,down+1,(O-1)*sizeof(float)));
+        unsetenv("MOTY_Q41_DOWN_ALIGN");
+
+        setenv("MOTY_Q41_FFN_DECODE_ROWS","4",1);
+        CHECK(moty_q41_gate_up(expected,x,gate,up,1,I,O,1));
+        for (int j = 0; j < 2; j++) {
+            setenv("MOTY_Q41_FFN_DECODE_ROWS",j ? "2" : "1",1);
+            setenv("MOTY_Q41_GATE_DECODE","1",1);
+            CHECK(moty_q41_gate_up(out,x,gate,up,1,I,O,1));
+            CHECK(!memcmp(expected,out,O*sizeof(float)));
+            unsetenv("MOTY_Q41_GATE_DECODE");
+        }
+        unsetenv("MOTY_Q41_FFN_DECODE_ROWS");
+    }
+    unsetenv("Q41_ACT");
+    unsetenv("MOTY_Q41_ROWS");
+    unsetenv("MOTY_Q41_FFN");
+    return 0;
+#else
+    return 2;
+#endif
+}
+
+int qt_q41_panel_cache(void) {
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(_WIN32)
+    enum { I = 128, O = 8, S = 33, BLOCKS = I/Q4_1_ELEMS };
+    uint8_t raw[O*BLOCKS*Q4_1_BYTES], block[Q4_1_BYTES];
+    float x[S*I], expected[S*O], actual[S*O];
+    const char *checksum = getenv("MOTY_Q41_CACHE_HASH");
+    char *saved_checksum = checksum ? strdup(checksum) : NULL;
+    unsetenv("MOTY_Q41_CACHE_HASH");
+    char path[] = "/tmp/moty-q41-test-XXXXXX", cache[128];
+    int wfd = mkstemp(path);
+    CHECK(wfd >= 0);
+    for (int b = 0; b < O*BLOCKS; b++) {
+        uint16_t params[] = {0x3000+(b/2)%10, 0xbc00};
+        memcpy(raw+b*Q4_1_BYTES,params,4);
+        for (int d = 4; d < Q4_1_BYTES; d++) raw[b*Q4_1_BYTES+d] = (uint8_t)(31*b+13*d);
+    }
+    CHECK(write(wfd,raw,sizeof(raw)) == sizeof(raw));
+    CHECK(close(wfd) == 0);
+    shards sh = {0};
+    st_tensor tensor = { .fd = st_open_fd(&sh,path), .off = 0, .nbytes = sizeof(raw) };
+    CHECK(!st_q41_cache(&sh,&tensor,I,O-1));
+    const uint8_t *panel = st_q41_cache(&sh,&tensor,I,O);
+    CHECK(panel);
+    const uint8_t *indexed = st_q41_cache_map(&sh,&tensor,I,O,1);
+    CHECK(indexed);
+    const uint32_t *table = q41_indexed_table(indexed,I,O);
+    uint8_t up[sizeof(raw)], up_panel[O/Q41_PANEL_ROWS*(I/Q41_PANEL_GROUP)*Q41_PANEL_BYTES];
+    memcpy(up,raw,sizeof(up));
+    memcpy(up_panel,panel,sizeof(up_panel));
+    for (int r = 0; r < O; r += Q41_PANEL_ROWS) {
+        for (int b = 0; b < BLOCKS; b += 2) {
+            uint8_t *row = up+(r*BLOCKS+b)*Q4_1_BYTES;
+            uint8_t *group = up_panel+((r/Q41_PANEL_ROWS)*(BLOCKS/2)+b/2)*Q41_PANEL_BYTES;
+            const uint16_t minimum = 0xb800;
+            memcpy(row+2,&minimum,2);
+            memcpy(row+Q4_1_BYTES+2,&minimum,2);
+            memcpy(group+2,&minimum,2);
+            row[4] ^= 0xff;
+            group[4*Q41_PANEL_ROWS] ^= 0xff;
+        }
+    }
+    for (int r = 0; r < O; r++)
+        for (int b = 0; b < BLOCKS; b++) {
+            const uint8_t *group = panel+((r/4)*(BLOCKS/2)+b/2)*Q41_PANEL_BYTES;
+            q41_panel_row_block(group,r%4,b%2,block);
+            CHECK(!memcmp(block,raw+(r*BLOCKS+b)*Q4_1_BYTES,Q4_1_BYTES));
+            group = indexed+((r/4)*(BLOCKS/2)+b/2)*Q41_INDEXED_BYTES;
+            q41_indexed_row_block(group,table,r%4,b%2,block);
+            CHECK(!memcmp(block,raw+(r*BLOCKS+b)*Q4_1_BYTES,Q4_1_BYTES));
+        }
+    qt_rng_s = 251;
+    qt_fill(x,S*I,1.f);
+    const int batches[] = {1,17,S};
+    for (int mode = 0; mode < 2; mode++) {
+        setenv("Q41_ACT",mode ? "f16" : "f32",1);
+        for (int i = 0; i < (int)(sizeof(batches)/sizeof(batches[0])); i++) {
+            int n = batches[i];
+            moty_q41_matmul(expected,x,raw,n,I,O,1);
+            moty_q41_panels(actual,x,panel,NULL,n,I,O);
+            CHECK(!memcmp(actual,expected,n*O*sizeof(float)));
+            moty_q41_indexed_head(actual,x,indexed,n,I,O);
+            CHECK(!memcmp(actual,expected,n*O*sizeof(float)));
+            setenv("MOTY_Q41_PANEL_PREFILL","1",1);
+            moty_q41_panels(actual,x,panel,NULL,n,I,O);
+            CHECK(!memcmp(actual,expected,n*O*sizeof(float)));
+            moty_q41_indexed_head(actual,x,indexed,n,I,O);
+            CHECK(!memcmp(actual,expected,n*O*sizeof(float)));
+            moty_q41_matmul(actual,x,up,n,I,O,1);
+            moty_hw_silu_mul(expected,actual,n*O);
+            moty_q41_panels(actual,x,panel,up_panel,n,I,O);
+            CHECK(!memcmp(actual,expected,n*O*sizeof(float)));
+            setenv("MOTY_Q41_PP_TILE","16",1);
+            setenv("MOTY_Q41_PP_XPACK","1",1);
+            setenv("MOTY_Q41_PANEL_DUAL","1",1);
+            moty_q41_panels(actual,x,panel,up_panel,n,I,O);
+            CHECK(!memcmp(actual,expected,n*O*sizeof(float)));
+            unsetenv("MOTY_Q41_PP_TILE");
+            unsetenv("MOTY_Q41_PP_XPACK");
+            unsetenv("MOTY_Q41_PANEL_DUAL");
+            unsetenv("MOTY_Q41_PANEL_PREFILL");
+        }
+    }
+    unsetenv("Q41_ACT");
+    setenv("MOTY_Q41_CACHE_HASH","parallel",1);
+    const uint8_t *parallel = st_q41_cache(&sh,&tensor,I,O);
+    CHECK(parallel && !memcmp(panel,parallel,sizeof(up_panel)));
+    Q41CacheDigest digest = {0};
+    q41_cache_digest_update(&digest,parallel,8);
+    q41_cache_digest_update(&digest,parallel+8,Q41_PANEL_BYTES);
+    q41_cache_digest_update(&digest,parallel+8+Q41_PANEL_BYTES,sizeof(up_panel)-8-Q41_PANEL_BYTES);
+    CHECK(q41_cache_digest_finish(&digest) ==
+          q41_cache_hash_payload(Q41_CACHE_HASH_PARALLEL,parallel,sizeof(up_panel)));
+    Q41CacheHeader before, after;
+    int old_fd = st_q41_cache_open(&sh,&tensor,I,O,&before);
+    CHECK(old_fd >= 0);
+    struct timespec timestamps[] = {{100,0},{100,0}};
+    CHECK(utimensat(AT_FDCWD,path,timestamps,0) == 0);
+    int new_fd = st_q41_cache_open(&sh,&tensor,I,O,&after);
+    CHECK(new_fd >= 0 && before.mtime != after.mtime);
+    struct stat old_info, new_info;
+    CHECK(!fstat(old_fd,&old_info) && !fstat(new_fd,&new_info));
+    CHECK(old_info.st_ino != new_info.st_ino);
+    CHECK(!close(old_fd) && !close(new_fd));
+    const uint8_t *rebuilt = st_q41_cache(&sh,&tensor,I,O);
+    CHECK(rebuilt && !memcmp(parallel,rebuilt,sizeof(up_panel)));
+    st_close_fds(&sh);
+    for (int version = Q41_CACHE_HASH_LEGACY; version <= Q41_CACHE_INDEXED; version++) {
+        if (version == Q41_CACHE_HASH_PARALLEL) setenv("MOTY_Q41_CACHE_HASH","parallel",1);
+        else unsetenv("MOTY_Q41_CACHE_HASH");
+        int is_indexed = version == Q41_CACHE_INDEXED;
+        tensor.fd = st_open_fd(&sh,path);
+        CHECK(st_q41_cache_map(&sh,&tensor,I,O,is_indexed));
+        st_close_fds(&sh);
+        snprintf(cache,sizeof(cache),"%s.%s-0",path,q41_cache_suffix(version));
+        wfd = open(cache,O_RDWR);
+        CHECK(wfd >= 0);
+        uint8_t bad;
+        off_t offset = sizeof(Q41CacheHeader);
+        if (version == Q41_CACHE_INDEXED) offset += q41_indexed_groups_bytes(I,O);
+        CHECK(pread(wfd,&bad,1,offset) == 1);
+        bad ^= 1;
+        CHECK(pwrite(wfd,&bad,1,offset) == 1);
+        CHECK(close(wfd) == 0);
+        tensor.fd = st_open_fd(&sh,path);
+        const uint8_t *repaired = st_q41_cache_map(&sh,&tensor,I,O,is_indexed);
+        CHECK(repaired);
+        if (is_indexed)
+            q41_indexed_row_block(repaired,q41_indexed_table(repaired,I,O),0,0,block);
+        else q41_panel_row_block(repaired,0,0,block);
+        CHECK(!memcmp(block,raw,Q4_1_BYTES));
+        st_close_fds(&sh);
+        unlink(cache);
+    }
+    if (saved_checksum) {
+        setenv("MOTY_Q41_CACHE_HASH",saved_checksum,1);
+        free(saved_checksum);
+    } else unsetenv("MOTY_Q41_CACHE_HASH");
+    unlink(path);
+    return 0;
+#else
+    return 2;
+#endif
+}
+
+int qt_q41_qkv(void) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    enum { I = 64, MAX_O = 13, S = 33, BLOCKS = I/Q4_1_ELEMS };
+    const int widths[] = {MAX_O, 5, 7};
+    uint16_t params[] = {0x3000, 0xbc00};
+    uint8_t raw[3][MAX_O*BLOCKS*Q4_1_BYTES];
+    float x[S*I], actual[3][S*MAX_O], ref[S*MAX_O];
+    float *const out[] = {actual[0], actual[1], actual[2]};
+    Mat w[3] = {0};
+    const Mat *const proj[] = {w, w+1, w+2};
+    qt_rng_s = 213;
+    qt_fill(x,S*I,0.5f);
+    for (int i = 0; i < 3; i++) {
+        w[i] = (Mat){ .q4 = raw[i], .fmt = WF_Q4_1, .I = I, .O = widths[i], .gs = i == 1 ? 32 : 64 };
+        for (int b = 0; b < widths[i]*BLOCKS; b++) {
+            uint8_t *block = raw[i]+b*Q4_1_BYTES;
+            memcpy(block,params,sizeof(params));
+            if (i == 1 && b%2) block[1] = 0x34;
+            for (int j = 4; j < Q4_1_BYTES; j++) block[j] = (uint8_t)(17*i+19*b+11*j);
+        }
+    }
+    setenv("MOTY_Q41_QKV","0",1);
+    CHECK(!moty_q41_qkv(out,x,proj,S));
+    setenv("MOTY_Q41_QKV","1",1);
+    w[2].q4 = NULL;
+    CHECK(!moty_q41_qkv(out,x,proj,S));
+    w[2].q4 = raw[2];
+    uint8_t packed[3*Q41_PANEL_BYTES];
+    for (int p = 0; p < 3; p++) for (int r = 0; r < 4; r++) {
+        const uint8_t *src = raw[0]+(p*4+r)*BLOCKS*Q4_1_BYTES;
+        uint8_t *group = packed+p*Q41_PANEL_BYTES;
+        memcpy(group+4*r,src,4);
+        memcpy(group+16+16*r,src+4,16);
+        memcpy(group+80+16*r,src+Q4_1_BYTES+4,16);
+    }
+    const char *short_prefill = getenv("MOTY_Q41_SHORT_PREFILL");
+    char *saved_short_prefill = short_prefill ? strdup(short_prefill) : NULL;
+    const int batches[] = {1, 7, 8, 9, 16, 17, 31, 32, S};
+    for (int mode = 0; mode < 2; mode++) {
+        setenv("Q41_ACT",mode ? "f16" : "f32",1);
+        setenv("MOTY_Q41_ROWS",mode ? "0" : "1",1);
+        for (size_t j = 0; j < sizeof(batches)/sizeof(*batches); j++) {
+            int n = batches[j];
+            unsetenv("MOTY_Q41_SHORT_PREFILL");
+            CHECK(moty_q41_qkv(out,x,proj,n));
+            for (int i = 0; i < 3; i++) {
+                moty_q41_matmul(ref,x,raw[i],n,I,widths[i],w[i].gs == 64);
+                CHECK(!memcmp(ref,out[i],n*widths[i]*sizeof(float)));
+            }
+            w[0].O = 12; w[0].q4 = packed; w[0].gs = Q41_PACKED_GS;
+            for (int short_path = 0; short_path <= 1; short_path++) {
+                if (short_path) setenv("MOTY_Q41_SHORT_PREFILL","1",1);
+                CHECK(moty_q41_qkv(out,x,proj,n));
+                for (int i = 0; i < 3; i++) {
+                    moty_q41_matmul(ref,x,raw[i],n,I,w[i].O,i != 1);
+                    CHECK(!memcmp(ref,out[i],n*w[i].O*sizeof(float)));
+                }
+            }
+            w[0].O = widths[0]; w[0].q4 = raw[0]; w[0].gs = 64;
+        }
+    }
+    unsetenv("Q41_ACT");
+    unsetenv("MOTY_Q41_ROWS");
+    unsetenv("MOTY_Q41_QKV");
+    if (saved_short_prefill) {
+        setenv("MOTY_Q41_SHORT_PREFILL",saved_short_prefill,1);
+        free(saved_short_prefill);
+    } else unsetenv("MOTY_Q41_SHORT_PREFILL");
+    return 0;
+#else
+    return 2;
+#endif
+}
+
+int qt_gqa_decode_tail(void) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    enum { KV = 2, H = KV*7, D = 64, STRIDE = 2180 };
+    float q[H*D], out[H*D], paired[H*D], ref[D], scores[STRIDE];
+    float *k = falloc(KV*STRIDE*D), *v = falloc(KV*STRIDE*D);
+    float *k4 = falloc(KV*STRIDE*D);
+    Scratch scr = {0};
+    qt_rng_s = 210;
+    qt_fill(q,H*D,2.f);
+    setenv("MOTY_Q41_GQA","1",1);
+    setenv("MOTY_Q41_GQA_V3","1",1);
+    setenv("MOTY_Q41_GQA_FOUR","1",1);
+    CHECK(!moty_attn_gqa64(out,q,k,v,KV,STRIDE,2047,0.125f,&scr));
+    setenv("MOTY_Q41_GQA_FOUR","0",1);
+    const int visible[] = {2048,2049,2177,2179};
+    for (int j = 0; j < (int)(sizeof(visible)/sizeof(visible[0])); j++) {
+        int n = visible[j];
+        qt_fill(k,KV*STRIDE*D,2.f);
+        qt_fill(v,KV*STRIDE*D,1.f);
+        for (int g = 0; g < KV; g++)
+            for (int i = n*D; i < STRIDE*D; i++) k[g*STRIDE*D+i] = v[g*STRIDE*D+i] = NAN;
+        for (int g = 0; g < KV; g++)
+            for (int t = 0; t < STRIDE; t++)
+                for (int d = 0; d < D; d++)
+                    k4[(g*STRIDE+(t&~3))*D+4*d+t%4] = k[(g*STRIDE+t)*D+d];
+        setenv("MOTY_Q41_GQA_PAIR","0",1);
+        setenv("MOTY_Q41_GQA_V3","0",1);
+        CHECK(moty_attn_gqa64(out,q,k,v,KV,STRIDE,n,0.125f,&scr));
+        setenv("MOTY_Q41_GQA_V3","1",1);
+        CHECK(moty_attn_gqa64(paired,q,k,v,KV,STRIDE,n,0.125f,&scr));
+        CHECK(!memcmp(paired,out,sizeof(out)));
+
+        setenv("MOTY_Q41_GQA_BLOCK_FIRST","1",1);
+        setenv("MOTY_Q41_GQA_MERGE","1",1);
+        setenv("MOTY_Q41_GQA_TEAM","1",1);
+        for (int variant = 0; variant < 2; variant++) {
+            setenv("MOTY_Q41_GQA_SCORE",variant ? "32" : "24",1);
+            CHECK(moty_attn_gqa64(paired,q,k,v,KV,STRIDE,n,0.125f,&scr));
+            CHECK(!memcmp(paired,out,sizeof(out)));
+        }
+        unsetenv("MOTY_Q41_GQA_SCORE");
+        unsetenv("MOTY_Q41_GQA_TEAM");
+        unsetenv("MOTY_Q41_GQA_MERGE");
+        unsetenv("MOTY_Q41_GQA_BLOCK_FIRST");
+        CHECK(moty_attn_gqa64_layout(paired,q,k4,v,KV,STRIDE,n,0.125f,&scr,1));
+        CHECK(!memcmp(paired,out,sizeof(out)));
+        unsetenv("MOTY_Q41_GQA_V3");
+        setenv("MOTY_Q41_GQA_PAIR","1",1);
+        CHECK(moty_attn_gqa64(paired,q,k,v,KV,STRIDE,n,0.125f,&scr));
+        CHECK(!memcmp(paired,out,sizeof(out)));
+        setenv("MOTY_Q41_GQA_FOUR","1",1);
+        CHECK(moty_attn_gqa64(paired,q,k,v,KV,STRIDE,n,0.125f,&scr));
+        CHECK(!memcmp(paired,out,sizeof(out)));
+        setenv("MOTY_Q41_GQA_PAIR","0",1);
+        CHECK(moty_attn_gqa64(paired,q,k,v,KV,STRIDE,n,0.125f,&scr));
+        CHECK(!memcmp(paired,out,sizeof(out)));
+        setenv("MOTY_Q41_GQA_FOUR","0",1);
+        for (int h = 0; h < H; h++) {
+            int kvbase = (h/7)*STRIDE;
+            att_scores_f32(scores,q+h*D,k,kvbase,0,n-1,D,0.125f);
+            softmax_row(scores,n);
+            att_accum_f32(ref,scores,v,kvbase,0,n-1,D);
+            for (int d = 0; d < D; d++) CHECK(fabsf(out[h*D+d]-ref[d]) < 2e-6f);
+        }
+    }
+#ifdef MOTY_THREADPOOL
+    if (moty_par_procs() >= 12) {
+        /* One KV head leaves five workers idle during softmax and merge. */
+        int saved_threads = moty_par_threads();
+        moty_par_set_threads(12);
+        setenv("MOTY_Q41_GQA_TEAM","0",1);
+        CHECK(moty_attn_gqa64(out,q,k,v,1,STRIDE,2179,0.125f,&scr));
+        setenv("MOTY_Q41_GQA_TEAM","1",1);
+        CHECK(moty_attn_gqa64(paired,q,k,v,1,STRIDE,2179,0.125f,&scr));
+        CHECK(!memcmp(paired,out,7*D*sizeof(float)));
+        unsetenv("MOTY_Q41_GQA_TEAM");
+        moty_par_set_threads(saved_threads);
+    }
+#endif
+    unsetenv("MOTY_Q41_GQA");
+    unsetenv("MOTY_Q41_GQA_PAIR");
+    unsetenv("MOTY_Q41_GQA_FOUR");
+    scr_free(&scr);
+    for (int n = 1; n <= 9; n++) {
+        float a[10], b[10], ref_a[10], ref_b[10];
+        moty_hw_attn_scores(ref_a,q,k,n,D,0.125f);
+        moty_hw_attn_scores(ref_b,q+D,k,n+1,D,0.125f);
+        moty_att_scores_kv4_pair(a,b,q,q+D,k4,n,0.125f);
+        CHECK(!memcmp(a,ref_a,n*sizeof(float)));
+        CHECK(!memcmp(b,ref_b,(n+1)*sizeof(float)));
+    }
+    free(k4); free(v); free(k);
+    return 0;
+#else
+    return 2;
+#endif
+}
+
+int qt_q41_causal_prefill_group(void) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    enum { D = 64, N = 23 };
+    float q[4][D], k[(N+3)*D], v[(N+3)*D], out[4][D], expected[D];
+    float scores[4][N+3], ref[N+3], *rows[] = {scores[0],scores[1],scores[2],scores[3]};
+    qt_rng_s = 308;
+    qt_fill(q[0],4*D,1.f); qt_fill(k,(N+3)*D,2.f); qt_fill(v,(N+3)*D,1.f);
+    for (int n = 1; n <= N; n++)
+        for (int count = 2; count <= 4; count += 2) {
+            moty_attn_prefill_group(out[0],D,q[0],rows,k,v,n,count,0.125f);
+            for (int j = 0; j < count; j++) {
+                moty_hw_attn_scores(ref,q[j],k,n+j,D,0.125f);
+                softmax_row(ref,n+j);
+                CHECK(!memcmp(ref,scores[j],(n+j)*sizeof(float)));
+                moty_hw_attn_accum(expected,ref,v,n+j,D);
+                CHECK(!memcmp(expected,out[j],sizeof(expected)));
+            }
+        }
+    return 0;
+#else
+    return 2;
+#endif
+}
+
+int qt_gqa_batch_exact(void) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    enum { H = 14, D = 64, KV = 2, STRIDE = 2056, N = 5 };
+    float q[N*H*D], expected[N*H*D], actual[N*H*D];
+    float *k = falloc(KV*STRIDE*D), *v = falloc(KV*STRIDE*D);
+    Scratch scratch = {0};
+    qt_rng_s = 54;
+    qt_fill(q,N*H*D,1.f); qt_fill(k,KV*STRIDE*D,1.f); qt_fill(v,KV*STRIDE*D,1.f);
+    setenv("MOTY_Q41_GQA","1",1);
+    setenv("MOTY_Q41_GQA_PAIR","0",1);
+    for (int tri = 0; tri < 2; tri++) {
+        setenv("MOTY_Q41_GQA_V3",tri ? "1" : "0",1);
+        CHECK(!moty_attn_gqa64_decode_batch(actual,q,k,v,KV,STRIDE,2047,N,0.125f,&scratch));
+        for (int j = 0; j < N; j++)
+            CHECK(moty_attn_gqa64(expected+j*H*D,q+j*H*D,k,v,KV,STRIDE,2048+j,0.125f,&scratch));
+        const char *tiles[] = {"0", "24", "32"};
+        setenv("MOTY_Q41_GQA_BLOCK_FIRST","1",1);
+        setenv("MOTY_Q41_GQA_MERGE","1",1);
+        for (int j = 0; j < 3; j++) {
+            setenv("MOTY_Q41_GQA_SCORE",tiles[j],1);
+            CHECK(moty_attn_gqa64_decode_batch(actual,q,k,v,KV,STRIDE,2048,N,0.125f,&scratch));
+            CHECK(!memcmp(actual,expected,sizeof(actual)));
+        }
+        unsetenv("MOTY_Q41_GQA_SCORE");
+        unsetenv("MOTY_Q41_GQA_BLOCK_FIRST");
+        unsetenv("MOTY_Q41_GQA_MERGE");
+    }
+    unsetenv("MOTY_Q41_GQA");
+    unsetenv("MOTY_Q41_GQA_PAIR");
+    unsetenv("MOTY_Q41_GQA_V3");
+    scr_free(&scratch); free(k); free(v);
+    return 0;
+#else
+    return 2;
+#endif
+}
+
+int qt_q41_history_draft(void) {
+    int hist[] = {7,8,9,10,11,12,13,14,15,7,8,9,10};
+    int draft[4];
+    CHECK(draft_from_history(hist,13,draft,4,0) == 4);
+    CHECK(!memcmp(draft,hist+4,4*sizeof(int)));
+    CHECK(draft_from_history(hist,13,draft,2,0) == 2);
+    CHECK(draft_from_history(hist,4,draft,4,0) == 0);
+    CHECK(draft_from_history(hist,13,draft,4,1) == 0);
+    int repeated[] = {7,8,9,10,11,12,1,7,8,9,10,11,12,2,7,8,9,10};
+    CHECK(draft_from_history(repeated,18,draft,4,1) == 2);
+    CHECK(draft[0] == 11 && draft[1] == 12);
+    CHECK(draft_from_history_votes(repeated,18,draft,4) == 2);
+    CHECK(draft[0] == 11 && draft[1] == 12);
+    const int split_votes[] = {1,2,3,9,1,2,4,9,1,2};
+    CHECK(draft_from_history_votes(split_votes,10,draft,4) == 0);
+    int distant[2048] = {7,8,9,10,11,55,56};
+    memcpy(distant+2043,distant,5*sizeof(int));
+    CHECK(draft_from_history(distant,2048,draft,2,1) == 0);
+    CHECK(draft_from_history_votes(distant,2048,draft,2) == 2);
+    CHECK(draft[0] == 55 && draft[1] == 56);
+    return 0;
+}
+
+#ifdef QWEN_Q41_TEST_MAIN
+int main(void) {
+#ifdef MOTY_Q41_REQUIRE_FMLAL
+    CHECK(moty_q41_uses_fp16());
+#endif
+    moty_par_set_threads(4);
+    return qt_gguf_q4_1_native() || qt_q41_stream_budget() || qt_q41_ffn() || qt_q41_panel_cache() || qt_q41_qkv() || qt_gqa_decode_tail() || qt_q41_causal_prefill_group() || qt_gqa_batch_exact() || qt_q41_history_draft() || qt_prefill_workspace();
+}
+#endif
 
 /* ---- KV_BITS=8: KV-cache int8 ---- */
 int qt_kv_i8_roundtrip(void) {
@@ -1624,9 +2603,8 @@ int qt_llama_fused_bitexact(void) {
     return 0;
 }
 
-/* ChatML turn: the pre-closed think block only for a vocabulary with <think>
- * (Qwen3, MiniCPM5 = HF enable_thinking=False); a Llama/SmolLM2 decoder
- * without it gets the bare turn, as its HF template (VisionPsy: 78 ids) */
+/* ChatML uses the bare turn when the template omits <think> (MNN-Pocket)
+ * or the vocabulary lacks it (VisionPsy). */
 int qt_turn_think(void) {
     Special sp[2] = { { "<|im_start|>", 12, 1 }, { "<think>", 7, 8 } };
     Tok T; memset(&T, 0, sizeof T);
@@ -1639,5 +2617,13 @@ int qt_turn_think(void) {
     n = build_turn(&T, buf, sizeof buf, "Hi");
     char want[256]; snprintf(want, sizeof want, "%s<think>\n\n</think>\n\n", bare);
     if (n != (int)strlen(want) || strcmp(buf, want)) { fprintf(stderr, "with <think>: '%s'\n", buf); return 1; }
+    const char *tmpl = "{{ '<|im_start|>assistant\\n' }}";
+    tok_set_chat_template(&T, tmpl, (int64_t)strlen(tmpl));
+    n = build_turn(&T, buf, sizeof buf, "Hi");
+    CHECK(n == (int)strlen(bare) && !strcmp(buf, bare));
+    tmpl = "{{ '<|im_start|>assistant\\n<think>' }}";
+    tok_set_chat_template(&T, tmpl, (int64_t)strlen(tmpl));
+    n = build_turn(&T, buf, sizeof buf, "Hi");
+    CHECK(n == (int)strlen(want) && !strcmp(buf, want));
     return 0;
 }

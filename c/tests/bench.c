@@ -185,9 +185,9 @@ int main(int argc, char **argv) {
         bn_fill(m.base.V[0], (int64_t)KV*(T+1)*hd);
         float *x = falloc(D), *out = falloc(D);
         bn_fill(x, D);
-        attention(&m, &l, 0, x, 1, T, out);             /* warm-up */
+        attention(&m, &l, 0, x, 1, T, out, NULL);       /* warm-up */
         double t0 = now_s();
-        for (int it = 0; it < iters; it++) attention(&m, &l, 0, x, 1, T, out);
+        for (int it = 0; it < iters; it++) attention(&m, &l, 0, x, 1, T, out, NULL);
         double t = now_s() - t0;
         double fl = 2.0*2.0*H*hd*(double)T*iters;       /* punteggi + contesto */
         double by = 2.0*KV*(double)T*hd*4*iters;        /* byte K+V letti dalla cache */

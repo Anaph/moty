@@ -50,10 +50,11 @@
  * with or without MOTY_PROF independently. */
 enum { OP_EMBED, OP_NORM, OP_RESID, OP_QKV, OP_QKNORM_ROPE, OP_KV_STORE, OP_ATTN_CORE, OP_O_PROJ,
        OP_CONV_IN, OP_CONV_DW, OP_CONV_OUT, OP_FFN_GATE_UP, OP_FFN_SILU, OP_FFN_DOWN,
-       OP_LM_HEAD, OP_SAMPLE, OP_N };
+       OP_LM_HEAD, OP_SAMPLE, OP_FFN_READ_READY, OP_FFN_READ_DOWN, OP_N };
 extern double moty_prof_op[OP_N];
 #define OP_NAMES { "embed", "rmsnorm", "resid", "qkv_proj", "qknorm+rope", "kv_store", "attn(score+softmax+V)", \
-    "o_proj", "conv_in_proj", "conv_depthwise", "conv_out_proj", "ffn_gate+up", "ffn_silu*up", "ffn_down", "lm_head", "sample" }
+    "o_proj", "conv_in_proj", "conv_depthwise", "conv_out_proj", "ffn_gate+up", "ffn_silu*up", "ffn_down", "lm_head", "sample", \
+    "ffn_read_ready", "ffn_read_down" }
 #ifdef MOTY_PROF
 #define OP_T(v) double v = now_s()
 #define OP_ACC(id, v) (moty_prof_op[id] += now_s() - (v))

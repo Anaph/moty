@@ -49,6 +49,7 @@ typedef struct {
     int        hcap;
     void      *maps[512];   /* read-only mappings of the shard files (st_map), NULL = none yet */
     int64_t    maplen[512];
+    unsigned   q41_cache_writes; /* published panel sidecars during this open */
 } shards;
 #define ST_MAX_SHARDS 512
 
@@ -71,11 +72,13 @@ static int st_dtype_code(const char *s) {
  * la dequantizzazione la installa gguf.h via g_st_dequant_fn (stesso pattern
  * di g_mat_stream_fn: st.h resta ignaro del formato GGUF). */
 #define ST_DTYPE_QBLOCK 4
-enum { ST_Q8_0 = 4, ST_Q4_0 = 5, ST_Q4_K = 6, ST_Q5_K = 7, ST_Q6_K = 8 };
+enum { ST_Q8_0 = 4, ST_Q4_0 = 5, ST_Q4_K = 6, ST_Q5_K = 7, ST_Q6_K = 8, ST_Q4_1 = 9 };
+enum { Q4_1_ELEMS = 32, Q4_1_BYTES = 20 };
 static int st_qblock(int dtype, int *belems, int *bbytes) {
     switch (dtype) {
         case ST_Q8_0: *belems = 32;  *bbytes = 34;  return 1;
         case ST_Q4_0: *belems = 32;  *bbytes = 18;  return 1;
+        case ST_Q4_1: *belems = Q4_1_ELEMS; *bbytes = Q4_1_BYTES; return 1;
         case ST_Q4_K: *belems = 256; *bbytes = 144; return 1;
         case ST_Q5_K: *belems = 256; *bbytes = 176; return 1;
         case ST_Q6_K: *belems = 256; *bbytes = 210; return 1;
@@ -104,7 +107,7 @@ static inline float f16_to_f32(uint16_t h) {
 }
 
 static int st_open_fd(shards *S, const char *path) {
-    for (int i = 0; i < S->nfd; i++) if (!strcmp(S->paths[i], path)) return S->fds[i];
+    for (int i = 0; i < S->nfd; i++) if (S->paths[i] && !strcmp(S->paths[i], path)) return S->fds[i];
     int fd = open(path, COMPAT_O_RDONLY);
     if (fd < 0) { moty_fail_code(MOTY_FAIL_IO, "%s: %s", path, strerror(errno)); }
     S->paths[S->nfd] = strdup(path); S->fds[S->nfd] = fd;
@@ -317,33 +320,41 @@ static int st_dtype(shards *S, const char *name) {
  * `align`-aligned): the caller then reads a copy. The mapping lives until
  * st_close_fds; its pages are file-backed and clean — the kernel can drop
  * and re-read them under memory pressure instead of swapping or killing. */
-static const void *st_map(shards *S, const char *name, int align) {
+static const void *st_map_fd(shards *S, int fd) {
 #ifdef _WIN32
-    (void)S; (void)name; (void)align; return NULL;
+    (void)S; (void)fd;
+    return NULL;
 #else
-    st_tensor *t = st_find(S, name);
-    if (!t || !g_st_map) return NULL;
-    t->used = 1;
+    if (!g_st_map) return NULL;
     int i = 0;
-    while (i < S->nfd && S->fds[i] != t->fd) i++;
+    while (i < S->nfd && S->fds[i] != fd) i++;
     if (i == S->nfd) return NULL;
     if (!S->maps[i]) {
         struct stat sb;
         void *p = MAP_FAILED;
-        if (fstat(t->fd, &sb) == 0 && sb.st_size > 0) {
+        if (fstat(fd, &sb) == 0 && sb.st_size > 0) {
             int fl = MAP_PRIVATE;
 #ifdef MAP_POPULATE
             if (g_st_map == 2) fl |= MAP_POPULATE;
 #endif
-            p = mmap(NULL, (size_t)sb.st_size, PROT_READ, fl, t->fd, 0);
+            p = mmap(NULL, (size_t)sb.st_size, PROT_READ, fl, fd, 0);
         }
         S->maps[i] = p == MAP_FAILED ? (void *)-1 : p;
         S->maplen[i] = p == MAP_FAILED ? 0 : (int64_t)sb.st_size;
     }
     if (S->maps[i] == (void *)-1) return NULL;
-    const char *q = (const char *)S->maps[i] + t->off;
-    return ((uintptr_t)q % (uintptr_t)align) ? NULL : q;
+    return S->maps[i];
 #endif
+}
+
+static const void *st_map(shards *S, const char *name, int align) {
+    st_tensor *t = st_find(S,name);
+    if (!t || !g_st_map) return NULL;
+    const char *base = st_map_fd(S,t->fd);
+    if (!base) return NULL;
+    t->used = 1;
+    const char *q = base+t->off;
+    return ((uintptr_t)q % (uintptr_t)align) ? NULL : q;
 }
 
 static void st_read_raw(shards *S, const char *name, void *out, int drop) {

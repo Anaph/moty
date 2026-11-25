@@ -18,7 +18,6 @@
 
 #include "nn/track.h"   /* first: heap calls go through the open tracker */
 #include <stdio.h>
-#include <malloc.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>

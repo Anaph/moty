@@ -71,6 +71,21 @@ void moty_matmul_q8r4_s(float *y, const float *x, const int8_t *q8, const uint16
                         int S, int I, int O);
 void moty_matmul_q4r4_s(float *y, const float *x, const uint8_t *q4, const uint16_t *s16,
                         int S, int I, int O);
+void moty_matmul_q4_1_native(float *y, const float *x, const uint8_t *raw, int S, int I, int O);
+enum { Q41_PACKED_GS = -64, Q41_INDEXED_GS = -65 };
+void moty_q41_panels(float *y, const float *x, const uint8_t *panels, const uint8_t *up, int S, int I, int O);
+void moty_q41_indexed_head(float *y, const float *x, const uint8_t *panels, int S, int I, int O);
+void moty_q41_matmul(float *y, const float *x, const uint8_t *raw, int S, int I, int O, int group64);
+int moty_q41_ffn_enabled(void);
+int moty_q41_gate_up(float *y, const float *x, const uint8_t *gate, const uint8_t *up, int S, int I, int O, int group64);
+struct Mat;
+/* Apply three resident Q4_1 projections to the same input or return 0 for fallback. */
+int moty_q41_ffn_team(float *out, float *intermediate, const float *x,
+                       const struct Mat *gate, const struct Mat *up, const struct Mat *down);
+int moty_q41_qkv(float *const out[3], const float *x, const struct Mat *const proj[3], int S);
+int moty_q41_uses_fp16(void);
+void moty_q41_begin_exact_batch(void);
+int moty_q41_end_exact_batch(void);
 void moty_matmul_q4k_native(float *y, const float *x, const uint8_t *raw,
                               int S, int I, int O);
 void moty_matmul_q6k_native(float *y, const float *x, const uint8_t *raw,

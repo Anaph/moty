@@ -17,23 +17,58 @@
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
+#ifdef __APPLE__
+#include <sys/mman.h>
+#endif
 #include "util/json.h"
 #include "tok/tok_unicode.h"
 
 /* ---------- hash map (chiavi binarie con lunghezza) ---------- */
-typedef struct { const char *k; int klen; int v; int used; } ment;
-typedef struct { ment *e; int cap; } hmap;
+typedef struct { const char *k; int klen; int v; } ment;
+typedef struct {
+    ment *e;
+    int cap;
+#ifdef __APPLE__
+    size_t mapped_bytes;
+#endif
+} hmap;
 static uint64_t tk_fnv(const char *s, int n){ uint64_t h=1469598103934665603ULL;
     for(int i=0;i<n;i++){ h^=(unsigned char)s[i]; h*=1099511628211ULL; } return h; }
-static void hm_init(hmap *m, int cap){ m->cap=cap; m->e=(ment*)calloc(cap,sizeof(ment)); }
+static void hm_init(hmap *m, int cap){ *m=(hmap){.e=(ment*)calloc(cap,sizeof(ment)),.cap=cap}; }
+
+static void hm_init_encoder(hmap *m, int cap, int one_shot) {
+#ifdef __APPLE__
+    // A large free can stay resident in Darwin's malloc cache.
+    const size_t bytes=(size_t)cap*sizeof(ment);
+    if (one_shot && bytes >= 128u*1024u) {
+        void *data=mmap(NULL,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
+        if (data!=MAP_FAILED) {
+            *m=(hmap){.e=(ment*)data,.cap=cap,.mapped_bytes=bytes};
+            return;
+        }
+    }
+#else
+    (void)one_shot;
+#endif
+    hm_init(m,cap);
+}
+
+static void hm_release(hmap *m) {
+#ifdef __APPLE__
+    if (m->mapped_bytes) munmap(m->e,m->mapped_bytes);
+    else
+#endif
+        free(m->e);
+    *m=(hmap){0};
+}
 static void hm_put(hmap *m, const char *k, int klen, int v){
     uint64_t h=tk_fnv(k,klen)&(m->cap-1);
-    while(m->e[h].used){ if(m->e[h].klen==klen && !memcmp(m->e[h].k,k,klen)){ m->e[h].v=v; return; } h=(h+1)&(m->cap-1); }
-    m->e[h].k=k; m->e[h].klen=klen; m->e[h].v=v; m->e[h].used=1;
+    while(m->e[h].k){ if(m->e[h].klen==klen && !memcmp(m->e[h].k,k,klen)){ m->e[h].v=v; return; } h=(h+1)&(m->cap-1); }
+    m->e[h].k=k; m->e[h].klen=klen; m->e[h].v=v;
 }
 static int hm_get(hmap *m, const char *k, int klen){
     uint64_t h=tk_fnv(k,klen)&(m->cap-1);
-    while(m->e[h].used){ if(m->e[h].klen==klen && !memcmp(m->e[h].k,k,klen)) return m->e[h].v; h=(h+1)&(m->cap-1); }
+    while(m->e[h].k){ if(m->e[h].klen==klen && !memcmp(m->e[h].k,k,klen)) return m->e[h].v; h=(h+1)&(m->cap-1); }
     return -1;
 }
 
@@ -49,6 +84,7 @@ typedef struct {
      * metaspazio U+2581 al posto degli spazi e byte-fallback <0xXX>.
      * Rilevata da model.byte_fallback==true nel tokenizer.json. */
     int mode;                 /* 0 = byte-level (GPT-2/cl100k), 1 = sentencepiece */
+    char merge_separator;     /* one-shot GGUF uses its borrowed space-delimited keys */
     int add_dummy_prefix;     /* normalizer Prepend "▁": prefissa il testo */
     /* pre_tokenizer Sequence[Split(\p{N}{1,3}, Isolated), Split(regex), ...]
      * (MiniCPM5): digit groups of <=3 are cut out BEFORE the main regex runs,
@@ -59,6 +95,7 @@ typedef struct {
      * token (LFM2 <|startoftext|>, MiniCPM5 <s>): HF prepends it when
      * add_special_tokens=True. -1 = none (Qwen: ByteLevel only). */
     int bos_id;
+    int chat_omits_think;      /* published chat template has no <think> marker */
     int byte_tok[256];        /* id di "<0xXX>" oppure -1 */
     int16_t *id2byte;         /* [n_ids] inverso di byte_tok (-1 = non byte-token) */
     /* pool di stringhe: UNA malloc per tutte le chiavi vocab/merges e i
@@ -256,11 +293,39 @@ static void tok_load(Tok *T, const char *path){
     json_free(root); free(buf);
 }
 
+/* The decoding tables and token strings stay usable after encoding ends. */
+static void tok_release_encoder(Tok *T) {
+    hm_release(&T->vocab);
+    hm_release(&T->merges);
+}
+
 /* libera tutto lo stato del tokenizer (pool compreso: una free per tutte le stringhe) */
 static void tok_free(Tok *T){
-    free(T->pool); free(T->vocab.e); free(T->merges.e);
+    tok_release_encoder(T);
+    free(T->pool);
     free(T->id2str); free(T->id_added); free(T->sp); free(T->id2byte);
     memset(T,0,sizeof(*T));
+}
+
+static void tok_set_chat_template(Tok *T, const char *text, int64_t len) {
+    T->chat_omits_think = 0;
+    if (!text || len <= 0) return;
+    const char marker[] = "<think>";
+    for (int64_t i = 0; i + (int64_t)sizeof(marker) - 1 <= len; i++)
+        if (!memcmp(text + i, marker, sizeof(marker) - 1)) return;
+    T->chat_omits_think = 1;
+}
+
+static void tok_load_snapshot_chat_template(Tok *T, const char *dir) {
+    char path[2048];
+    snprintf(path, sizeof(path), "%s/chat_template.jinja", dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    fclose(f);
+    long len;
+    char *text = slurp_file(path, &len);
+    tok_set_chat_template(T, text, len);
+    free(text);
 }
 
 #ifdef GGUF_H
@@ -268,8 +333,16 @@ static void tok_free(Tok *T){
  * tok_load, stringhe nel pool. Modello atteso "gpt2" (byte-level BPE, la
  * famiglia Qwen); i tokenizer sentencepiece in GGUF non sono supportati.
  * In GGUF l'id di un token E' il suo indice nell'array tokens. */
-static void tok_load_gguf(Tok *T, GgufMeta *M) {
+enum { TOK_GGUF_FULL, TOK_GGUF_DECODE_ONLY, TOK_GGUF_ONE_SHOT };
+
+static void tok_load_gguf_mode(Tok *T, GgufMeta *M, int mode) {
+    const int decode_only=mode==TOK_GGUF_DECODE_ONLY;
+    const int one_shot=mode==TOK_GGUF_ONE_SHOT;
     memset(T, 0, sizeof(*T));
+    T->merge_separator = one_shot ? ' ' : '\0';
+    int64_t template_len;
+    const char *template = gguf_str(M, "tokenizer.chat_template", &template_len);
+    tok_set_chat_template(T, template, template_len);
     /* llama.cpp convention: add_bos_token (bool) + bos_token_id */
     T->bos_id = gguf_int(M, "tokenizer.ggml.add_bos_token", 0)
               ? (int)gguf_int(M, "tokenizer.ggml.bos_token_id", -1) : -1;
@@ -289,31 +362,41 @@ static void tok_load_gguf(Tok *T, GgufMeta *M) {
     /* sizing del pool: token (+NUL) e chiavi merges ("left\0right" = len) */
     int64_t psz = 0, l;
     garr it = toks; while (garr_next_str(&it, &l)) psz += l + 1;
-    if (have_merges) { it = mrg; while (garr_next_str(&it, &l)) psz += l; }
+    if (have_merges && !decode_only && !one_shot) { it = mrg; while (garr_next_str(&it, &l)) psz += l; }
     T->pool_len = psz; T->pool_off = 0;
     T->pool = malloc(psz > 0 ? psz : 1);
     if (!T->pool) { moty_fail_code(MOTY_FAIL_OOM, "[tok] OOM pool %lld\n", (long long)psz); }
     T->n_ids = (int)nvoc;
     T->id2str = calloc(T->n_ids, sizeof(char*));
     T->id_added = calloc(T->n_ids, sizeof(int));
-    int vc = 1; while (vc < nvoc*2) vc <<= 1;
-    hm_init(&T->vocab, vc);
+    if (!decode_only) {
+        int vc = 1; while (vc < nvoc*2) vc <<= 1;
+        hm_init_encoder(&T->vocab,vc,one_shot);
+    }
     int nsp = 0;
     for (int64_t id = 0; id < nvoc; id++) {
         const char *s = garr_next_str(&toks, &l);
         if (!s) { moty_fail_code(MOTY_FAIL_FORMAT, "[tok] GGUF: array tokens troncato\n"); }
         char *k = tk_pool_dup(T, s, (int)l);
-        hm_put(&T->vocab, k, (int)l, (int)id);
+        if (!decode_only) hm_put(&T->vocab,k,(int)l,(int)id);
         T->id2str[id] = k;
         int tt = have_types ? (int)garr_next_int(&types) : 1;
         if (tt == 3) { T->id_added[id] = 1; nsp++; }   /* CONTROL -> added token */
     }
-    int mc = 1; while (mc < (nmerg > 0 ? nmerg : 1)*2) mc <<= 1;
-    hm_init(&T->merges, mc);
+    if (!decode_only) {
+        int mc = 1; while (mc < (nmerg > 0 ? nmerg : 1)*2) mc <<= 1;
+        hm_init_encoder(&T->merges,mc,one_shot);
+    }
     if (have_merges) for (int64_t i = 0; i < nmerg; i++) {
         const char *s = garr_next_str(&mrg, &l);
         const char *sp = s ? memchr(s, ' ', l) : NULL;
         if (!sp) { moty_fail_code(MOTY_FAIL_FORMAT, "[tok] GGUF: merge senza spazio\n"); }
+        if (decode_only) continue;
+        if (one_shot) {
+            /* GGUF metadata stays live until the CLI releases the encoder. */
+            hm_put(&T->merges,s,(int)l,(int)i);
+            continue;
+        }
         int ll = (int)(sp - s), rl = (int)(l - ll - 1);
         char *key = tk_pool_take(T, ll + 1 + rl);
         memcpy(key, s, ll); key[ll] = 0; memcpy(key+ll+1, sp+1, rl);
@@ -329,9 +412,12 @@ static void tok_load_gguf(Tok *T, GgufMeta *M) {
             T->sp[si].id = id; si++;
         }
     qsort(T->sp, T->nsp, sizeof(Special), cmp_sp_len);
-    tk_byte_tables(T);
+    if (!decode_only) tk_byte_tables(T);
     fprintf(stderr, "[tok] GGUF: %d token, %lld merges, %d added\n",
             T->n_ids, (long long)nmerg, T->nsp);
+}
+static void tok_load_gguf(Tok *T, GgufMeta *M) {
+    tok_load_gguf_mode(T,M,TOK_GGUF_FULL);
 }
 #endif /* GGUF_H */
 
@@ -350,7 +436,7 @@ static void bpe_core(Tok *T, const char *s, int sl, int *out, int *no, int max, 
         int best=INT_MAX, bp=-1;
         for(int i=0;i+1<ns;i++){
             int ll=slen[i], rl=slen[i+1];
-            memcpy(kbuf,s+soff[i],ll); kbuf[ll]=0; memcpy(kbuf+ll+1,s+soff[i+1],rl);
+            memcpy(kbuf,s+soff[i],ll); kbuf[ll]=T->merge_separator; memcpy(kbuf+ll+1,s+soff[i+1],rl);
             int rk=hm_get(&T->merges,kbuf,ll+1+rl);
             if(rk>=0 && rk<best){ best=rk; bp=i; }
         }

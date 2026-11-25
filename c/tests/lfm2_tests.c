@@ -4,7 +4,12 @@
  * Modello sintetico con NOMI HF (Lfm2ForCausalLM, come LFM2.5-350M):
  * conv/attn alternati, QK-norm, FFN con block_auto_adjust_ff_dim. */
 #define LFM2_TEST
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#define malloc_usable_size malloc_size
+#else
 #include <malloc.h>
+#endif
 #include "../engines/lfm2.c"
 #include "tiny_st.h"
 #include "ref_dense.h"
@@ -13,6 +18,26 @@
     fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #cond); return 1; } } while (0)
 
 #include "tiny_lfm2.h"
+
+int lt_q41_requires_opt_in(void) {
+    st_tensor tensor = {.dtype = ST_Q4_1};
+    shards sh = {.t = &tensor, .n = 1};
+    CHECK(!q41_native_selected(&sh,0,0));
+    CHECK(!q41_native_selected(&sh,8,0));
+    tensor.dtype = ST_Q4_K;
+    CHECK(!q41_native_selected(&sh,-1,0));
+    tensor.dtype = ST_Q4_1;
+
+    MotyTrap *trap = calloc(1,sizeof(*trap));
+    CHECK(trap);
+    MotyTrap *prev = moty_trap_arm(trap);
+    if (MOTY_TRAP_TRY(trap)) q41_native_selected(&sh,-1,0);
+    moty_trap_disarm(prev);
+    int rejected = trap->code == MOTY_FAIL_FORMAT && strstr(trap->msg,"native Q4_1 is not supported");
+    free(trap);
+    CHECK(rejected);
+    return 0;
+}
 
 /* independent reference: HF Lfm2 forward over the whole sequence, all
  * positions' logits -> lo[T][V] */

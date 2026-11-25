@@ -4,6 +4,8 @@
 #ifndef RT_MODEL_LOAD_H
 #define RT_MODEL_LOAD_H
 
+#include "io/q41_panels.h"
+
 /* open phases (MotyCommon.load_ph): where the seconds of a model open go */
 enum { LP_INDEX, LP_SMALL, LP_EMBED, LP_HEAD, LP_LAYERS, LP_FUSE, LP_TOK, LP_KV, LP_N };
 static const char *const lp_name[LP_N] = { "index", "small", "embed", "head", "layers", "fuse", "tokenizer", "kv" };
@@ -119,10 +121,81 @@ static void load_mat_r4(Model *m, Mat *w, const char *name, const char *pname, i
 
 static void quantize_from_disk(Model *m, const char *name, int8_t *q, float *qs, int64_t N, int I, int rows);
 
+static int q41_same_params_per_pair(const uint8_t *raw, int I, int64_t bytes) {
+    if (I % (2*Q4_1_ELEMS)) return 0;
+    for (int64_t b = 0; b < bytes; b += 2*Q4_1_BYTES)
+        if (memcmp(raw+b,raw+b+Q4_1_BYTES,4)) return 0;
+    return 1;
+}
+
+static int q41_group64_enabled(void) {
+    const char *group64 = moty_getenv("MOTY_Q41_GROUP64");
+    const char *rows = moty_getenv("MOTY_Q41_ROWS");
+    return moty_q41_uses_fp16() && (!rows || !strcmp(rows,"1")) &&
+           (group64 ? !strcmp(group64,"1") : g_gguf && gguf_find(&g_gguf_meta,"pocket.qat_conversion"));
+}
+
+#if defined(ENGINE_Q41_PANELS) && defined(__aarch64__) && defined(__ARM_NEON) && !defined(_WIN32)
+static int q41_pack_selected(const Model *m, const char *name) {
+    const char *packed = moty_getenv("MOTY_Q41_PACKED");
+    if (!packed) return 0;
+    int head = !strcmp(name,"lm_head.weight") ||
+               (m->base.lm_tied && !strcmp(name,"model.embed_tokens.weight"));
+    int ffn = strstr(name,".mlp.") != NULL;
+    int down = ffn && strstr(name,".down_proj.") != NULL;
+    return !strcmp(packed,"all") || !strcmp(packed,"stream-all") ||
+           ((!strcmp(packed,"1") || !strcmp(packed,"stream")) && (head || ffn)) ||
+           (!strcmp(packed,"head") && head) || (!strcmp(packed,"ffn") && ffn) ||
+           (!strcmp(packed,"gate") && ffn && !down) || (!strcmp(packed,"down") && down);
+}
+#endif
+
 static void load_mat_bits(Model *m, Mat *w, const char *name, int O, int I, int bits) {
-    mat_reset_storage(w);            /* fmt = WF_F32 di default */
     mat_reset_storage(w);
     w->O = O; w->I = I;
+    if (bits == -1) {
+        st_tensor *t = st_expect(&m->S, name, (int64_t)O*I);
+        if (t->dtype == ST_Q4_1) {
+            if (I % Q4_1_ELEMS)
+                moty_fail_code(MOTY_FAIL_FORMAT, "%s: Q4_1 matrix rows must be a multiple of %d\n", name, Q4_1_ELEMS);
+            w->fmt = WF_Q4_1;
+#if defined(ENGINE_Q41_PANELS) && defined(__aarch64__) && defined(__ARM_NEON) && !defined(_WIN32)
+            if (q41_pack_selected(m,name)) {
+#ifdef __APPLE__
+                const char *indexed = moty_getenv("MOTY_Q41_INDEXED_HEAD");
+                uint64_t original_bytes = (uint64_t)(I/64)*(O/4)*Q41_PANEL_BYTES;
+                if (indexed && !strcmp(indexed,"1") && I <= Q41_INDEX_MAX_INPUT &&
+                    g_gguf && gguf_find(&g_gguf_meta,"pocket.qat_conversion") &&
+                    m->base.lm_tied && !strcmp(name,"model.embed_tokens.weight") &&
+                    q41_indexed_bytes(I,O) < original_bytes && moty_q41_uses_fp16()) {
+                    const uint8_t *panels = st_q41_cache_map(&m->S,t,I,O,1);
+                    if (panels) {
+                        w->q4 = (uint8_t *)panels; w->gs = Q41_INDEXED_GS; w->borrowed = 2;
+                        return;
+                    }
+                }
+#endif
+                const uint8_t *panels = st_q41_cache(&m->S,t,I,O);
+                if (panels) {
+                    w->q4 = (uint8_t *)panels; w->gs = Q41_PACKED_GS; w->borrowed = 2;
+                    return;
+                }
+            }
+#endif
+            const void *mapped = st_map(&m->S, name, 1);
+            if (mapped) { w->q4 = (uint8_t *)mapped; w->borrowed = 2; }
+            else { w->q4 = balloc(t->nbytes, name); st_read_raw(&m->S, name, w->q4, 0); }
+            if (q41_group64_enabled() && q41_same_params_per_pair(w->q4,I,t->nbytes))
+                w->gs = 64;
+            return;
+        }
+        if (t->dtype == ST_Q4_K || t->dtype == ST_Q6_K) {
+            w->q4 = balloc(t->nbytes, name);
+            st_read_raw(&m->S, name, w->q4, 0);
+            w->fmt = t->dtype == ST_Q4_K ? WF_Q4K : WF_Q6K;
+            return;
+        }
+    }
     if ((bits == 4 || bits == 8) && I % 32 == 0) {
         /* a pre-packed container (Q4R4/Q8R4 by stored size) is read as it
          * was packed, whatever QBITS / Q4FMT say: the file defines the layout */
@@ -141,12 +214,7 @@ static void load_mat_bits(Model *m, Mat *w, const char *name, int O, int I, int 
         return;
     }
     w->f = load_t(m, name, (int64_t)O*I);
-    if (bits == 8) {
-        w->q = balloc((int64_t)O*I, name); w->qs = falloc(O);
-        quantize_rows(w->f, w->q, w->qs, O, I, 8);
-        free(w->f); w->f = NULL;
-        w->fmt = WF_I8;
-    } else if (bits == 4) {
+    if (bits == 4) {
         int gs = g_qgroup;
         int64_t rb = ((int64_t)I+1)/2, ng = gs > 0 ? ((int64_t)I+gs-1)/gs : 1;
         w->q4 = balloc((int64_t)O*rb, name); w->qs = falloc((int64_t)O*ng);
@@ -161,19 +229,7 @@ static void load_mat_bits(Model *m, Mat *w, const char *name, int O, int I, int 
         pack_int2(w->f, w->q4, w->qs, O, I, 2);
         free(w->f); w->f = NULL;
         w->fmt = WF_I2;
-    } else if (bits == -1) { /* nativo Q4_K/Q6_K: raw, nessuna re-quant */
-        st_tensor *t = st_expect(&m->S, name, (int64_t)O*I);
-        if (t->dtype == ST_Q4_K || t->dtype == ST_Q6_K) {
-            void *raw = balloc(t->nbytes, name);
-            st_read_raw(&m->S, name, raw, 0);
-            w->q4 = (uint8_t*)raw;
-            w->fmt = (t->dtype == ST_Q4_K) ? WF_Q4K : WF_Q6K;
-        } else {
-            w->f = load_t(m, name, (int64_t)O*I);
-            w->fmt = WF_F32;
-        }
     }
-    /* bits==0: fmt resta WF_F32 (default), w->f residente */
 }
 
 static void load_mat(Model *m, Mat *w, const char *name, int O, int I) {
@@ -394,13 +450,51 @@ static void stream_scratch_alloc(Model *m) {
     }
 }
 
+/* Native Q4_1 is an engine capability, independent of the GGUF parser's
+ * ability to decode Q4_1 tensors into the engine's existing formats. */
+static int q41_native_selected(const shards *s, int qbits, int64_t budget_bytes) {
+    if (qbits != -1 && (qbits != 0 || moty_getenv("QBITS"))) return 0;
+    for (int i = 0; i < s->n; i++) {
+        if (s->t[i].dtype != ST_Q4_1) continue;
+#ifndef ENGINE_NATIVE_Q41
+        (void)budget_bytes;
+        if (qbits == -1)
+            moty_fail_code(MOTY_FAIL_FORMAT, "[" ENGINE_TAG "] native Q4_1 is not supported by this engine; use QBITS=0 or 8\n");
+        return 0;
+#else
+        int native_budget = 0;
+#ifdef ENGINE_Q41_STREAM
+        native_budget = qbits == -1 && gguf_find(&g_gguf_meta,"pocket.qat_conversion");
+#endif
+        if (!g_micro && (budget_bytes <= 0 || native_budget)) return 1;
+        if (qbits == -1)
+            moty_fail_code(MOTY_FAIL_FORMAT,"Native Q4_1 is incompatible with MICRO or a layer streaming budget; use QBITS=0 or 8\n");
+        return 0;
+#endif
+    }
+    return 0;
+}
+
 /* budget_bytes==0 -> tutto residente (comportamento classico) */
 static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_bytes, int ctx_hint) {
     memset(m, 0, sizeof(*m));
     m->base.qbits = qbits;
     double tp = now_s();
+#ifdef ENGINE_Q41_STREAM
+    int q41_stream = 0;
+#endif
     /* GGUF: l'indice va costruito PRIMA del config (i metadati SONO il config) */
-    if (g_gguf) gguf_index(&m->S, &g_gguf_meta, g_gguf);
+    if (g_gguf) {
+        gguf_index(&m->S, &g_gguf_meta, g_gguf);
+        if (q41_native_selected(&m->S,qbits,budget_bytes)) {
+            m->base.qbits = -1;
+#ifdef ENGINE_Q41_STREAM
+            q41_stream = budget_bytes > 0;
+#endif
+            fprintf(stderr, "[" ENGINE_TAG "] native GGUF Q4_1 (%s activations, FP32 accumulation)\n",
+                    moty_q41_uses_fp16() ? "NEON FP16" : "FP32");
+        }
+    }
     load_cfg(&m->c, snap);
     if (!g_gguf) st_init(&m->S, snap);
     Cfg *c = &m->c;
@@ -426,21 +520,32 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
     /* EMBED=disk: no resident table, embed_row gathers the row from the file
      * (the micro-RSS branch). Only valid when nothing else reads the table:
      * a tied lm_head must then be packed separately (QBITS=4 Q4R4). */
+    const char *embed_name = "model.embed_tokens.weight";
+    int embed_q41 = m->base.qbits == -1 && st_dtype(&m->S, embed_name) == ST_Q4_1;
     int head_q4r4 = m->base.lm_tied && D % 32 == 0          /* a container's packed head, or QBITS=4 r4 */
                     && (st_has(&m->S, "lm_head.weight.s16") || (m->base.qbits == 4 && g_q4fmt));
-    if (g_embed_disk && m->base.lm_tied && !head_q4r4) {
+    if (g_embed_disk && m->base.lm_tied && !head_q4r4 && !embed_q41) {
         moty_fail_code(MOTY_FAIL_FORMAT, "[" ENGINE_TAG "] EMBED=disk con lm_head legato richiede QBITS=4 Q4FMT=r4\n");
     }
     if (g_embed_disk && embed_is_q8(m))
         moty_fail_code(MOTY_FAIL_FORMAT, "[" ENGINE_TAG "] EMBED=disk: this container's table is int8 in place (mmap) already\n");
-    if (g_embed_disk) st_expect(&m->S, "model.embed_tokens.weight", (int64_t)c->vocab*D);
-    else if (m->base.qbits > 0 || moty_getenv("EMBED_Q8") || embed_is_q8(m)) load_embed_q8(m);  /* qbits=-1 (native): f32 embed */
-    else m->base.embed = load_t(m, "model.embed_tokens.weight", (int64_t)c->vocab*D);
+    Mat packed_embed;
+    if (embed_q41) {
+        if (!g_embed_disk || m->base.lm_tied) load_mat_bits(m, &packed_embed, embed_name, c->vocab, D, -1);
+        if (!g_embed_disk) {
+            m->base.embed_q41 = packed_embed.q4;
+            m->base.embed_q41_gs = packed_embed.gs;
+        }
+    } else if (g_embed_disk) st_expect(&m->S, embed_name, (int64_t)c->vocab*D);
+    else if (m->base.qbits > 0 || moty_getenv("EMBED_Q8") || embed_is_q8(m)) load_embed_q8(m);
+    else m->base.embed = load_t(m, embed_name, (int64_t)c->vocab*D);
     LP_MARK(m, LP_EMBED, tp);
     if (m->base.lm_tied) {
         mat_reset_storage(&m->base.lm_head);
         m->base.lm_head.O = c->vocab; m->base.lm_head.I = D;
-        if (head_q4r4) {
+        if (embed_q41) {
+            m->base.lm_head = packed_embed;
+        } else if (head_q4r4) {
             /* tied head in Q4R4 packed from the original rows (not from the
              * int8 table: no double quantization); a container stores it
              * pre-packed as lm_head.weight */
@@ -463,6 +568,14 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
         load_mat_bits(m, &m->base.lm_head, "lm_head.weight", c->vocab, D, m->base.qbits);
     }
     LP_MARK(m, LP_HEAD, tp);
+#ifdef ENGINE_Q41_STREAM
+    if (q41_stream) {
+        qwen_q41_stream_open(m, budget_bytes, ctx_hint);
+        LP_MARK(m, LP_LAYERS, tp);
+        m->base.load_s = now_s() - t0;
+        return;
+    }
+#endif
     /* 2) budget -> quanti layer di matrici stanno residenti */
     m->base.n_resident = budget_bytes > 0 ? budget_resident(m, budget_bytes, ctx_hint)
                                      : c->n_layers;
@@ -657,6 +770,26 @@ static void embed_row(Model *m, int id, float scale, float *dst) {
         const int8_t *er = m->base.embed_q + (int64_t)id*D;
         float es = m->base.embed_qs[id] * scale;
         for (int i = 0; i < D; i++) dst[i] = er[i] * es;
+    } else if (m->base.embed_q41) {
+        int blocks = D / Q4_1_ELEMS;
+        if (m->base.embed_q41_gs == Q41_INDEXED_GS) {
+            const uint8_t *p = m->base.embed_q41;
+            const uint32_t *table = q41_indexed_table(p,D,m->c.vocab);
+            const uint8_t *panel = p+(int64_t)(id/4)*(blocks/2)*Q41_INDEXED_BYTES;
+            for (int b = 0; b < blocks; b++) {
+                uint8_t raw[Q4_1_BYTES];
+                q41_indexed_row_block(panel+(b/2)*Q41_INDEXED_BYTES,table,id%4,b%2,raw);
+                gguf_dq_q4_1(raw,1,dst+b*Q4_1_ELEMS);
+            }
+        } else if (m->base.embed_q41_gs == Q41_PACKED_GS) {
+            const uint8_t *panel = m->base.embed_q41 + (int64_t)(id/4)*(blocks/2)*Q41_PANEL_BYTES;
+            for (int b = 0; b < blocks; b++) {
+                uint8_t raw[Q4_1_BYTES];
+                q41_panel_row_block(panel+(b/2)*Q41_PANEL_BYTES,id%4,b%2,raw);
+                gguf_dq_q4_1(raw,1,dst+b*Q4_1_ELEMS);
+            }
+        } else gguf_dq_q4_1(m->base.embed_q41 + (int64_t)id * blocks * Q4_1_BYTES, blocks, dst);
+        if (scale != 1.f) for (int i = 0; i < D; i++) dst[i] *= scale;
     } else {
         st_read_slice_f32(&m->S, "model.embed_tokens.weight", (int64_t)id*D, D, dst, 0);
         if (scale != 1.f) for (int i = 0; i < D; i++) dst[i] *= scale;

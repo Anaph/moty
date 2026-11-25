@@ -84,7 +84,12 @@ int moty_rt_parse_env(MotyRunConfig *e) {
     if (moty_rt_g_gguf && !*moty_rt_g_gguf) moty_rt_g_gguf = NULL;
     if (!e->snap && !moty_rt_g_gguf) { fprintf(stderr, "set SNAP=<snapshot directory> oppure GGUF=<file.gguf>\n"); return 0; }
     e->qbits = getenv("QBITS") ? atoi(getenv("QBITS")) : 0;
-    if (e->qbits != -1 && e->qbits != 0 && e->qbits != 2 && e->qbits != 4 && e->qbits != 8) { fprintf(stderr, "QBITS deve essere 0 (f32), 4 (int4) o 8 (int8)\n"); return 0; }
+    if (e->qbits != -1 && e->qbits != 0 && e->qbits != 2 && e->qbits != 4 && e->qbits != 8) { fprintf(stderr, "QBITS must be -1 (native GGUF), 0 (f32), 2, 4 or 8\n"); return 0; }
+    const char *q41_act = getenv("Q41_ACT");
+    if (q41_act && strcmp(q41_act, "f16") && strcmp(q41_act, "f32")) {
+        fprintf(stderr, "Q41_ACT must be f16 or f32\n");
+        return 0;
+    }
     if (getenv("QGROUP")) {
         moty_rt_g_qgroup = atoi(getenv("QGROUP"));
         if (moty_rt_g_qgroup < 0 || (moty_rt_g_qgroup > 0 && moty_rt_g_qgroup % 16)) {

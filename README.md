@@ -147,7 +147,8 @@ Common environment variables (qwen engine):
 | `TEMP` / `NUCLEUS` / `SEED` | 0.7 / 0.95 | sampling (TEMP=0 → greedy) |
 | `CHAT_TEMPLATE` | 1 | wrap prompt in the model's chat format |
 | `THINK` | 0 | Qwen3 thinking mode (0 pre-closes the think block) |
-| `QBITS` | 0 | 8 → int8-quantize weights **and embeddings** at load (~4× less RAM); 4 → int4 layer weights with group-wise scales (~8× on layers; embeddings stay int8; the lm_head stays int8 except with Q4R4, where a tied head is packed to Q4R4 from the original rows) |
+| `QBITS` | native for Q4_1 GGUF in Qwen, 0 otherwise | `-1` → native GGUF kernel for Q4_1 (Qwen), Q4_K or Q6_K; `0` → float32 weights; `8` → int8-quantize weights **and embeddings** at load; `4` → int4 layer weights, int8 embeddings, and a Q4R4 tied head when `Q4FMT=r4` |
+| `Q41_ACT` | `f16` on AArch64 builds with NEON FMLAL, `f32` elsewhere | Q4_1 matmul activation precision. Both modes accumulate in float32. Set `f32` to select the previous activation precision. |
 | `QGROUP` | 32 | int4 scale group size (multiple of 16; 0 → one scale per row). 32 matches the GGUF Q4_0 block. Q4R4 always uses 32 |
 | `Q4FMT` | `r4` on aarch64, else `g` | `QBITS=4` layout: `r4` = Q4R4 (ARMv8.0 NEON kernels, 4.5 bits/weight), `g` = legacy grouped int4 |
 | `EMBED` | `ram` | `disk` → no resident embedding table: the row of each input token is read from the snapshot (bf16/f32, no int8 rounding). With a tied lm_head it requires `QBITS=4 Q4FMT=r4` (the head is packed separately). Saves vocab×hidden bytes — 200 MB on MiniCPM5-1B |
@@ -228,12 +229,49 @@ Weights are indexed into the same loader the safetensors path uses (names
 translated from the llama.cpp scheme), the config is synthesized from the
 `<arch>.*` metadata, and the tokenizer comes from `tokenizer.ggml.*`
 (byte-level BPE only — the Qwen family). Supported tensor types: F32, F16,
-BF16, Q8_0, Q4_0 and the K-quants Q4_K/Q5_K/Q6_K (dequantized on load, then
-requantized per `QBITS`). Special case: Q4_0 with `QBITS=4` is repacked
+BF16, Q8_0, Q4_0, Q4_1 and the K-quants Q4_K/Q5_K/Q6_K. Q4_1 defaults to the
+native kernel, which uses the packed GGUF blocks directly. `QBITS=0` expands
+weights to float32, and `QBITS=4` or `8` requantizes them at load. Q4_0 with
+`QBITS=4 Q4FMT=g` is repacked
 **losslessly** into the engine's group-wise int4 (same nibble encoding, same
 32-element scale blocks) — you run exactly the bits that are in the file.
 `REF=`, `MEM_GB`, `MICRO=1`, `KV_BITS` and LoRA adapters all work as with a
 snapshot directory.
+
+### MNN-Pocket-0.3B
+
+Run the [official QAT Q4_1 GGUF](https://huggingface.co/taobao-mnn/MNN-Pocket-0.3B-GGUF)
+with the Qwen engine on CPU:
+
+```sh
+make qwen
+curl -fL -o MNN-Pocket-0.3B-Instruct-Q4_1.gguf \
+  https://huggingface.co/taobao-mnn/MNN-Pocket-0.3B-GGUF/resolve/main/MNN-Pocket-0.3B-Instruct-Q4_1.gguf
+GGUF=./MNN-Pocket-0.3B-Instruct-Q4_1.gguf CTX=512 THREADS=4 TEMP=0 NGEN=32 \
+  PROMPT="What is the capital of France?" ./c/qwen
+```
+
+Moty uses the official QAT blocks in place by default (`QBITS=-1`). The tied
+output projection and input embeddings share the packed table. `MMAP=0`
+keeps a packed copy in RAM. Set `QBITS=0` for the float32 baseline or
+`QBITS=8` for the existing int8 requantization path. For a smaller resident
+set with Pocket, set `QBITS=-1` explicitly alongside `MEM_GB` or `MEM_FRAC`.
+This keeps attention and the tied head resident and streams the original
+Q4_1 FFN blocks. The budget guides weight placement. On Apple FMLAL,
+`MOTY_Q41_PACKED=stream` also lets single-token steps read lossless Group64
+panel caches. The `stream-all` selection also uses resident attention
+panels for decode and an original-block window for prefill.
+`MOTY_Q41_FILE_WINDOWS=1` reuses read-only windows for verified gate
+and down panels on Apple Silicon. See the
+[half-RSS profiles](docs/models/mnn-pocket-0.3b.md#follow-up-on-prefill-at-half-rss)
+for measured budgets and worker counts.
+`MICRO=1` still requires a non-native mode.
+See [the Pocket benchmark](docs/models/mnn-pocket-0.3b.md) for RAM, speed and token comparisons.
+
+The [original Hugging Face snapshot](https://huggingface.co/taobao-mnn/MNN-Pocket-0.3B)
+also works with `SNAP=/path/to/MNN-Pocket-0.3B` in place of `GGUF`. Keep
+`chat_template.jinja` alongside `config.json`, `tokenizer.json` and
+`model.safetensors` so the Qwen engine uses Pocket's plain ChatML turn.
 
 `MICRO=1` (qwen only) is the mode for **hard** memory limits (cgroup,
 embedded): nothing of the model stays resident. Embedding rows are gathered

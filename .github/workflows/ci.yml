@@ -33,6 +33,22 @@ jobs:
       - name: Test suite (native march)
         run: cd c && make test-native
 
+  apple-q41:
+    name: Pocket Q4_1 (Apple Silicon, pthread)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Exercise FMLAL and FFN file windows
+        run: |
+          test "$(uname -m)" = arm64
+          cd c
+          make -j3 THREADPOOL=1 ARCH=apple-m1 libmoty-runtime.a
+          clang -O2 -mcpu=apple-m1 -DMOTY_THREADPOOL -pthread -I. \
+            -DQWEN_Q41_TEST_MAIN -DMOTY_Q41_REQUIRE_FMLAL \
+            -ffunction-sections -Wl,-dead_strip tests/qwen_tests.c \
+            libmoty-runtime.a libmoty-nn.a libmoty-hw.a -lm -o /tmp/moty-q41-test
+          /tmp/moty-q41-test
+
   # Cross-compile + QEMU parity for the ARM SIMD tiers added in WP1.1/1.4.
   # x86 runners can't run ARM code natively; qemu-user executes the simd parity
   # suite (bit-exact vs scalar int64/double reference) under each tier so a
@@ -71,6 +87,15 @@ jobs:
             cat /tmp/${n}.out
             grep -qx "tier: neon" /tmp/${n}.out || { echo "FAIL $n: NEON tier not compiled"; exit 1; }
           done
+      - name: Q4_1 and GQA kernels on emulated Cortex-A53
+        run: |
+          cd c
+          make -j libmoty-runtime.a CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar ARCH=armv8-a
+          # GCC 12 can ICE while vectorizing an unrelated fixture in this translation unit.
+          aarch64-linux-gnu-gcc -O1 -march=armv8-a -fopenmp -pthread -static -I. \
+            -DQWEN_Q41_TEST_MAIN -ffunction-sections -Wl,--gc-sections \
+            tests/qwen_tests.c libmoty-runtime.a libmoty-nn.a libmoty-hw.a -lm -o /tmp/q41_test
+          qemu-aarch64 -cpu cortex-a53 /tmp/q41_test
       - name: aarch64 engine cross-compile (SVE2)
         run: cd c && make clean && make all CC=aarch64-linux-gnu-gcc ARCH=armv9-a
       - name: armv7 simd parity (Cortex-A7 / A15, non-dotprod NEON)

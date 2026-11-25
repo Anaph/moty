@@ -76,6 +76,11 @@ void moty_mat_apply(float *y, const float *x, const Mat *w, int S) {
         case WF_I4:  matmul_i4_s(y, x, w->q4, w->qs, S, w->I, w->O); return;
         case WF_I8:  matmul_q_s(y, x, w->q, w->qs, S, w->I, w->O); return;
         case WF_I2:  matmul_i2_s(y, x, w->q4, w->qs, S, w->I, w->O); return;
+        case WF_Q4_1:
+            if (w->gs == Q41_PACKED_GS) moty_q41_panels(y,x,w->q4,NULL,S,w->I,w->O);
+            else if (w->gs == Q41_INDEXED_GS) moty_q41_indexed_head(y,x,w->q4,S,w->I,w->O);
+            else moty_q41_matmul(y,x,w->q4,S,w->I,w->O,w->gs == 64);
+            return;
         case WF_Q4K: matmul_q4k_native(y, x, w->q4, S, w->I, w->O); return;
         case WF_Q6K: matmul_q6k_native(y, x, w->q4, S, w->I, w->O); return;
         default:     matmul(y, x, w->f, S, w->I, w->O); return;
