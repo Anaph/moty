@@ -14,7 +14,7 @@
     fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #cond); return 1; } } while (0)
 
 typedef struct {
-    atomic_int *hits; atomic_int calls; int *tid_of; int64_t *lo, *hi; int bad;
+    atomic_int *hits; atomic_int calls; int *tid_of; int64_t *lo, *hi; atomic_int bad;
 } Cov;
 
 static void cov_fn(void *c_, int64_t i0, int64_t i1, int tid) {
@@ -22,7 +22,10 @@ static void cov_fn(void *c_, int64_t i0, int64_t i1, int tid) {
     atomic_fetch_add(&c->calls, 1);
     if (tid < 0 || tid >= 64 || i0 >= i1) c->bad = 1;
     if (c->lo) { c->lo[tid] = i0; c->hi[tid] = i1; }
-    for (int64_t i = i0; i < i1; i++) { atomic_fetch_add(&c->hits[i], 1); if (c->tid_of) c->tid_of[i] = tid; }
+    for (int64_t i = i0; i < i1; i++) {
+        int previous = atomic_fetch_add(&c->hits[i], 1);
+        if (previous == 0 && c->tid_of) c->tid_of[i] = tid;
+    }
 }
 
 /* static: one contiguous range per thread, split like schedule(static) */
@@ -67,18 +70,22 @@ int par_dynamic_chunks(void) {
     return 0;
 }
 
-/* THREADS_DECODE: a smaller team for a while, then the full team again */
+/* Alternate sizes so an idle worker may miss one or more publications. */
 int par_team_resize(void) {
-    int sizes[] = { 4, 3, 1, 2, 4, 3, 4 };
-    for (size_t k = 0; k < sizeof sizes / sizeof *sizes; k++) {
-        moty_par_set_threads(sizes[k]);
-        for (int rep = 0; rep < 200; rep++) {
-            int64_t n = 257;
-            Cov c = { calloc(n, sizeof(atomic_int)), 0, malloc(n * sizeof(int)), NULL, NULL, 0 };
-            moty_par_for(n, rep & 1 ? 8 : 0, cov_fn, &c);
+    const int sizes[] = { 12, 6, 12, 8, 12, 10, 12, 1 };
+    for (int rep = 0; rep < 400; rep++) {
+        for (size_t k = 0; k < sizeof sizes / sizeof *sizes; k++) {
+            enum { N = 257 };
+            atomic_int hits[N] = {0};
+            int tid_of[N];
+            Cov c = { hits, 0, tid_of, NULL, NULL, 0 };
+            moty_par_set_threads(sizes[k]);
+            moty_par_for(N, rep & 1 ? 8 : 0, cov_fn, &c);
             CHECK(!c.bad);
-            for (int64_t i = 0; i < n; i++) { CHECK(atomic_load(&c.hits[i]) == 1); CHECK(c.tid_of[i] < sizes[k]); }
-            free(c.hits); free(c.tid_of);
+            for (int i = 0; i < N; i++) {
+                CHECK(atomic_load(&hits[i]) == 1);
+                CHECK(tid_of[i] < sizes[k]);
+            }
         }
     }
     return 0;
@@ -113,14 +120,14 @@ int par_nested(void) {
     return 0;
 }
 
-/* many short regions with workers that sleep after one poll: every wakeup
+/* Many short regions with workers that sleep immediately: every wakeup
  * must arrive (a lost one hangs the test) */
 static void sum_fn(void *c_, int64_t i0, int64_t i1, int tid) {
     atomic_llong *s = c_;
     for (int64_t i = i0; i < i1; i++) atomic_fetch_add(s, i);
 }
 int par_sleep_wakeup(void) {
-    setenv("MOTY_POOL_SPIN", "1", 1);          /* read when the pool starts (this process) */
+    moty_par_config(0,0);
     for (int rep = 0; rep < 20000; rep++) {
         moty_par_set_threads(rep % 7 == 0 ? 2 : 4);
         atomic_llong s = 0;

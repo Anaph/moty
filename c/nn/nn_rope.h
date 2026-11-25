@@ -16,6 +16,10 @@ static inline float sigmoidf(float x) { return x > 20.f ? 1.f : x < -20.f ? 0.f 
 
 /* M3: implementazioni in nn/rope.c (libmoty-nn) */
 void moty_rope_head(float *x, int pos, float theta, int rot);
+/* Prepare on the serial caller before sharing the borrowed rows with
+ * workers. The rows remain valid until the table grows again. */
+const float *moty_rope_rows(float theta, int rot, int first, int count);
+void moty_rope_apply_row(float *x, int rot, const float *cs);
 void moty_l2norm_head(float *x, int d);
 #ifndef MOTY_CORE_NO_LEGACY
 #define rope_head   moty_rope_head

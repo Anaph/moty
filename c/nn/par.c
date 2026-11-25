@@ -52,6 +52,8 @@ void moty_par_shutdown(void) {}
 #include <time.h>
 
 #define PAR_MAX 64
+enum { PAR_TEAM_BITS = 7, PAR_TEAM_MASK = (1 << PAR_TEAM_BITS)-1 };
+_Static_assert(PAR_MAX <= PAR_TEAM_MASK,"Published team size does not fit");
 
 #if defined(__aarch64__) || defined(__arm__)
 #define cpu_relax() __asm__ __volatile__("yield" ::: "memory")
@@ -64,7 +66,7 @@ void moty_par_shutdown(void) {}
 typedef struct {                    /* one cache line per worker */
     pthread_t th;
     atomic_int sleeping;
-    unsigned start_gen;             /* `gen` when the worker was created */
+    uint64_t start_job;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     char pad[64];
@@ -77,10 +79,10 @@ static struct {
     atomic_int pin;                 /* both set by each library call while idle workers read them */
     int configured;
     atomic_int quit;                /* moty_par_shutdown */
-    /* the current region, published by `gen` */
+    /* The low bits of job carry the team size, the high bits the generation.
+     * Idle workers must decide membership from the same snapshot they claim. */
     moty_par_fn fn; void *ctx; int64_t n; int chunk;
-    atomic_int team;
-    _Alignas(64) atomic_uint gen;
+    _Alignas(64) atomic_uint_fast64_t job;
     _Alignas(64) atomic_llong next;
     _Alignas(64) atomic_int done;
     Worker w[PAR_MAX];
@@ -112,12 +114,12 @@ static void pin_to(int k) {         /* k-th CPU of the process's affinity mask *
 #endif
 }
 
-static void run_share(int tid) {
+static void run_share(int tid, int team) {
     tl_tid = tid; tl_in = 1;
     moty_par_fn fn = P.fn; void *ctx = P.ctx; int64_t n = P.n;
     if (P.chunk <= 0) {
         int64_t i0, i1;
-        moty_par_range(n, tid, atomic_load_explicit(&P.team, memory_order_relaxed), &i0, &i1);
+        moty_par_range(n, tid, team, &i0, &i1);
         if (i0 < i1) fn(ctx, i0, i1, tid);
     } else {
         for (;;) {
@@ -135,41 +137,45 @@ static void *worker(void *arg) {
     int tid = (int)(intptr_t)arg;
     Worker *me = &P.w[tid];
     if (atomic_load_explicit(&P.pin, memory_order_relaxed)) pin_to(tid);
-    /* not atomic_load(&P.gen): the region that made the caller start this
+    /* not atomic_load(&P.job): the region that made the caller start this
      * worker may be published before the thread first runs */
-    unsigned seen = me->start_gen;
+    uint64_t seen = me->start_job;
     for (;;) {
-        unsigned g = seen;
+        uint64_t job = seen;
         /* in the team: poll for the next region for spin_us, then sleep; out
          * of it (THREADS_DECODE below THREADS): sleep at once, leaving the
          * core to others. Asleep, a worker costs no CPU. */
         long spin_us = atomic_load_explicit(&P.spin_us, memory_order_relaxed);
-        if (tid < atomic_load_explicit(&P.team, memory_order_relaxed) && spin_us > 0) {
+        if (tid < (int)(seen & PAR_TEAM_MASK) && spin_us > 0) {
             double t0 = par_now_us();
             for (long i = 1;; i++) {
-                g = atomic_load_explicit(&P.gen, memory_order_acquire);
-                if (g != seen || atomic_load_explicit(&P.quit, memory_order_relaxed)) break;
+                job = atomic_load_explicit(&P.job, memory_order_acquire);
+                if (job != seen || atomic_load_explicit(&P.quit, memory_order_relaxed)) break;
                 cpu_relax();
                 if (!(i & 63) && par_now_us() - t0 > spin_us) break;
             }
         }
         if (atomic_load(&P.quit)) return NULL;
-        if (g == seen) {
+        if (job == seen) {
             pthread_mutex_lock(&me->mu);
             atomic_store(&me->sleeping, 1);             /* seq_cst: pairs with the publisher */
             for (;;) {
                 if (atomic_load(&P.quit)) { atomic_store(&me->sleeping, 0); pthread_mutex_unlock(&me->mu); return NULL; }
-                g = atomic_load(&P.gen);
-                if (g != seen) { if (tid < atomic_load(&P.team)) break; seen = g; }
+                job = atomic_load(&P.job);
+                if (job != seen) {
+                    if (tid < (int)(job & PAR_TEAM_MASK)) break;
+                    seen = job;
+                }
                 pthread_cond_wait(&me->cv, &me->mu);
             }
             atomic_store(&me->sleeping, 0);
             pthread_mutex_unlock(&me->mu);
-        } else if (tid >= atomic_load(&P.team)) {       /* a region without this worker */
-            seen = g; continue;
+        } else if (tid >= (int)(job & PAR_TEAM_MASK)) { /* a region without this worker */
+            seen = job;
+            continue;
         }
-        seen = g;
-        run_share(tid);
+        seen = job;
+        run_share(tid,(int)(job & PAR_TEAM_MASK));
         atomic_fetch_add_explicit(&P.done, 1, memory_order_release);
     }
     return NULL;
@@ -194,7 +200,7 @@ static void start_workers(int team) {
     for (int t = P.started + 1; t < team; t++) {
         Worker *w = &P.w[t];
         pthread_mutex_init(&w->mu, NULL); pthread_cond_init(&w->cv, NULL);
-        w->start_gen = atomic_load(&P.gen);
+        w->start_job = atomic_load(&P.job);
         if (pthread_create(&w->th, NULL, worker, (void *)(intptr_t)t))
             moty_fail_code(MOTY_FAIL_OOM, "moty_par: pthread_create: %s", strerror(errno));
         P.started = t;
@@ -243,15 +249,17 @@ void moty_par_for(int64_t n, int chunk, moty_par_fn fn, void *ctx) {
     if (tl_in || team == 1) { fn(ctx, 0, n, tl_tid); return; }
     if (team > P.started + 1) start_workers(team);
     P.fn = fn; P.ctx = ctx; P.n = n; P.chunk = chunk;
-    atomic_store_explicit(&P.team, team, memory_order_relaxed);
     atomic_store_explicit(&P.next, 0, memory_order_relaxed);
     atomic_store_explicit(&P.done, 0, memory_order_relaxed);
-    atomic_fetch_add(&P.gen, 1);                        /* seq_cst: publish, then look for sleepers */
+    uint64_t previous = atomic_load_explicit(&P.job,memory_order_relaxed);
+    uint64_t generation = (previous & ~(uint64_t)PAR_TEAM_MASK) + (UINT64_C(1) << PAR_TEAM_BITS);
+    /* Publish with a sequentially consistent RMW before checking sleepers. */
+    atomic_exchange(&P.job, generation | (uint64_t)team);
     for (int t = 1; t < team; t++)
         if (atomic_load(&P.w[t].sleeping)) {
             pthread_mutex_lock(&P.w[t].mu); pthread_cond_signal(&P.w[t].cv); pthread_mutex_unlock(&P.w[t].mu);
         }
-    run_share(0);
+    run_share(0,team);
     while (atomic_load_explicit(&P.done, memory_order_acquire) < team - 1) cpu_relax();
 }
 

@@ -50,7 +50,7 @@
  *  The tier strings below must be compiled with the SAME       *
  *  -march as hw.c (both come from the same CFLAGS).            *
  * ============================================================ */
-enum { WF_F32=0, WF_I8=1, WF_I4=2, WF_I2=3, WF_I4G=4, WF_Q4K=5, WF_Q6K=6, WF_Q4R4=7, WF_Q8R4=8 };
+enum { WF_F32=0, WF_I8=1, WF_I4=2, WF_I2=3, WF_I4G=4, WF_Q4K=5, WF_Q6K=6, WF_Q4R4=7, WF_Q8R4=8, WF_Q4_1=9 };
 
 #include <stdint.h>
 #include <math.h>

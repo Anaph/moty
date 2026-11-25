@@ -4,7 +4,12 @@
  * Modello sintetico con NOMI HF (Lfm2ForCausalLM, come LFM2.5-350M):
  * conv/attn alternati, QK-norm, FFN con block_auto_adjust_ff_dim. */
 #define LFM2_TEST
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#define malloc_usable_size malloc_size
+#else
 #include <malloc.h>
+#endif
 #include "../engines/lfm2.c"
 #include "tiny_st.h"
 #include "ref_dense.h"

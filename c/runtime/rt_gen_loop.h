@@ -136,7 +136,90 @@ static void prof_op_report(const char *what, int ntok, double wall) {
 #endif
 }
 
-static int gen_turn(Model *m, Tok *T, int *hist, int len, int k, int n_new, int echo, int *stopped) {
+#ifdef ENGINE_VERIFY_OK
+static float *verify_batch(Model *m, const int *ids, int n, int pos) {
+    if (pos < 0 || n <= 0 || pos > m->base.max_t-n || !ENGINE_VERIFY_OK(m)) return NULL;
+    g_all_logits = 1;
+    float *lo = step(m,ids,n,pos);
+    g_all_logits = 0;
+    return lo;
+}
+#endif
+
+#ifdef ENGINE_CLI_VERIFY
+/* Prefer the longest suffix and the nearest previous, non-overlapping
+ * match. Only propose tokens already present in the committed history. */
+static int draft_from_history(const int *hist, int end, int *draft, int limit, int confirm) {
+    int floor = end > 1024 ? end-1024 : 0;
+    for (int n = 4; n >= 2; n--) {
+        int suffix = end-n;
+        if (suffix < n+1) continue;
+        int best = 0;
+        for (int i = suffix-n-1; i >= floor; i--) {
+            if (memcmp(hist+i,hist+suffix,n*sizeof(int))) continue;
+            int count = suffix-i-n;
+            if (count > limit) count = limit;
+            if (!confirm) {
+                memcpy(draft,hist+i+n,count*sizeof(int));
+                return count;
+            }
+            if (!best) {
+                memcpy(draft,hist+i+n,count*sizeof(int));
+                best = count;
+                continue;
+            }
+            if (count > best) count = best;
+            int agreed = 0;
+            while (agreed < count && draft[agreed] == hist[i+n+agreed]) agreed++;
+            if (agreed >= 2) return agreed;
+        }
+    }
+    return 0;
+}
+
+/* Vote on the next token after the longest supported suffix, then extend
+ * the proposed suffix. Votes always come from already committed history. */
+static int draft_from_history_votes(const int *hist, int end, int *draft, int limit) {
+    enum { MAX_SUFFIX = 8, HISTORY_WINDOW = 8192 };
+    int floor = end > HISTORY_WINDOW ? end-HISTORY_WINDOW : 0;
+    int n = 0;
+    for (; n < limit; n++) {
+        int suffix[MAX_SUFFIX];
+        int size = end+n < MAX_SUFFIX ? end+n : MAX_SUFFIX;
+        for (int i = 0; i < size; i++) {
+            int k = end+n-size+i;
+            suffix[i] = k < end ? hist[k] : draft[k-end];
+        }
+        int found = 0;
+        for (int width = size; width > 0; width--) {
+            const int *tail = suffix+size-width;
+            int total = 0, votes = 0, choice = 0;
+            for (int i = end-width-1; i >= floor; i--) {
+                if (hist[i+width-1] != tail[width-1] ||
+                    memcmp(hist+i,tail,(width-1)*sizeof(int))) continue;
+                int next = hist[i+width];
+                total++;
+                if (!votes) { choice = next; votes = 1; }
+                else votes += next == choice ? 1 : -1;
+            }
+            int needed = width > 4 ? 1 : width > 1 ? 2 : 4;
+            if (total < needed) continue;
+            int matches = 0;
+            for (int i = end-width-1; i >= floor; i--)
+                if (hist[i+width] == choice && !memcmp(hist+i,tail,width*sizeof(int))) matches++;
+            if (matches*5 < total*4) continue;
+            draft[n] = choice;
+            found = 1;
+            break;
+        }
+        if (!found) break;
+    }
+    return n;
+}
+#endif
+
+static int gen_turn(Model *m, Tok *T, int *hist, int len, int k, int n_new, int echo,
+                    int one_shot, int *stopped) {
     int dump = g_tokens_dump;
     static int ignore_eos = -1;            /* IGNORE_EOS=1: fixed-length runs for benchmarks */
     if (ignore_eos < 0) ignore_eos = getenv("IGNORE_EOS") && atoi(getenv("IGNORE_EOS"));
@@ -158,12 +241,29 @@ static int gen_turn(Model *m, Tok *T, int *hist, int len, int k, int n_new, int 
     if (td < 0) td = getenv("THREADS_DECODE") ? atoi(getenv("THREADS_DECODE")) : 0;
     int th_prefill = moty_par_threads();
     if (td > 0) moty_par_set_threads(td);
+#ifdef ENGINE_CLI_VERIFY
+    /* The interactive loop can start the next prefill after an unwritten
+     * final token. Speculative rows must stay out of that physical gap. */
+    const char *look = one_shot ? moty_getenv("MOTY_Q41_LOOKAHEAD") : NULL;
+    int confirm = look && !strcmp(look,"auto");
+    int backoff = look && !strcmp(look,"backoff");
+    int draft_limit = look && !strcmp(look,"2") ? 2 : 0;
+    if (confirm || backoff || (look && !strcmp(look,"4"))) draft_limit = 4;
+    if (draft_limit && (g_temp > 0.f || !ENGINE_CLI_VERIFY_OK(m))) draft_limit = 0;
+    int draft[4], rejected[4] = {0}, proposed = 0, row = 0, batches = 0, accepted = 0, attempted = 0;
+    float *batch = NULL;
+#endif
     t0 = now_s();
     for (int s = 0; s < n_new; s++) {
         OP_T(t_s);
         int t = pick_tok(&m->base.scr, logit, m->c.vocab);
         OP_ACC(OP_SAMPLE, t_s);
-        free(logit); logit = NULL;
+#ifdef ENGINE_CLI_VERIFY
+        if (!batch) free(logit);
+#else
+        free(logit);
+#endif
+        logit = NULL;
         hist[base + ng++] = t;
         ENGINE_OBSERVE(m, t);
         if (dump) fprintf(stderr, "%d ", t);
@@ -173,12 +273,58 @@ static int gen_turn(Model *m, Tok *T, int *hist, int len, int k, int n_new, int 
             fwrite(buf, 1, bn, stdout); fflush(stdout);
         }
         if (s == n_new - 1) break;
+#ifdef ENGINE_CLI_VERIFY
+        int pos = base+ng-1;
+        if (batch) {
+            if (row < proposed && t == draft[row]) {
+                accepted++;
+                logit = batch+(int64_t)(++row)*m->c.vocab;
+                continue;
+            }
+            if (row < proposed) rejected[row]++;
+            free(batch);
+            batch = NULL;
+            m->base.kv_len = pos;    /* the first mismatch is a pending token */
+        }
+        if (draft_limit) {
+            int limit = n_new-ng;
+            if (limit > m->base.max_t-pos-1) limit = m->base.max_t-pos-1;
+            if (limit > draft_limit) limit = draft_limit;
+            proposed = 0;
+            if (limit > 0) {
+                if (backoff) proposed = draft_from_history_votes(hist,pos+1,draft,limit);
+                else proposed = draft_from_history(hist,pos+1,draft,limit,confirm);
+            }
+            if (proposed) {
+                int seq[5] = {t};
+                memcpy(seq+1,draft,proposed*sizeof(int));
+                batch = ENGINE_CLI_VERIFY(m,seq,proposed+1,pos);
+                if (batch) {
+                    batches++; attempted += proposed;
+                    row = 0; logit = batch;
+                    continue;
+                }
+            }
+        }
+#endif
         logit = step(m, &hist[base + ng - 1], 1, base + ng - 1);
         ENGINE_LOGITS_HOOK(m, logit);
     }
+#ifdef ENGINE_CLI_VERIFY
+    if (batch) {
+        free(batch);
+        logit = NULL;
+        m->base.kv_len = base+ng-1;  /* speculative suffix stays invisible */
+    }
+#endif
     if (logit) free(logit);
     if (dump) fprintf(stderr, "\n");
     double tgen = now_s() - t0;
+#ifdef ENGINE_CLI_VERIFY
+    if (draft_limit)
+        fprintf(stderr,"[q41-lookahead] %d batches, %d/%d proposals accepted; first mismatches %d/%d/%d/%d\n",
+                batches,accepted,attempted,rejected[0],rejected[1],rejected[2],rejected[3]);
+#endif
     if (td > 0) moty_par_set_threads(th_prefill);
     prof_op_report("decode", ng, tgen);
     fprintf(stderr, "\n[" ENGINE_TAG "] prefill %d tok in %.2fs (%.1f tok/s) | decode %d tok in %.2fs (%.2f tok/s) | RSS %.2f GB\n",

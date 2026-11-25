@@ -8,6 +8,19 @@
 #define NN_ATTN_KERNELS_H
 #include <stdint.h>
 
+struct Scratch;
+void moty_attn_prefill_group(float *out, int stride, const float *q,
+                            float *const *scores, const float *k, const float *v,
+                            int n, int count, float scale);
+void moty_att_scores_kv4_pair(float *s0, float *s1, const float *q0, const float *q1,
+                              const float *k, int n, float scale);
+void moty_att_scores_kv4(float *scores, const float *q, const float *k, int n, float scale);
+int moty_attn_gqa64_decode_batch(float *out, const float *q, const float *k, const float *v,
+                                int kv_heads, int stride, int visible, int n, float scale, struct Scratch *scratch);
+int moty_attn_gqa64_layout(float *out, const float *q, const float *k, const float *v,
+                           int kv_heads, int kv_stride, int visible, float scale, struct Scratch *scratch, int kv4);
+int moty_attn_gqa64(float *out, const float *q, const float *k, const float *v,
+                   int kv_heads, int kv_stride, int visible, float scale, struct Scratch *scratch);
 
 
 

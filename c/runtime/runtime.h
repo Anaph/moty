@@ -20,6 +20,9 @@ static void load_cfg(Cfg *c, const char *snap);
 static void load_small(Model *m);
 static int layer_matrefs(Model *m, int li, MatRef *r);
 static int64_t fixed_bytes(Model *m, int ctx);
+#ifdef ENGINE_Q41_STREAM
+static void qwen_q41_stream_open(Model *m, int64_t budget, int ctx);
+#endif
 static float *step(Model *m, const int *ids, int S, int pos_base);
 static void kv_alloc(Model *m, int max_t);
 static void state_reset(Model *m);
@@ -38,6 +41,9 @@ static void banner(Model *m);
  * il motore puo' caricare stato extra (es. adattatori LoRA) */
 #ifndef ENGINE_POST_INIT
 #define ENGINE_POST_INIT(m) ((void)0)
+#endif
+#ifndef ENGINE_CLI_CLEANUP
+#define ENGINE_CLI_CLEANUP(m) ((void)0)
 #endif
 /* il motore dichiara ENGINE_MICRO 1 se il suo step() sa girare senza embed
  * residente (gather per riga dal disco). Senza dichiarazione MICRO=1 fallisce
@@ -109,6 +115,15 @@ static void cfg_common(jval *r, Cfg *c) {
 #include "runtime/rt_gen_loop.h"
 #include "runtime/rt_env_cfg.h"
 
+static void cli_release_gguf_metadata(Model *m) {
+#if defined(__APPLE__) && defined(ENGINE_Q41_PANELS)
+    if (g_gguf && m->base.qbits == -1 && gguf_find(&g_gguf_meta,"pocket.qat_conversion"))
+        gguf_release_mapped_metadata(&m->S,&g_gguf_meta);
+#else
+    (void)m;
+#endif
+}
+
 #ifdef ENGINE_API_ID
 static int cli_api_oneshot(void);
 #endif
@@ -177,9 +192,12 @@ static int engine_main(int argc, char **argv) {
         fprintf(stderr, "[" ENGINE_TAG "] EMBEDS: %d rows for token %d\n", m.base.inj_n, m.base.inj_tok);
     }
     const char *refpath = getenv("REF");
-    if (refpath) return run_ref(&m, refpath);
     const char *pplpath = getenv("PPL");
-    if (pplpath && *pplpath) return run_ppl(&m, pplpath);
+    if (refpath || (pplpath && *pplpath)) {
+        int rc = refpath ? run_ref(&m,refpath) : run_ppl(&m,pplpath);
+        ENGINE_CLI_CLEANUP(&m);
+        return rc;
+    }
     /* after REF/PPL: validation and perplexity always use the full head */
     static MotyHeadSL head_sl;
     if (g_head_topk > 0) {
@@ -190,11 +208,18 @@ static int engine_main(int argc, char **argv) {
         } else fprintf(stderr, "[" ENGINE_TAG "] HEAD_TOPK ignored: needs a Q4R4 lm_head (QBITS=4 Q4FMT=r4)\n");
     }
 
+    const char *pids = getenv("PROMPT_IDS");
+    const char *prompt = getenv("PROMPT");
     Tok T;
-    if (g_gguf) tok_load_gguf(&T, &g_gguf_meta);   /* single-file: vocab/merges dai metadati */
-    else {
+    if (g_gguf) {
+        int tok_mode = TOK_GGUF_FULL;
+        if (pids && *pids) tok_mode = TOK_GGUF_DECODE_ONLY;
+        else if (prompt) tok_mode = TOK_GGUF_ONE_SHOT;
+        tok_load_gguf_mode(&T,&g_gguf_meta,tok_mode);
+    } else {
         char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
         tok_load(&T, tokpath);
+        tok_load_snapshot_chat_template(&T, snap);
     }
     stops_seed(&m, &T);
     for (int i = 0; i < m.c.n_eos; i++) stop_add(m.c.eos[i]);
@@ -202,33 +227,44 @@ static int engine_main(int argc, char **argv) {
 
     kv_alloc(&m, maxctx);
     int *hist = malloc(maxctx * sizeof(int));
-    char *buf = malloc(1<<16);
 
     /* PROMPT_IDS=<json {"ids":[...]}>: a ready token sequence (e.g. a
      * processor's expansion of text + image placeholders), no template */
-    const char *pids = getenv("PROMPT_IDS");
     if (pids && *pids) {
-        char *jb = slurp_file(pids, NULL); jval *jr = jb ? json_parse(jb) : NULL;
-        int k = 0; int *ids = jr ? read_int_array(jr, "ids", &k) : NULL;
-        if (!ids || k <= 0 || k + 2 > maxctx) { fprintf(stderr, "[" ENGINE_TAG "] PROMPT_IDS %s: need {\"ids\":[...]} within CTX\n", pids); return 1; }
-        memcpy(hist, ids, k * sizeof(int));
+        char *jb = slurp_file(pids, NULL);
+        jval *jr = jb ? json_parse(jb) : NULL;
+        const jval *ids = json_get(jr, "ids");
+        int k = ids && ids->t == J_ARR ? ids->len : 0;
+        int valid = k > 0 && k <= maxctx - 2;
+        if (valid)
+            for (int i = 0; i < k; i++) hist[i] = (int)ids->kids[i]->num;
+        json_free(jr);
+        free(jb);
+        if (!valid) {
+            fprintf(stderr, "[" ENGINE_TAG "] PROMPT_IDS %s: need {\"ids\":[...]} within CTX\n", pids);
+            return 1;
+        }
         int cur = ngen; if (k + cur + 1 > maxctx) cur = maxctx - k - 1;
         int stopped;
-        gen_turn(&m, &T, hist, 0, k, cur, 1, &stopped);
+        cli_release_gguf_metadata(&m);
+        gen_turn(&m, &T, hist, 0, k, cur, 1, 1, &stopped);
         printf("\n");
+        ENGINE_CLI_CLEANUP(&m);
         return 0;
     }
-    const char *prompt = getenv("PROMPT");
+    char *buf = malloc(1<<16);
     if (prompt) {                                   /* one-shot */
         int bl = templ ? build_turn(&T, buf, 1<<16, prompt)
                        : snprintf(buf, 1<<16, "%s", prompt);
         int k = 0;
         if (T.bos_id >= 0) hist[k++] = T.bos_id;    /* HF add_special_tokens=True */
         k += tok_encode(&T, buf, bl, hist + k, maxctx - 2 - k);
+        if (g_gguf) tok_release_encoder(&T);
         int cur = ngen; if (k + cur + 1 > maxctx) cur = maxctx - k - 1;
         int stopped;
-        gen_turn(&m, &T, hist, 0, k, cur, 1, &stopped);
+        gen_turn(&m, &T, hist, 0, k, cur, 1, 1, &stopped);
         printf("\n");
+        ENGINE_CLI_CLEANUP(&m);
         return 0;
     }
 
@@ -256,13 +292,14 @@ static int engine_main(int argc, char **argv) {
         }
         int cur = ngen; if (len + k + cur + 1 > maxctx) cur = maxctx - len - k - 1;
         int stopped;
-        int ng = gen_turn(&m, &T, hist, len, k, cur, 1, &stopped);
+        int ng = gen_turn(&m, &T, hist, len, k, cur, 1, 0, &stopped);
         len += k + ng;
         /* chiude il blocco assistant nel transcript: i token del suffisso entrano
          * in KV col prefill del turno successivo */
         const char *suffix = stopped ? "\n" : ENGINE_EOT;
         len += tok_encode(&T, suffix, (int)strlen(suffix), hist + len, maxctx - len);
     }
+    ENGINE_CLI_CLEANUP(&m);
     return 0;
 }
 
@@ -310,7 +347,13 @@ static void *eng_open(const char *dir, const MotyEngineOpen *o) {
         e->m.base.head_sl = &e->head_sl;
     char p[2048]; snprintf(p, sizeof p, "%s/tokenizer.json", dir);
     FILE *tf = fopen(p, "rb");
-    if (tf) { fclose(tf); tok_load(&e->T, p); e->has_tok = 1; stops_seed(&e->m, &e->T); }
+    if (tf) {
+        fclose(tf);
+        tok_load(&e->T, p);
+        tok_load_snapshot_chat_template(&e->T, dir);
+        e->has_tok = 1;
+        stops_seed(&e->m, &e->T);
+    }
     LP_MARK(&e->m, LP_TOK, tp);
     for (int i = 0; i < e->m.c.n_eos; i++) stop_add(e->m.c.eos[i]);
     for (int i = 0; i < g_nstop && e->nstop < 16; i++) e->stops[e->nstop++] = g_stop[i];
@@ -374,11 +417,7 @@ static float *eng_step(void *p, int tok, int pos) { g_all_logits = 0; return ste
 static float *eng_verify(void *p, const int *ids, int n, int pos) {
 #ifdef ENGINE_VERIFY_OK
     EngInst *e = p;
-    if (!ENGINE_VERIFY_OK(&e->m)) return NULL;
-    g_all_logits = 1;
-    float *lo = step(&e->m, ids, n, pos);
-    g_all_logits = 0;
-    return lo;
+    return verify_batch(&e->m,ids,n,pos);
 #else
     (void)p; (void)ids; (void)n; (void)pos;
     return NULL;

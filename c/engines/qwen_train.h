@@ -239,10 +239,10 @@ static void train_forward(Model *m, const int *ids, int S, LStash *st, int L0, f
         Layer *l = &m->L[i];
         if (i < L0) {
             for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s * D, x + (int64_t)s * D, l->in_ln, D, c->eps);
-            attention(m, l, i, nrm, S, 0, tmp);
+            attention(m, l, i, nrm, S, 0, tmp, NULL);
             for (int64_t j = 0; j < (int64_t)S * D; j++) x[j] += tmp[j];
             for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s * D, x + (int64_t)s * D, l->post_ln, D, c->eps);
-            mlp(m, l, nrm, S, tmp);
+            mlp(m, l, nrm, S, tmp, NULL, -1);
             for (int64_t j = 0; j < (int64_t)S * D; j++) x[j] += tmp[j];
         } else {
             t_layer_forward(m, l, i, x, S, &st[i - L0]);

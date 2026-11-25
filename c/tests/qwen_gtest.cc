@@ -26,8 +26,18 @@ int qt_memknob_env(void);
 int qt_memknob_q8_parity(void);
 int qt_gguf_tiny_parity(void);
 int qt_gguf_q4_0_load(void);
+int qt_gguf_q4_1_native(void);
+int qt_q41_stream_budget(void);
+int qt_q41_ffn(void);
+int qt_q41_panel_cache(void);
+int qt_q41_qkv(void);
+int qt_gqa_decode_tail(void);
+int qt_q41_causal_prefill_group(void);
+int qt_q41_history_draft(void);
+int qt_gqa_batch_exact(void);
 int qt_kv_i8_roundtrip(void);
 int qt_kv_i8_tolerance(void);
+int qt_prefill_workspace(void);
 int qt_kv_i8_hybrid(void);
 int qt_prefill_chunk(void);
 int qt_prefill_chunk_tta(void);
@@ -77,8 +87,18 @@ C_TEST(QwenMemKnob,  EnvPrecedence,       qt_memknob_env)
 C_TEST(QwenMemKnob,  StreamInt8Parity,    qt_memknob_q8_parity)
 C_TEST(QwenGguf,     TinyParity,          qt_gguf_tiny_parity)
 C_TEST(QwenGguf,     Q40LoadPaths,        qt_gguf_q4_0_load)
+C_TEST(QwenGguf,     Q41Native,           qt_gguf_q4_1_native)
+C_TEST(QwenGguf,     Q41StreamBudget,     qt_q41_stream_budget)
+C_TEST(QwenGguf,     Q41FusedFfn,         qt_q41_ffn)
+C_TEST(QwenGguf,     Q41PanelCache,       qt_q41_panel_cache)
+C_TEST(QwenGguf,     Q41JointQkv,         qt_q41_qkv)
+C_TEST(QwenGqa,      DecodeBlocks,        qt_gqa_decode_tail)
+C_TEST(QwenGqa,      CausalPrefillGroup,  qt_q41_causal_prefill_group)
+C_TEST(QwenGqa,      BatchExact,          qt_gqa_batch_exact)
+C_TEST(QwenGguf,     Q41HistoryDraft,      qt_q41_history_draft)
 C_TEST(QwenKv8,      RowRoundtrip,        qt_kv_i8_roundtrip)
 C_TEST(QwenKv8,      LogitsTolerance,     qt_kv_i8_tolerance)
+C_TEST(QwenPrefill,  WorkspaceExact,      qt_prefill_workspace)
 C_TEST(QwenKv8,      HybridLayout,        qt_kv_i8_hybrid)
 C_TEST(QwenPrefill,  ChunkBitExact,       qt_prefill_chunk)
 C_TEST(QwenPrefill,  ChunkTtaStash,       qt_prefill_chunk_tta)

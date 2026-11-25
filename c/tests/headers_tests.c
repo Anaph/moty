@@ -155,6 +155,50 @@ int ht_gguf_q40_q80(void) {
     return 0;
 }
 
+int ht_gguf_q4_1(void) {
+    char path[512]; ht_gguf_tmp("q4_1", path, sizeof(path));
+    const uint16_t scales[2] = { 0x3800, 0x4000 };   /* 0.5, 2 */
+    const uint16_t mins[2] = { 0xC000, 0x3C00 };     /* -2, 1 */
+    uint8_t blocks[2][20];
+    for (int b = 0; b < 2; b++) {
+        memcpy(blocks[b], &scales[b], 2);
+        memcpy(blocks[b] + 2, &mins[b], 2);
+        for (int i = 0; i < 16; i++) blocks[b][4 + i] = (uint8_t)(i | ((15 - i) << 4));
+    }
+    tg_reset();
+    tg_kv_str("general.architecture", "qwen3");
+    int64_t dims[] = { 32, 2 };
+    tg_tensor("token_embd.weight", 3, 2, dims, blocks, sizeof(blocks));
+    tg_write(path);
+    tg_reset();
+
+    shards S; GgufMeta M;
+    gguf_index(&S, &M, path);
+    const char *name = "model.embed_tokens.weight";
+    CHECK(st_dtype(&S, name) == ST_Q4_1);
+    CHECK(st_nbytes(&S, name) == sizeof(blocks));
+    float out[64], second[32];
+    st_read_f32(&S, name, out, 0);
+    st_read_slice_f32(&S, name, 32, 32, second, 0);
+    for (int i = 0; i < 16; i++) {
+        CHECK(out[i]      == 0.5f * i - 2.f);
+        CHECK(out[i + 16] == 0.5f * (15 - i) - 2.f);
+        CHECK(out[i + 32] == 2.f * i + 1.f);
+        CHECK(out[i + 48] == 2.f * (15 - i) + 1.f);
+    }
+    CHECK(!memcmp(out + 32, second, sizeof(second)));
+    st_close_fds(&S);
+    free(S.t[0].name);
+    free(S.paths[0]);
+    free(S.t);
+    free(S.hidx);
+    free(M.kv[0].key);
+    free(M.kv);
+    free(M.hdr);
+    remove(path);
+    return 0;
+}
+
 /* K-quants: superblocchi costruiti a mano vs riferimento per-elemento */
 int ht_gguf_kquants(void) {
     float out[256];
@@ -296,6 +340,7 @@ int ht_tok_gguf(void) {
     char gpath[512]; ht_gguf_tmp("tok", gpath, sizeof(gpath));
     tg_reset();
     tg_kv_str("tokenizer.ggml.model", "gpt2");
+    tg_kv_str("tokenizer.chat_template", "{{ '<|im_start|>assistant\\n' }}");
     /* stesso vocabolario di TOK_FIX_STRINGS: id = indice; "Ġ" = C4 A0 */
     static const char *toks[10] = { "h","e","l","o","\xC4\xA0","he","ll","hell","hello","<|endoftext|>" };
     tg_kv_arr_str("tokenizer.ggml.tokens", toks, 10);
@@ -303,11 +348,28 @@ int ht_tok_gguf(void) {
     tg_kv_arr_i32("tokenizer.ggml.token_type", types, 10);
     static const char *mrg[4] = { "h e", "l l", "he ll", "hell o" };
     tg_kv_arr_str("tokenizer.ggml.merges", mrg, 4);
+#ifdef __APPLE__
+    long page=sysconf(_SC_PAGESIZE);
+    CHECK(page>0);
+    int pad_count=(int)(page/(long)sizeof(int32_t)) + 1;
+    int32_t *pad=calloc(pad_count,sizeof(*pad));
+    CHECK(pad);
+    tg_kv_arr_i32("test.padding",pad,pad_count);
+    free(pad);
+    const float weight=1.25f;
+    tg_tensor_f32("token_embd.weight",1,1,&weight);
+    int prev_map=g_st_map;
+    g_st_map=1;
+#endif
     tg_write(gpath);
     shards S; GgufMeta M;
     gguf_index(&S, &M, gpath);
     Tok G; tok_load_gguf(&G, &M);
+    Tok D; tok_load_gguf_mode(&D,&M,TOK_GGUF_DECODE_ONLY);
     CHECK(G.n_ids == 10 && G.nsp == 1 && G.sp[0].id == 9);
+    CHECK(!D.vocab.e && !D.merges.e && D.pool_len < G.pool_len);
+    CHECK(tok_id_of(&D,"<|endoftext|>") == 9);
+    CHECK(G.chat_omits_think);
     CHECK(G.pool_off == G.pool_len);                       /* sizing esatto */
     /* riferimento: la stessa fixture via tokenizer.json */
     char jpath[512];
@@ -323,9 +385,32 @@ int ht_tok_gguf(void) {
         int lg = tok_decode(&G, ig, ng, dg, 63);
         int lj = tok_decode(&J, ij, nj, dj, 63);
         CHECK(lg == lj && memcmp(dg, dj, lg) == 0);
+        CHECK(tok_decode(&D,ig,ng,dj,63) == lg && !memcmp(dg,dj,lg));
     }
     CHECK(tok_id_of(&G, "<|endoftext|>") == 9);
-    tok_free(&G); tok_free(&J);
+    Tok P; tok_load_gguf_mode(&P,&M,TOK_GGUF_ONE_SHOT);
+    CHECK(P.merge_separator == ' ' && P.pool_len == D.pool_len);
+    int ip[64], ig[64], len=(int)strlen(cases[1]);
+    int np=tok_encode(&P,cases[1],len,ip,64);
+    int ng=tok_encode(&G,cases[1],len,ig,64);
+    CHECK(np == ng && !memcmp(ip,ig,np*sizeof(int)));
+    tok_release_encoder(&P);
+    CHECK(!P.vocab.e && !P.merges.e);
+    CHECK(tok_id_of(&P,"<|endoftext|>") == 9);
+    char dp[64], dg[64];
+    int lg=tok_decode(&G,ig,ng,dg,63);
+    CHECK(tok_decode(&P,ip,np,dp,63) == lg && !memcmp(dp,dg,lg));
+    tok_free(&G); tok_free(&J); tok_free(&D); tok_free(&P);
+#ifdef __APPLE__
+    const float *mapped=st_map(&S,"model.embed_tokens.weight",1);
+    CHECK(mapped && *mapped==weight);
+    CHECK(gguf_release_mapped_metadata(&S,&M) && !M.kv && !M.nkv);
+    CHECK(st_map(&S,"model.embed_tokens.weight",1)==mapped && *mapped==weight);
+    g_st_map=prev_map;
+#endif
+    st_close_fds(&S);
+    for (int i = 0; i < M.nkv; i++) free(M.kv[i].key);
+    free(M.kv); free(M.hdr); free(S.t); free(S.hidx); free(S.paths[0]);
     g_st_dequant_fn = NULL;
     remove(gpath); remove(jpath);
     return 0;

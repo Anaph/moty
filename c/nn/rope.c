@@ -1,6 +1,7 @@
 /* rope.c — M3 libmoty-nn */
 #include "nn/nn_rope.h"
 #include "nn/par.h"
+#include <limits.h>
 
 void moty_l2norm_head(float *x, int d) {
     double s = 0; for (int i = 0; i < d; i++) s += (double)x[i] * x[i];
@@ -36,14 +37,34 @@ static const float *rope_row(float theta, int rot, int pos) {
     return t->cs + (size_t)pos * rot;
 }
 
+const float *moty_rope_rows(float theta, int rot, int first, int count) {
+    if (moty_par_active() || first < 0 || rot <= 0 || count < 1 ||
+        count-1 > INT_MAX/2-first) return NULL;
+    const float *last = rope_row(theta,rot,first+count-1);
+    return last ? last-(size_t)(count-1)*rot : NULL;
+}
+
+static inline void rope_rotate(float *x, int half, int i, float c, float s) {
+    float a = x[i], b = x[i+half];
+    x[i] = a * c - b * s;
+    x[i+half] = a * s + b * c;
+}
+
+void moty_rope_apply_row(float *x, int rot, const float *cs) {
+    int half = rot/2;
+    for (int i = 0; i < half; i++) rope_rotate(x,half,i,cs[2*i],cs[2*i+1]);
+}
+
 void moty_rope_head(float *x, int pos, float theta, int rot) {
     const float *cs = (!moty_par_active() && pos >= 0) ? rope_row(theta, rot, pos) : NULL;
-    for (int i = 0; i < rot / 2; i++) {
+    int half = rot/2;
+    for (int i = 0; i < half; i++) {
         float c, s;
         if (cs) { c = cs[2*i]; s = cs[2*i+1]; }
-        else { float angle = pos / powf(theta, (float)(2 * i) / rot); c = cosf(angle); s = sinf(angle); }
-        float a = x[i], b = x[i + rot / 2];
-        x[i] = a * c - b * s;
-        x[i + rot / 2] = a * s + b * c;
+        else {
+            float angle = pos / powf(theta, (float)(2 * i) / rot);
+            c = cosf(angle); s = sinf(angle);
+        }
+        rope_rotate(x,half,i,c,s);
     }
 }

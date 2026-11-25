@@ -85,7 +85,65 @@ typedef struct {
 } Layer;
 
 typedef struct {
+    Mat *mat;
+    const st_tensor *tensor;
+    int check_group64, resident;
+#if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
+    int raw_gs, panel_fd, panel_verified;
+    int64_t panel_bytes;
+    uint64_t panel_hash, panel_version;
+#endif
+} QwenQ41Input;
+
+typedef struct {
+    QwenQ41Input ffn[3];
+    int64_t bytes;
+} QwenQ41Layer;
+
+#if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
+typedef struct {
+    uint8_t *address;
+    size_t capacity, page_size;
+    int writable;
+} QwenQ41FileWindow;
+#endif
+
+typedef struct {
+    const st_tensor *tensor;
+    uint8_t *dst;
+    int error;
+#if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
+    const QwenQ41Input *panel;
+    QwenQ41FileWindow *file_window;
+    uint8_t *copy_dst;
+    int packed, map_panel;
+#endif
+} QwenQ41Read;
+
+#ifdef __APPLE__
+typedef struct QwenQ41Queue QwenQ41Queue;
+enum { Q41_READERS = 4, Q41_WINDOWS = 3, Q41_MAX_WINDOWS = 4,
+       Q41_FFN_MATRICES = 3, Q41_ATTN_MATRICES = 4 };
+#endif
+
+typedef struct {
     MODEL_COMMON_FIELDS;                   /* contratto con runtime.h (nn.h) */
+    QwenQ41Layer *q41_layers;
+    uint8_t *q41_window;
+    int64_t q41_window_bytes;
+    int q41_window_count, q41_prefill_panels;
+#ifdef __APPLE__
+    QwenQ41Queue *q41_queue;
+#endif
+#if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
+    const st_tensor *(*q41_attention)[4];
+    uint8_t *q41_attention_raw;
+    int q41_attention_group64;
+#endif
+    int kv4;
+    float *kv4_scores, *pp_scores;
+    int pp_attn, exact_batch;
+    int prefill_workspace, prefill_parallel, auto_prefill_chunk;
     Lora lm_lora;                          /* adattatore LoRA sull'lm_head (r=0 = spento) */
 } Model;
 
@@ -109,9 +167,20 @@ static void qwen_fuse(Model *m);
  * plain one (no shortlist, no online adapter, no TTA, all layers resident) */
 #define ENGINE_VERIFY_OK(m) qwen_verify_ok(m)
 static int qwen_verify_ok(Model *m);
+#define ENGINE_CLI_VERIFY_OK(m) qwen_cli_verify_ok(m)
+#define ENGINE_CLI_VERIFY(m, ids, n, pos) qwen_cli_verify((m),(ids),(n),(pos))
+static int qwen_cli_verify_ok(Model *m);
+static float *qwen_cli_verify(Model *m, const int *ids, int n, int pos);
+
 #define ENGINE_API_ID qwen
 #define ENGINE_API_TYPES "qwen3", "qwen2", "llama"
 
+#define ENGINE_Q41_PANELS 1
+#define ENGINE_Q41_STREAM 1
+#ifdef __APPLE__
+static void qwen_q41_stream_close(Model *m);
+#define ENGINE_CLI_CLEANUP(m) qwen_q41_stream_close(m)
+#endif
 #include "runtime/runtime.h"
 
 enum { TTA_OFF = 0, TTA_CACHE = 1, TTA_BIAS = 2, TTA_LORA = 3 };
@@ -509,6 +578,8 @@ static int64_t fixed_bytes(Model *m, int ctx) {
                           : rows*c->head_dim*4;
 }
 
+#include "qwen_q41_stream.h"
+
 /* azzera gli stati ricorrenti dei layer lineari (inizio generazione / reset
  * contesto) e lo stato TTA: l'adattamento non sopravvive al reset. */
 static void state_reset(Model *m) {
@@ -539,8 +610,29 @@ static void qwen_att_part(void *c_, int64_t r0, int64_t r1, int tid) {
         int qpos = c->pos_base + s;
         const float *qv = c->q + s*c->qw + (int64_t)hh*hd;
         int64_t kvbase = (int64_t)kvh * m->base.max_t;
+        int pp = m->pp_attn;
+        if (pp && hd == 64 && !m->kv4 && !c->kv8 && r1-r >= pp && c->S-s >= pp) {
+            float *scores[4] = {sc};
+            int64_t extra = (int64_t)tid*(pp-1)*m->base.max_t;
+            for (int j = 1; j < pp; j++) scores[j] = m->pp_scores+extra+(int64_t)(j-1)*m->base.max_t;
+            moty_attn_prefill_group(c->ctx+s*c->qw+(int64_t)hh*hd,(int)c->qw,qv,scores,
+                                    m->base.K[layer]+kvbase*hd,m->base.V[layer]+kvbase*hd,
+                                    qpos+1,pp,c->scale);
+            r += pp-1;
+            continue;
+        }
         if (c->kv8) att_scores_i8(sc, qv, m->base.K8[layer], m->base.Ks[layer], kvbase, 0, qpos, hd, c->scale);
-        else        att_scores_f32(sc, qv, m->base.K[layer], kvbase, 0, qpos, hd, c->scale);
+        else if (m->kv4) {
+            int64_t stride = ((int64_t)m->base.max_t+3)&~INT64_C(3);
+            const float *key = m->base.K[layer]+kvh*stride*hd;
+            if (m->kv4_scores && r+1 < r1 && s+1 < c->S) {
+                float *sc1 = m->kv4_scores+(int64_t)tid*m->base.max_t;
+                moty_att_scores_kv4_pair(sc,sc1,qv,qv+c->qw,key,qpos+1,c->scale);
+                softmax_row(sc1,qpos+2);
+                att_accum_f32(c->ctx+(s+1)*c->qw+(int64_t)hh*hd,sc1,m->base.V[layer],kvbase,0,qpos+1,hd);
+                r++;
+            } else moty_att_scores_kv4(sc,qv,key,qpos+1,c->scale);
+        } else att_scores_f32(sc, qv, m->base.K[layer], kvbase, 0, qpos, hd, c->scale);
         softmax_row(sc, qpos+1);
         float *cx = c->ctx + s*c->qw + (int64_t)hh*hd;
         if (c->kv8) att_accum_i8(cx, sc, m->base.V8[layer], m->base.Vs[layer], kvbase, 0, qpos, hd);
@@ -548,12 +640,59 @@ static void qwen_att_part(void *c_, int64_t r0, int64_t r1, int tid) {
     }
 }
 
-static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
+static float *qwen_rows_alloc(Scratch *work, int64_t n) {
+    return work ? scr_take(work,n*sizeof(float)) : falloc(n);
+}
+
+/* A layer reuses the same frame for attention and FFN. The caller reserves
+ * the whole frame before taking any pointers, including the residuals. */
+static void qwen_rows_release(Scratch *work, int64_t mark, float *a, float *b,
+                              float *c, float *d) {
+    if (work) work->used = mark;
+    else { free(a); free(b); free(c); free(d); }
+}
+
+typedef struct {
+    Model *m;
+    const Layer *layer;
+    float *q, *k;
+    const float *v, *rope;
+    int pos, li;
+} QwenPrefillKeys;
+
+static void qwen_prefill_keys(void *arg, int64_t first, int64_t end, int tid) {
+    (void)tid;
+    const QwenPrefillKeys *j = arg;
+    const Model *m = j->m;
+    const Cfg *c = &m->c;
+    const int hd = c->head_dim, heads = c->n_heads, kv = c->n_kv_heads;
+    for (int64_t s = first; s < end; s++) {
+        const float *rope = j->rope+s*c->rot;
+        for (int h = 0; h < heads; h++) {
+            float *row = j->q+(s*heads+h)*hd;
+            if (j->layer->qn) rmsnorm_row(row,row,j->layer->qn,hd,c->eps);
+            moty_rope_apply_row(row,c->rot,rope);
+        }
+        for (int h = 0; h < kv; h++) {
+            float *row = j->k+(s*kv+h)*hd;
+            if (j->layer->kn) rmsnorm_row(row,row,j->layer->kn,hd,c->eps);
+            moty_rope_apply_row(row,c->rot,rope);
+            int64_t slot = (int64_t)h*m->base.max_t+j->pos+s;
+            memcpy(m->base.K[j->li]+slot*hd,row,hd*sizeof(float));
+            memcpy(m->base.V[j->li]+slot*hd,j->v+(s*kv+h)*hd,hd*sizeof(float));
+        }
+    }
+}
+
+static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out, Scratch *work) {
+    int64_t mark = work ? work->used : 0;
     Cfg *c = &m->c;
     int H = c->n_heads, KV = c->n_kv_heads, hd = c->head_dim;
     int G = H / KV;                       /* teste query per testa kv */
     int64_t qw = (int64_t)H*hd, kw = (int64_t)KV*hd;
     float *q, *gate = NULL;
+    float *k = qwen_rows_alloc(work,S*kw), *vv = qwen_rows_alloc(work,S*kw);
+    int joint_qkv = 0;
     OP_T(t_qkv);
     if (l->gated) {
         float *qg = falloc(S*2*qw);
@@ -567,11 +706,15 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
         free(qg);
     } else {
-        q = falloc(S*qw);
-        if (!l->qkv.q4) mat_apply(q, x, &l->q, S);
+        q = qwen_rows_alloc(work,S*qw);
+        if (!l->qkv.q4) {
+            float *const out_qkv[] = { q, k, vv };
+            const Mat *const proj[] = { &l->q, &l->k, &l->v };
+            joint_qkv = l->q.fmt == WF_Q4_1 && moty_q41_qkv(out_qkv, x, proj, S);
+            if (!joint_qkv) mat_apply(q, x, &l->q, S);
+        }
         if (l->lo) lora_apply(&l->lo->q, q, x, S, l->q.I, l->q.O);
     }
-    float *k = falloc(S*kw), *vv = falloc(S*kw);
     if (l->qkv.q4) {                        /* fused [q|k|v] (qwen_fuse): one GEMV, split per token */
         float *qkvb = falloc((int64_t)S*(qw + 2*kw));
         mat_apply(qkvb, x, &l->qkv, S);
@@ -582,7 +725,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             memcpy(vv + (int64_t)s*kw, r + qw + kw, kw*sizeof(float));
         }
         free(qkvb);
-    } else {
+    } else if (!joint_qkv) {
         mat_apply(k,  x, &l->k, S);
         mat_apply(vv, x, &l->v, S);
     }
@@ -593,7 +736,14 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     OP_ACC(OP_QKV, t_qkv);
     /* qk-norm PER TESTA (Qwen3), poi RoPE per testa */
     OP_T(t_qk);
-    for (int s = 0; s < S; s++) {
+    int kv8 = m->base.K8[layer] != NULL;
+    const float *rope = m->prefill_parallel && S >= 128 && !kv8 && !m->kv4
+                      ? moty_rope_rows(c->theta,c->rot,pos_base,S) : NULL;
+    if (rope) {
+        QwenPrefillKeys job = {m,l,q,k,vv,rope,pos_base,layer};
+        moty_par_for(S,0,qwen_prefill_keys,&job);
+    }
+    for (int s = 0; !rope && s < S; s++) {
         int pos = pos_base + s;
         for (int hh = 0; hh < H; hh++) {
             float *qh = q + s*qw + (int64_t)hh*hd;
@@ -609,24 +759,47 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     OP_ACC(OP_QKNORM_ROPE, t_qk);
     /* scrive k,v nella kv-cache alle posizioni pos_base..pos_base+S-1 */
     OP_T(t_kv);
-    int kv8 = m->base.K8[layer] != NULL;           /* KV_BITS=8 su questo layer */
-    for (int s = 0; s < S; s++) for (int hh = 0; hh < KV; hh++) {
+    for (int s = 0; !rope && s < S; s++) for (int hh = 0; hh < KV; hh++) {
         int t = pos_base + s;
         int64_t slot = (int64_t)hh*m->base.max_t + t;
         if (kv8) {
             kv_store_row(m->base.K8[layer] + slot*hd, &m->base.Ks[layer][slot], k + s*kw + (int64_t)hh*hd, hd);
             kv_store_row(m->base.V8[layer] + slot*hd, &m->base.Vs[layer][slot], vv + s*kw + (int64_t)hh*hd, hd);
         } else {
-            memcpy(m->base.K[layer] + slot*hd, k + s*kw + (int64_t)hh*hd, hd*sizeof(float));
+            const float *src = k + s*kw + (int64_t)hh*hd;
+            if (m->kv4) {
+                int64_t stride = ((int64_t)m->base.max_t+3)&~INT64_C(3);
+                float *dst = m->base.K[layer]+(hh*stride+(t&~3))*hd;
+                int lane = t%4;
+                if (!lane) memset(dst,0,4*hd*sizeof(float));
+                for (int d = 0; d < hd; d++) dst[4*d+lane] = src[d];
+            } else memcpy(m->base.K[layer]+slot*hd,src,hd*sizeof(float));
             memcpy(m->base.V[layer] + slot*hd, vv + s*kw + (int64_t)hh*hd, hd*sizeof(float));
         }
     }
     OP_ACC(OP_KV_STORE, t_kv);
     OP_T(t_at);
     float scale = 1.f / sqrtf((float)hd);
-    float *ctx = falloc(S*qw);
+    float *ctx = qwen_rows_alloc(work,S*qw);
     QAttJob aj = { m, q, ctx, S, G, hd, layer, pos_base, kv8, qw, scale };
-    moty_par_for((int64_t)H*S, 0, qwen_att_part, &aj);
+    int block_decode = hd == 64 && G == 7 && !kv8 && m->base.lm_head.fmt == WF_Q4_1;
+    if (m->exact_batch && S > 1) {
+        int batched = block_decode && !m->kv4 &&
+                     moty_attn_gqa64_decode_batch(ctx,q,m->base.K[layer],m->base.V[layer],KV,
+                                                  m->base.max_t,pos_base+1,S,scale,&m->base.bscr);
+        for (int s = 0; !batched && s < S; s++) {
+            const float *query = q+(int64_t)s*qw;
+            float *result = ctx+(int64_t)s*qw;
+            if (block_decode &&
+                moty_attn_gqa64_layout(result,query,m->base.K[layer],m->base.V[layer],KV,
+                                      m->base.max_t,pos_base+s+1,scale,&m->base.bscr,m->kv4)) continue;
+            QAttJob single = { m,query,result,1,G,hd,layer,pos_base+s,kv8,qw,scale };
+            moty_par_for(H,0,qwen_att_part,&single);
+        }
+    } else if (S != 1 || !block_decode ||
+               !moty_attn_gqa64_layout(ctx,q,m->base.K[layer],m->base.V[layer],KV,
+                                     m->base.max_t,pos_base+1,scale,&m->base.bscr,m->kv4))
+        moty_par_for((int64_t)H*S, 0, qwen_att_part, &aj);
     if (gate) {                            /* Qwen3.5: gating per-elemento sull'output */
         for (int64_t i = 0; i < S*qw; i++) ctx[i] *= 1.f/(1.f + expf(-gate[i]));
         free(gate);
@@ -636,7 +809,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     mat_apply(out, ctx, &l->o, S);
     if (l->lo) lora_apply(&l->lo->o, out, ctx, S, l->o.I, l->o.O);
     OP_ACC(OP_O_PROJ, t_o);
-    free(q); free(k); free(vv); free(ctx);
+    qwen_rows_release(work,mark,q,k,vv,ctx);
 }
 
 /* ---------- Gated DeltaNet (Qwen3.5, layer linear_attention) ----------
@@ -651,15 +824,41 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
 
 /* SwiGLU denso: out[S,D] = down( silu(gate(x)) * up(x) ), in batch sugli S
  * token: ogni riga di peso viene letta una volta sola per l'intero batch */
-static void mlp(Model *m, Layer *l, float *x, int S, float *out) {
+static void mlp(Model *m, Layer *l, float *x, int S, float *out, Scratch *work,
+                int pending_down) {
+    int64_t mark = work ? work->used : 0;
     Cfg *c = &m->c; int I = c->inter;
+    if ((!l->lo || (!l->lo->gate.r && !l->lo->up.r)) && l->gate.fmt == WF_Q4_1 && l->up.fmt == WF_Q4_1 &&
+        !l->gate.sh && !l->up.sh && l->gate.q4 && l->up.q4 && I % 4 == 0 &&
+        ((l->gate.gs == Q41_PACKED_GS && l->up.gs == Q41_PACKED_GS) ||
+         (l->gate.gs != Q41_PACKED_GS && l->up.gs != Q41_PACKED_GS && moty_q41_ffn_enabled()))) {
+        float *g = qwen_rows_alloc(work,(int64_t)S*I);
+        OP_T(t0);
+        if (pending_down < 0 && S == 1 && !l->lo && moty_q41_ffn_team(out,g,x,&l->gate,&l->up,&l->down)) {
+            OP_ACC(OP_FFN_GATE_UP, t0);  /* this measurement includes down */
+            qwen_rows_release(work,mark,g,NULL,NULL,NULL);
+            return;
+        }
+        if (l->gate.gs == Q41_PACKED_GS)
+            moty_q41_panels(g,x,l->gate.q4,l->up.q4,S,l->gate.I,I);
+        else moty_q41_gate_up(g,x,l->gate.q4,l->up.q4,S,l->gate.I,I,l->gate.gs == 64 && l->up.gs == 64);
+        OP_ACC(OP_FFN_GATE_UP, t0);
+        qwen_q41_finish_down(m,pending_down);
+        OP_T(t1);
+        mat_apply(out, g, &l->down, S);
+        if (l->lo) lora_apply(&l->lo->down, out, g, S, l->down.I, l->down.O);
+        OP_ACC(OP_FFN_DOWN, t1);
+        qwen_rows_release(work,mark,g,NULL,NULL,NULL);
+        return;
+    }
     if (l->gate_up.q4) {                    /* fused [gate|up] -> shared dense FFN layer */
+        qwen_q41_finish_down(m,pending_down);
         MotyFfnView f = { .gate=&l->gate, .up=&l->up, .down=&l->down, .gate_up=&l->gate_up,
                           .inter=I, .scr=&m->base.scr };
         moty_nn_dense_ffn(&f, x, S, out);
         return;
     }
-    float *g = falloc((int64_t)S*I), *u = falloc((int64_t)S*I);
+    float *g = qwen_rows_alloc(work,(int64_t)S*I), *u = qwen_rows_alloc(work,(int64_t)S*I);
     OP_T(t0);
     mat_apply(g, x, &l->gate, S);
     mat_apply(u, x, &l->up,   S);
@@ -671,61 +870,172 @@ static void mlp(Model *m, Layer *l, float *x, int S, float *out) {
     OP_T(t1);
     moty_hw_silu_mul(g, u, (int64_t)S*I);
     OP_ACC(OP_FFN_SILU, t1);
+    qwen_q41_finish_down(m,pending_down);
     OP_T(t2);
     mat_apply(out, g, &l->down, S);
     if (l->lo) lora_apply(&l->lo->down, out, g, S, l->down.I, l->down.O);  /* input = g fuso */
     OP_ACC(OP_FFN_DOWN, t2);
-    free(g); free(u);
+    qwen_rows_release(work,mark,g,u,NULL,NULL);
+}
+
+typedef struct {
+    float *out;
+    const float *x, *weights;
+    int dim;
+    float eps;
+} QwenNormRows;
+
+static void qwen_norm_worker(void *arg, int64_t first, int64_t end, int tid) {
+    (void)tid;
+    const QwenNormRows *j = arg;
+    for (int64_t s = first; s < end; s++)
+        rmsnorm_row(j->out+s*j->dim,j->x+s*j->dim,j->weights,j->dim,j->eps);
+}
+
+static void qwen_norm_rows(const Model *m, float *out, const float *x, const float *weights, int S) {
+    int dim = m->c.hidden;
+    if (m->prefill_parallel && S >= 128) {
+        QwenNormRows job = {out,x,weights,dim,m->c.eps};
+        moty_par_for(S,0,qwen_norm_worker,&job);
+    } else {
+        for (int s = 0; s < S; s++)
+            rmsnorm_row(out+(int64_t)s*dim,x+(int64_t)s*dim,weights,dim,m->c.eps);
+    }
+}
+
+static void qwen_attention_step(Model *m, Layer *l, int layer, float *x, int S,
+                                int pos, float *nrm, float *tmp, Scratch *work) {
+    Cfg *c = &m->c;
+    int D = c->hidden;
+    OP_T(t_n1);
+    qwen_norm_rows(m,nrm,x,l->in_ln,S);
+    OP_ACC(OP_NORM, t_n1);
+    if (l->type == LT_LINEAR) deltanet(m,l,nrm,S,tmp);
+#if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
+    else if (S > 1 && m->q41_attention_raw) {
+        /* Keep the decode panels resident and use one raw window across
+         * prefill layers. The temporary view shares the original KV. */
+        Layer view = *l;
+        Mat *proj[] = {&view.q,&view.k,&view.v,&view.o};
+        uint8_t *dst = m->q41_attention_raw;
+        QwenQ41Batch *batch = m->q41_queue ? &m->q41_queue->attention : NULL;
+        if (batch) dispatch_group_wait(batch->ready,DISPATCH_TIME_FOREVER);
+        int job_index = 0;
+        for (int j = 0; j < 4; j++) {
+            const st_tensor *t = m->q41_attention[layer][j];
+            if (!t) continue;
+            int err = batch ? batch->jobs[job_index++].error : qwen_q41_read_bytes(t->fd,dst,t->off,t->nbytes);
+            if (err) moty_fail_code(MOTY_FAIL_IO,"Cannot read native Q4_1 tensor %s: %s",t->name,strerror(err));
+            proj[j]->q4 = dst;
+            proj[j]->gs = m->q41_attention_group64;
+            dst += scr_al(t->nbytes);
+        }
+        attention(m,&view,layer,nrm,S,pos,tmp,work);
+    }
+#endif
+    else attention(m,l,layer,nrm,S,pos,tmp,work);
+    OP_T(t_r1);
+    moty_hw_add(x,tmp,(int64_t)S*D);
+    OP_ACC(OP_RESID, t_r1);
+}
+
+static void qwen_ffn_step(Model *m, Layer *l, float *x, int S,
+                          float *nrm, float *tmp, Scratch *work, int pending_down) {
+    Cfg *c = &m->c;
+    int D = c->hidden;
+    OP_T(t_n2);
+    qwen_norm_rows(m,nrm,x,l->post_ln,S);
+    OP_ACC(OP_NORM, t_n2);
+    mlp(m,l,nrm,S,tmp,work,pending_down);
+    OP_T(t_r2);
+    moty_hw_add(x,tmp,(int64_t)S*D);
+    OP_ACC(OP_RESID, t_r2);
+}
+
+static int64_t qwen_prefill_bytes(const Cfg *c, int tokens) {
+    int64_t hidden = scr_al((int64_t)tokens*c->hidden*sizeof(float));
+    int64_t queries = scr_al((int64_t)tokens*c->n_heads*c->head_dim*sizeof(float));
+    int64_t kv = scr_al((int64_t)tokens*c->n_kv_heads*c->head_dim*sizeof(float));
+    int64_t attn = 2*(queries+kv);
+    int64_t ffn = 2*scr_al((int64_t)tokens*c->inter*sizeof(float));
+    return 2*hidden+(attn > ffn ? attn : ffn);
+}
+
+static void qwen_step_release(Scratch *work, Scratch *shared, float *x, float *nrm, float *tmp) {
+    if (work) {
+        if (work != shared) scr_free(work);
+    }
+    else { free(x); free(nrm); free(tmp); }
 }
 
 /* un passo: token nuovi ids[S] a posizione pos_base. Ritorna logits dell'ultimo token (malloc'd). */
-static float *step(Model *m, const int *ids, int S, int pos_base) {
+static float *qwen_step_batch(Model *m, const int *ids, int S, int pos_base, Scratch *shared) {
     Cfg *c = &m->c; int D = c->hidden;
-    float *x = falloc((int64_t)S*D);
+    Scratch arena = {0};
+    Scratch *work = S > 1 && m->prefill_workspace ? (shared ? shared : &arena) : NULL;
+    if (work) {
+        scr_reset(work);
+        scr_reserve(work,qwen_prefill_bytes(c,S));
+    }
+    float *x = qwen_rows_alloc(work,(int64_t)S*D);
     OP_T(t_e);
     for (int s = 0; s < S; s++) embed_row(m, ids[s], 1.f, x + (int64_t)s*D);
     OP_ACC(OP_EMBED, t_e);
-    float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
-    /* gli scratch di streaming esistono solo nel percorso MEM_GB classico;
-     * in micro-RSS lo streaming avviene DENTRO mat_apply, matrice per matrice */
+    float *nrm = qwen_rows_alloc(work,(int64_t)S*D);
+    /* The dense Pocket workspace consumes the normalized input in Q/K/V
+     * or gate/up before the output projection overwrites it. */
+    float *tmp = work ? nrm : qwen_rows_alloc(NULL,(int64_t)S*D);
     int strm = m->base.stream_buf != NULL || m->base.stream_q != NULL;
-    if (strm && m->base.n_resident < c->n_layers) layer_prefetch(m, m->base.n_resident);
+    if (strm && m->base.n_resident < c->n_layers) layer_prefetch(m,m->base.n_resident);
+#ifdef __APPLE__
+    QwenQ41Queue *queue = qwen_q41_begin_batch(m,S);
+#endif
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
         if (strm && i >= m->base.n_resident) {
-            layer_stream_in(m, i);                  /* rilegge il layer dal disco (f32) */
-            if (i + 1 < c->n_layers && i + 1 >= m->base.n_resident) layer_prefetch(m, i + 1);
+            layer_stream_in(m,i);
+            if (i + 1 < c->n_layers && i + 1 >= m->base.n_resident) layer_prefetch(m,i+1);
         }
-        OP_T(t_n1);
-        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
-        OP_ACC(OP_NORM, t_n1);
-        if (l->type == LT_LINEAR) deltanet(m, l, nrm, S, tmp);
-        else attention(m, l, i, nrm, S, pos_base, tmp);
-        OP_T(t_r1);
-        moty_hw_add(x, tmp, (int64_t)S*D);
-        OP_ACC(OP_RESID, t_r1);
-        OP_T(t_n2);
-        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
-        OP_ACC(OP_NORM, t_n2);
-        mlp(m, l, nrm, S, tmp);
-        OP_T(t_r2);
-        moty_hw_add(x, tmp, (int64_t)S*D);
-        OP_ACC(OP_RESID, t_r2);
+        qwen_attention_step(m,l,i,x,S,pos_base,nrm,tmp,work);
+#if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
+        if (queue && S > 1 && m->q41_attention_raw && i+1 < c->n_layers)
+            qwen_q41_attention_prefetch(m,i+1);
+#endif
+        const int cold = m->q41_window && i >= m->base.n_resident;
+        int pending_down = cold ? qwen_q41_load_ffn(m,i,S) : -1;
+        qwen_ffn_step(m,l,x,S,nrm,tmp,work,pending_down);
+#ifdef __APPLE__
+        /* Reuse the window after all FFN workers have returned. */
+        if (cold && queue) {
+            int next = i+m->q41_window_count;
+            if (next < c->n_layers) qwen_q41_stream_prefetch(m,next,S);
+            else if (queue->read_ahead && S == 1 && !g_skip_logits && !g_all_logits) {
+                /* This slot has finished its last FFN of the current token. */
+                int slot = (i-m->base.n_resident)%m->q41_window_count;
+                if (slot < queue->read_ahead) qwen_q41_stage_decode(m,slot);
+            }
+        }
+#endif
     }
     m->base.kv_len = pos_base + S;
     /* blocco intermedio di un prefill a blocchi: KV/stati aggiornati, ma
      * niente final-norm/lm_head/stash TTA (validi solo per l'ultimo token) */
-    if (g_skip_logits) { free(x); free(nrm); free(tmp); return NULL; }
+    if (g_skip_logits) { qwen_step_release(work,shared,x,nrm,tmp); return NULL; }
+#ifdef __APPLE__
+    if (queue && S > 1 && !g_all_logits)
+        for (int j = 0; j < queue->read_ahead && m->base.n_resident+j < c->n_layers; j++)
+            qwen_q41_stage_decode(m,j);
+#endif
     OP_T(t_h);
     if (g_all_logits) {                /* lookahead verification: every position, the full head */
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, m->base.final_norm, D, c->eps);
         float *lg = falloc((int64_t)S * c->vocab);
         mat_apply(lg, nrm, &m->base.lm_head, S);
         OP_ACC(OP_LM_HEAD, t_h);
-        free(x); free(nrm); free(tmp);
+        qwen_step_release(work,shared,x,nrm,tmp);
         return lg;
     }
-    float *last = falloc(D);
+    float *last = nrm;  /* Reuse the normalization buffer after the final layer. */
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->base.final_norm, D, c->eps);
     if ((g_tta.mode == TTA_CACHE || g_tta.mode == TTA_LORA) && g_tta.alloc) {
         memcpy(g_tta.h_cur, last, D*sizeof(float)); /* stash per cache / adattatore online */
@@ -736,28 +1046,133 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     moty_nn_head_apply(logit, last, &m->base.lm_head, m->lm_lora.r ? NULL : m->base.head_sl);
     lora_apply(&m->lm_lora, logit, last, 1, m->base.lm_head.I, m->base.lm_head.O);
     OP_ACC(OP_LM_HEAD, t_h);
-    free(x); free(nrm); free(tmp); free(last);
+    qwen_step_release(work,shared,x,nrm,tmp);
     return logit;
+}
+
+/* Dense causal layers can be advanced by contiguous chunks. If any
+ * projection rejects FP16 packing, discard the provisional suffix and
+ * replay the original batch from the input IDs, preserving batch-wide
+ * precision selection. Every replayed K/V row is overwritten in order. */
+static float *step(Model *m, const int *ids, int S, int pos_base) {
+    int chunk = m->auto_prefill_chunk;
+    if (chunk < 4 || S < 1024 || S <= chunk || g_prefill_chunk > 0 ||
+        g_all_logits || m->exact_batch || m->base.inj)
+        return qwen_step_batch(m,ids,S,pos_base,NULL);
+    Scratch shared = {0};
+    int skip_last = g_skip_logits;
+    float *logits = NULL;
+    for (int start = 0; start < S;) {
+        int count = S-start;
+        if (count > chunk) count = count == chunk+1 ? chunk-1 : chunk;
+        g_skip_logits = skip_last || start+count < S;
+        moty_q41_begin_exact_batch();
+        logits = qwen_step_batch(m,ids+start,count,pos_base+start,&shared);
+        if (moty_q41_end_exact_batch()) {
+            free(logits);
+            scr_free(&shared);
+            g_skip_logits = skip_last;
+            m->base.kv_len = pos_base;
+            return qwen_step_batch(m,ids,S,pos_base,NULL);
+        }
+        start += count;
+    }
+    g_skip_logits = skip_last;
+    scr_free(&shared);
+    return logits;
+}
+
+static int qwen_cli_verify_ok(Model *m) {
+    return m->base.lm_head.fmt == WF_Q4_1 && m->c.head_dim == 64 && m->c.n_heads == 14 &&
+           m->c.n_kv_heads == 2 && !m->kv4 && g_kv_bits != 8 && qwen_verify_ok(m);
+}
+
+static float *qwen_cli_verify(Model *m, const int *ids, int n, int pos) {
+    m->exact_batch = 1;
+    moty_q41_begin_exact_batch();
+    float *lo = verify_batch(m,ids,n,pos);
+    m->exact_batch = 0;
+    if (moty_q41_end_exact_batch()) {
+        free(lo);
+        m->base.kv_len = pos;
+        return NULL;
+    }
+#ifdef MOTY_Q41_VERIFY_CHECK
+    if (lo) {
+        for (int j = 0; j < n; j++) {
+            float *single = step(m,ids+j,1,pos+j);
+            if (memcmp(single,lo+(int64_t)j*m->c.vocab,m->c.vocab*sizeof(float)))
+                moty_fail_code(MOTY_FAIL_FORMAT,"Q4_1 batch logits differ at position %d",pos+j);
+            free(single);
+        }
+    }
+#endif
+    return lo;
 }
 
 static void kv_alloc(Model *m, int max_t) {
     Cfg *c = &m->c;
     kv_arrays_alloc(m, max_t);
+    m->pp_attn = 0;
+    m->pp_scores = NULL;
+    m->prefill_workspace = 0;
+    m->prefill_parallel = 0;
+    m->auto_prefill_chunk = 0;
+    if (g_gguf && gguf_find(&g_gguf_meta,"pocket.qat_conversion") &&
+        m->base.lm_head.fmt == WF_Q4_1 && !c->hybrid &&
+        (m->base.n_resident == c->n_layers || m->q41_window)) {
+        int compatible = 1;
+        for (int l = 0; l < c->n_layers; l++)
+            if (m->L[l].gated || m->L[l].qkv.q4 || m->L[l].lo || m->L[l].type == LT_LINEAR) {
+                compatible = 0;
+                break;
+            }
+        if (compatible) {
+            const char *work = moty_getenv("MOTY_Q41_WORKSPACE");
+            const char *chunk = moty_getenv("MOTY_Q41_AUTO_CHUNK");
+#if defined(__APPLE__) && defined(__ARM_NEON)
+            int workspace_default = 1;
+            int chunk_default = moty_q41_uses_fp16() && moty_par_threads() == 12 ? 256 : 0;
+#else
+            int workspace_default = 0;
+            int chunk_default = 0;
+#endif
+            m->prefill_workspace = work ? !strcmp(work,"1") : workspace_default;
+            const char *parallel = moty_getenv("MOTY_Q41_PREFILL_PAR");
+            m->prefill_parallel = parallel && !strcmp(parallel,"1") && moty_q41_uses_fp16();
+            m->auto_prefill_chunk = chunk ? atoi(chunk) : chunk_default;
+        }
+    }
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    const char *kv4 = moty_getenv("MOTY_Q41_KV4");
+    m->kv4 = kv4 && !strcmp(kv4,"1") && g_kv_bits != 8 && c->head_dim == 64 &&
+             c->n_heads == 14 && c->n_kv_heads == 2 && m->base.lm_head.fmt == WF_Q4_1 && max_t <= INT_MAX-3;
+    const char *pp = moty_getenv("MOTY_Q41_PP_ATTN");
+    if (!m->kv4 && g_kv_bits != 8 && c->head_dim == 64 && m->base.lm_head.fmt == WF_Q4_1) {
+        int pp_default = max_t >= 2048 && c->n_heads == 14 && c->n_kv_heads == 2 &&
+                         moty_q41_uses_fp16() && moty_par_threads() == 12;
+        m->pp_attn = pp ? (!strcmp(pp,"2") ? 2 : !strcmp(pp,"4") ? 4 : 0) : pp_default ? 4 : 0;
+    }
+    if (m->pp_attn)
+        m->pp_scores = falloc((int64_t)(m->pp_attn-1)*moty_par_threads()*max_t);
+#endif
+    const char *pair = m->kv4 ? moty_getenv("MOTY_Q41_KV4_PREFILL_PAIR") : NULL;
+    m->kv4_scores = pair && !strcmp(pair,"1") ? falloc((int64_t)moty_par_threads()*max_t) : NULL;
+    int slots = m->kv4 ? (max_t+3)&~3 : max_t;
     for (int i = 0; i < c->n_layers; i++) {
         if (c->ltype[i] == LT_LINEAR) continue;  /* i layer lineari usano lo stato, non la KV */
-        kv_layer_alloc(m, i, c->n_kv_heads, c->head_dim, max_t);
+        kv_layer_alloc(m, i, c->n_kv_heads, c->head_dim, slots);
     }
     state_reset(m);
 }
 
-/* costruisce il turno chat Qwen3 (ChatML). THINK=0 pre-chiude il blocco think,
- * solo per i modelli che hanno il token <think> (Qwen3, MiniCPM5: il loro template
- * HF con enable_thinking=False fa lo stesso); un Llama/SmolLM2 o Qwen2.5 senza
- * <think> riceve il turno ChatML nudo, come il suo template HF. */
+/* THINK=0 pre-closes the reasoning block for Qwen3/MiniCPM5. Some models
+ * (MNN-Pocket) retain <think> in the vocabulary but omit it from ChatML. */
 static int build_turn(Tok *T, char *buf, int cap, const char *user) {
     int think = moty_getenv("THINK") ? atoi(moty_getenv("THINK")) : 0;
     int bl = snprintf(buf, cap, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", user);
-    if (!think && tok_id_of(T, "<think>") >= 0) bl += snprintf(buf+bl, cap-bl, "<think>\n\n</think>\n\n");
+    if (!think && !T->chat_omits_think && tok_id_of(T, "<think>") >= 0 && bl >= 0 && bl < cap)
+        bl += snprintf(buf+bl, cap-bl, "<think>\n\n</think>\n\n");
     return bl;
 }
 
