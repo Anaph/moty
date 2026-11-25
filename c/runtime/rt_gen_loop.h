@@ -5,6 +5,10 @@
 #define RT_GEN_LOOP_H
 #include "util/prof.h"    /* OP_T/OP_ACC per-op table (no-ops without MOTY_PROF) */
 
+#ifndef ENGINE_DECODE_PHASE
+#define ENGINE_DECODE_PHASE(m, active) ((void)0)
+#endif
+
 /* ---------- prefill a blocchi (PREFILL_CHUNK) ----------
  * Le attivazioni del prefill crescono con S (mlp: 2*S*inter f32 — 1.6 GB a
  * S=4096 su un 4B) e lo scratch statico di matmul_q_s resta a S*I per sempre:
@@ -253,6 +257,7 @@ static int gen_turn(Model *m, Tok *T, int *hist, int len, int k, int n_new, int 
     int draft[4], rejected[4] = {0}, proposed = 0, row = 0, batches = 0, accepted = 0, attempted = 0;
     float *batch = NULL;
 #endif
+    ENGINE_DECODE_PHASE(m,1);
     t0 = now_s();
     for (int s = 0; s < n_new; s++) {
         OP_T(t_s);
@@ -317,6 +322,7 @@ static int gen_turn(Model *m, Tok *T, int *hist, int len, int k, int n_new, int 
         m->base.kv_len = base+ng-1;  /* speculative suffix stays invisible */
     }
 #endif
+    ENGINE_DECODE_PHASE(m,0);
     if (logit) free(logit);
     if (dump) fprintf(stderr, "\n");
     double tgen = now_s() - t0;

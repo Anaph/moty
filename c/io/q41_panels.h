@@ -253,6 +253,7 @@ static int st_q41_cache_open_format(shards *s, const st_tensor *t, int I, int O,
     int ok = q41_cache_build(writer,t,&key);
     if (close(writer) != 0) ok = 0;
     if (ok && rename(tmp,path) == 0) {
+        s->q41_cache_writes++;
         fd = open(path,O_RDONLY | O_NONBLOCK);
         if (fd < 0) return -1;
         if (!fstat(fd,&sb) && S_ISREG(sb.st_mode) && q41_cache_read_header(fd,&key,disk,&sb))

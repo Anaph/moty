@@ -54,6 +54,10 @@ Stale sidecar headers and lengths trigger an atomic replacement. A resident
 checksum failure triggers one rebuild attempt. A checksum failure found by a
 streaming reader uses raw Q4_1 for the current run and attempts to repair the
 sidecar for the next open.
+Verified stream reads retain the sidecar's modification and change times.
+A changed stamp invalidates the checksum result. File windows are checked
+again when the prefetch is bound to a projection. Cache writers publish
+new files by atomic rename, so existing read-only views keep their file.
 
 | Option | Purpose |
 | --- | --- |
@@ -120,8 +124,10 @@ python3 tools/ref/pocket_bench.py --model "$model" --candidate ./c/moty > pocket
 ```
 
 The [benchmark runner](../../tools/ref/pocket_bench.py) checks generated
-IDs in each pair and confirms that the candidate mapped both gate and down
-panels, then writes prefill and decode rates, latency and RSS
+IDs in each pair and confirms that the candidate consumed mapped gate and down
+panels during decode. Measured runs with a streaming fallback or any sidecar
+publication are rejected. Warm-up can build or repair the cache. The runner
+writes prefill and decode rates, latency and RSS
 to JSON. Use `--workload text`, `256`, `1536`, `3584` or
 `3584-speed` to run a single case. The same
 [prompts and token IDs](../../tools/ref/pocket_bench_inputs.json) can

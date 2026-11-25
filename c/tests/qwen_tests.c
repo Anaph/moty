@@ -1156,12 +1156,26 @@ int qt_q41_stream_budget(void) {
                      batch->file_windows[0].address && !batch->file_windows[0].writable &&
                      batch->file_windows[2].address && !batch->file_windows[2].writable &&
                      !batch->file_windows[1].address;
-            /* If up falls back, gate must release its read-only view
-             * before reloading raw weights into the same window. */
-            qwen_q41_read_raw(&batch->jobs[1]);
-            batch->jobs[1].packed = 0;
+            exact &= !stream.q41_mapped_gate && !stream.q41_mapped_down;
+            /* Change a verified, already staged panel without resizing it.
+             * Binding must use raw gate and up and restore the sidecar. */
+            const QwenQ41Input *gate = &stream.q41_layers[first].ffn[0];
+            char path_gate[720];
+            snprintf(path_gate,sizeof(path_gate),"%s.%s-%lld",path,q41_cache_suffix(gate->panel_version),
+                     (long long)gate->tensor->off);
+            int gate_fd = open(path_gate,O_RDWR);
+            uint8_t gate_byte = 0;
+            exact &= gate_fd >= 0 && pread(gate_fd,&gate_byte,1,sizeof(Q41CacheHeader)) == 1;
+            if (gate_fd >= 0) {
+                uint8_t corrupt = gate_byte^1;
+                exact &= pwrite(gate_fd,&corrupt,1,sizeof(Q41CacheHeader)) == 1;
+                close(gate_fd);
+            }
+            unsigned writes = stream.S.q41_cache_writes;
             qwen_q41_stream_bind(&stream,first,batch->jobs,0,2);
-            exact &= batch->file_windows[0].writable && !batch->jobs[0].packed;
+            exact &= batch->file_windows[0].writable && !batch->jobs[0].packed &&
+                     !batch->jobs[1].packed && batch->jobs[0].invalid_panel &&
+                     stream.S.q41_cache_writes == writes+1 && stream.q41_fallbacks == 2;
 
             const QwenQ41Input *down = &stream.q41_layers[first].ffn[2];
             char path_down[720];

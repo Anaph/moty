@@ -84,6 +84,10 @@ typedef struct {
     LoraLayer *lo;                         /* adattatori LoRA (NULL = spenti) */
 } Layer;
 
+#if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
+typedef struct { struct timespec modified, changed; } QwenQ41PanelStamp;
+#endif
+
 typedef struct {
     Mat *mat;
     const st_tensor *tensor;
@@ -92,6 +96,7 @@ typedef struct {
     int raw_gs, panel_fd, panel_verified;
     int64_t panel_bytes;
     uint64_t panel_hash, panel_version;
+    QwenQ41PanelStamp panel_stamp;
 #endif
 } QwenQ41Input;
 
@@ -104,7 +109,7 @@ typedef struct {
 typedef struct {
     uint8_t *address;
     size_t capacity, page_size;
-    int writable, mapped_panel;
+    int writable;
 } QwenQ41FileWindow;
 #endif
 
@@ -116,7 +121,8 @@ typedef struct {
     const QwenQ41Input *panel;
     QwenQ41FileWindow *file_window;
     uint8_t *copy_dst;
-    int packed, map_panel, invalid_panel;
+    int packed, map_panel, mapped_panel, map_failed, invalid_panel, expect_panel;
+    QwenQ41PanelStamp panel_stamp;
 #endif
 } QwenQ41Read;
 
@@ -139,6 +145,8 @@ typedef struct {
     const st_tensor *(*q41_attention)[4];
     uint8_t *q41_attention_raw;
     int q41_attention_group64;
+    int q41_panels_requested, q41_decoding;
+    unsigned q41_mapped_gate, q41_mapped_down, q41_fallbacks;
 #endif
     int kv4;
     float *kv4_scores, *pp_scores;
@@ -178,6 +186,9 @@ static float *qwen_cli_verify(Model *m, const int *ids, int n, int pos);
 #define ENGINE_NATIVE_Q41 1
 #define ENGINE_Q41_PANELS 1
 #define ENGINE_Q41_STREAM 1
+#if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
+#define ENGINE_DECODE_PHASE(m, active) ((m)->q41_decoding = (active))
+#endif
 #ifdef __APPLE__
 static void qwen_q41_stream_close(Model *m);
 #define ENGINE_CLI_CLEANUP(m) qwen_q41_stream_close(m)

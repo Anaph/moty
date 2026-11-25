@@ -23,6 +23,7 @@ static void qwen_q41_panels_open(Model *m) {
     const char *packed = moty_getenv("MOTY_Q41_PACKED");
     if (!m->q41_window || !packed || !moty_q41_uses_fp16() ||
         (strcmp(packed,"stream") && strcmp(packed,"stream-all"))) return;
+    m->q41_panels_requested = 1;
     int panels = 0;
     for (int i = m->base.n_resident; i < m->c.n_layers; i++) {
         QwenQ41Input *in = m->q41_layers[i].ffn;
@@ -240,10 +241,25 @@ static void qwen_q41_prepare_copy(QwenQ41Read *job) {
     uint8_t *scratch = qwen_q41_file_window_map(job->file_window,job->tensor->nbytes,-1,0);
     job->dst = scratch ? scratch : job->copy_dst;
 }
+
+static int qwen_q41_panel_stamp(const QwenQ41Input *panel, size_t length,
+                               QwenQ41PanelStamp *stamp) {
+    struct stat info;
+    if (fstat(panel->panel_fd,&info) || info.st_size < 0 || (uint64_t)info.st_size != length)
+        return 0;
+    *stamp = (QwenQ41PanelStamp){info.st_mtimespec,info.st_ctimespec};
+    return 1;
+}
+
+static int qwen_q41_same_stamp(QwenQ41PanelStamp a, QwenQ41PanelStamp b) {
+    return a.modified.tv_sec == b.modified.tv_sec && a.modified.tv_nsec == b.modified.tv_nsec &&
+           a.changed.tv_sec == b.changed.tv_sec && a.changed.tv_nsec == b.changed.tv_nsec;
+}
 #endif
 
 static void qwen_q41_read_raw(QwenQ41Read *job) {
 #if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
+    job->packed = job->mapped_panel = 0;
     qwen_q41_prepare_copy(job);
 #endif
     const st_tensor *t = job->tensor;
@@ -254,29 +270,30 @@ static void qwen_q41_read_raw(QwenQ41Read *job) {
 static void qwen_q41_read(void *arg) {
     QwenQ41Read *job = arg;
 #if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
-    /* Check the first payload already in the decode window. A failed
-     * sidecar read falls back within the same raw-sized tensor slot. */
     const QwenQ41Input *panel = job->panel;
-    if (job->map_panel && panel->panel_verified && panel->panel_fd >= 0) {
-        size_t bytes = job->tensor->nbytes;
-        size_t length = sizeof(Q41CacheHeader)+panel->panel_bytes;
-        struct stat info;
-        uint8_t *view = NULL;
-        if (!fstat(panel->panel_fd,&info) && info.st_size >= 0 && (uint64_t)info.st_size == length)
-            view = qwen_q41_file_window_map(job->file_window,bytes,panel->panel_fd,length);
-        if (view) {
-            const volatile uint8_t *pages = view;
-            for (size_t i = 0; i < length; i += job->file_window->page_size) (void)pages[i];
-            job->dst = view+sizeof(Q41CacheHeader);
-            job->packed = 1;
-            job->file_window->mapped_panel = 1;
-            return;
-        }
-    }
     if (panel) {
+        size_t length = sizeof(Q41CacheHeader)+panel->panel_bytes;
+        job->packed = job->mapped_panel = 0;
+        if (job->map_panel && panel->panel_verified) {
+            uint8_t *view = NULL;
+            if (qwen_q41_panel_stamp(panel,length,&job->panel_stamp) &&
+                qwen_q41_same_stamp(job->panel_stamp,panel->panel_stamp))
+                view = qwen_q41_file_window_map(job->file_window,job->tensor->nbytes,panel->panel_fd,length);
+            if (view) {
+                const volatile uint8_t *pages = view;
+                for (size_t i = 0; i < length; i += job->file_window->page_size) (void)pages[i];
+                job->dst = view+sizeof(Q41CacheHeader);
+                job->packed = job->mapped_panel = 1;
+                return;
+            }
+            job->map_failed = 1;
+        }
+        /* A buffered payload is private to the job. Reuse its checksum
+         * only if the sidecar still has the last verified stamp. */
         qwen_q41_prepare_copy(job);
         if (!qwen_q41_read_bytes(panel->panel_fd,job->dst,sizeof(Q41CacheHeader),panel->panel_bytes) &&
-            (panel->panel_verified ||
+            qwen_q41_panel_stamp(panel,length,&job->panel_stamp) &&
+            ((panel->panel_verified && qwen_q41_same_stamp(job->panel_stamp,panel->panel_stamp)) ||
              q41_cache_hash_payload(panel->panel_version,job->dst,panel->panel_bytes) == panel->panel_hash)) {
             job->packed = 1;
             return;
@@ -292,7 +309,7 @@ static int qwen_q41_use_panels(const Model *m, int S) {
 }
 
 static void qwen_q41_read_jobs(QwenQ41Read jobs[3], const QwenQ41Layer *layer,
-                               uint8_t *dst, int use_panels) {
+                               uint8_t *dst, int expect_panels) {
     for (int j = 0; j < 3; j++) {
         const QwenQ41Input *in = &layer->ffn[j];
         if (in->resident) {
@@ -302,9 +319,10 @@ static void qwen_q41_read_jobs(QwenQ41Read jobs[3], const QwenQ41Layer *layer,
         const st_tensor *t = in->tensor;
         QwenQ41Read job = {.tensor=t,.dst=dst};
 #if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
-        if (use_panels && in->panel_bytes) job.panel = in;
+        job.expect_panel = expect_panels;
+        if (expect_panels && in->panel_bytes) job.panel = in;
 #else
-        (void)use_panels;
+        (void)expect_panels;
 #endif
         jobs[j] = job;
         dst += scr_al(t->nbytes);
@@ -315,10 +333,23 @@ static void qwen_q41_stream_bind(Model *m, int li, QwenQ41Read jobs[3],
                                  int first, int end) {
     QwenQ41Layer *layer = &m->q41_layers[li];
 #if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
+    /* Staged read-only pages can change before a projection claims them.
+     * Recheck them before pairing gate and up or publishing any weights. */
+    for (int j = first; j < end; j++) {
+        QwenQ41Read *job = &jobs[j];
+        if (!job->mapped_panel) continue;
+        QwenQ41PanelStamp stamp;
+        size_t length = sizeof(Q41CacheHeader)+job->panel->panel_bytes;
+        if (!qwen_q41_panel_stamp(job->panel,length,&stamp) ||
+            !qwen_q41_same_stamp(stamp,job->panel_stamp)) {
+            job->map_panel = 0;
+            job->map_failed = 1;
+            qwen_q41_read(job);
+        }
+    }
     if (first == 0 && jobs[0].packed != jobs[1].packed) {
         int packed_projection = jobs[0].packed ? 0 : 1;
         QwenQ41Read *job = &jobs[packed_projection];
-        job->packed = 0;
         qwen_q41_read_raw(job);
     }
 #endif
@@ -332,8 +363,14 @@ static void qwen_q41_stream_bind(Model *m, int li, QwenQ41Read jobs[3],
         w->q4 = jobs[j].dst;
         w->borrowed = 1;
 #if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
+        m->q41_fallbacks += jobs[j].map_failed || (jobs[j].expect_panel && !jobs[j].packed);
         if (jobs[j].packed) {
-            if (!input->panel_verified) input->panel_verified = 1;
+            input->panel_stamp = jobs[j].panel_stamp;
+            input->panel_verified = 1;
+            if (m->q41_decoding && jobs[j].mapped_panel) {
+                m->q41_mapped_gate += j == 0;
+                m->q41_mapped_down += j == 2;
+            }
             w->gs = Q41_PACKED_GS;
             continue;
         }
@@ -361,7 +398,11 @@ static void qwen_q41_stream_bind(Model *m, int li, QwenQ41Read jobs[3],
 
 static void qwen_q41_stream_load(Model *m, int li, int S) {
     QwenQ41Read jobs[3];
-    qwen_q41_read_jobs(jobs,&m->q41_layers[li],m->q41_window,qwen_q41_use_panels(m,S));
+    int expect_panels = 0;
+#if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON)
+    expect_panels = m->q41_panels_requested && qwen_q41_use_panels(m,S);
+#endif
+    qwen_q41_read_jobs(jobs,&m->q41_layers[li],m->q41_window,expect_panels);
     for (int j = 0; j < 3; j++)
         if (jobs[j].tensor) qwen_q41_read(&jobs[j]);
     qwen_q41_stream_bind(m,li,jobs,0,3);
@@ -424,13 +465,8 @@ static void qwen_q41_queue_close(Model *m) {
     pthread_cond_broadcast(&q->work);
     pthread_mutex_unlock(&q->mutex);
     for (int j = 0; j < q->n_readers; j++) pthread_join(q->readers[j],NULL);
-#if defined(__aarch64__) && defined(__ARM_NEON)
-    int mapped_gate = 0, mapped_down = 0;
-#endif
     for (int j = 0; j < m->q41_window_count; j++) {
 #if defined(__aarch64__) && defined(__ARM_NEON)
-        mapped_gate += q->batch[j].file_windows[0].mapped_panel;
-        mapped_down += q->batch[j].file_windows[2].mapped_panel;
         for (int p = 0; p < Q41_FFN_MATRICES; p++)
             qwen_q41_file_window_close(&q->batch[j].file_windows[p]);
 #endif
@@ -439,8 +475,6 @@ static void qwen_q41_queue_close(Model *m) {
     }
 #if defined(__aarch64__) && defined(__ARM_NEON)
     if (q->attention.ready) dispatch_release(q->attention.ready);
-    if (q->batch[0].file_windows[0].page_size)
-        fprintf(stderr,"[qwen] Q4_1 file windows used: gate=%d down=%d\n",mapped_gate,mapped_down);
 #endif
     pthread_cond_destroy(&q->work);
     pthread_mutex_destroy(&q->mutex);
@@ -451,9 +485,14 @@ static void qwen_q41_queue_close(Model *m) {
 static void qwen_q41_stream_close(Model *m) {
     qwen_q41_queue_close(m);
 #if defined(__aarch64__) && defined(__ARM_NEON)
-    if (m->q41_window)
+    if (m->q41_window) {
         for (int i = m->base.n_resident; i < m->c.n_layers; i++)
             for (int j = 0; j < 3; j++) qwen_q41_panel_close(&m->q41_layers[i].ffn[j]);
+        const char *windows = moty_getenv("MOTY_Q41_FILE_WINDOWS");
+        if (windows && !strcmp(windows,"1"))
+            fprintf(stderr,"[qwen] Q4_1 decode windows: gate=%u down=%u fallbacks=%u cache_writes=%u\n",
+                    m->q41_mapped_gate,m->q41_mapped_down,m->q41_fallbacks,m->S.q41_cache_writes);
+    }
 #endif
 }
 
@@ -536,7 +575,11 @@ static void qwen_q41_stream_prefetch(Model *m, int layer, int S) {
     QwenQ41Queue *q = m->q41_queue;
     QwenQ41Batch *batch = qwen_q41_batch_for_layer(m,layer);
     uint8_t *dst = m->q41_window + (batch-q->batch)*m->q41_window_bytes;
-    qwen_q41_read_jobs(batch->jobs,&m->q41_layers[layer],dst,qwen_q41_use_panels(m,S));
+    int expect_panels = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    expect_panels = m->q41_panels_requested && qwen_q41_use_panels(m,S);
+#endif
+    qwen_q41_read_jobs(batch->jobs,&m->q41_layers[layer],dst,expect_panels);
 #if defined(__aarch64__) && defined(__ARM_NEON)
     if (batch->file_windows[0].page_size) {
         for (int p = 0; p < Q41_FFN_MATRICES; p++) {

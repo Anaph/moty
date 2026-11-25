@@ -49,6 +49,7 @@ typedef struct {
     int        hcap;
     void      *maps[512];   /* read-only mappings of the shard files (st_map), NULL = none yet */
     int64_t    maplen[512];
+    unsigned   q41_cache_writes; /* published panel sidecars during this open */
 } shards;
 #define ST_MAX_SHARDS 512
 

@@ -47,7 +47,7 @@ def profile_settings(workload):
     return settings
 
 
-def run(binary, env):
+def run(binary, env, *, check_profile=True):
     start = monotonic()
     with subprocess.Popen(["/usr/bin/time", "-l", binary], env=env,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
@@ -58,11 +58,15 @@ def run(binary, env):
     log = err.decode(errors="replace")
     if proc.returncode or not first_byte:
         raise RuntimeError(log)
-    if env.get("MOTY_Q41_FILE_WINDOWS") == "1":
-        windows = re.search(r"Q4_1 file windows used: gate=(\d+) down=(\d+)", log)
-        if not windows or min(map(int, windows.groups())) == 0:
-            raise RuntimeError(f"The streaming profile did not map both gate and down panels. "
-                               f"Check the Apple FMLAL build and the sidecar cache.\n{log}")
+    if check_profile and env.get("MOTY_Q41_FILE_WINDOWS") == "1":
+        windows = re.search(r"Q4_1 decode windows: gate=(\d+) down=(\d+) "
+                            r"fallbacks=(\d+) cache_writes=(\d+)", log)
+        if not windows:
+            raise RuntimeError(f"Missing streaming profile counters.\n{log}")
+        gate, down, fallbacks, cache_writes = map(int, windows.groups())
+        if not gate or not down or fallbacks or cache_writes:
+            raise RuntimeError(f"The streaming profile requires mapped gate and down reads "
+                               f"in decode with no fallback or cache writes.\n{log}")
     pp = re.search(r"prefill (\d+) tok in .*? \(([\d.]+) tok/s\)", log)
     tps = re.search(r"decode \d+ tok in .*? \(([\d.]+) tok/s\)", log)
     rss = re.search(r"(\d+)\s+maximum resident set size", log)
@@ -97,7 +101,8 @@ def compare(workload, binaries, env, pairs, fixtures, fixture_dir):
         order = (0, 1) if repeat % 2 == 0 else (1, 0)
         for case in cases:
             for i in order:
-                runs[i].append(run(binaries[i], dict(common, **case, **options[i])))
+                runs[i].append(run(binaries[i], dict(common, **case, **options[i]),
+                                   check_profile=repeat >= 0))
             if runs[0][-1][0] != runs[1][-1][0]:
                 raise RuntimeError(f"{workload} generated different token IDs in pair {repeat}")
             if workload != "text" and (len(runs[0][-1][0]), runs[0][-1][1]) != (128, int(n)):
